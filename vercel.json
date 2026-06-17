@@ -27,6 +27,7 @@
     "OCI_NAMESPACE": "axadzcltpbiu",
     "OCI_REGION": "us-chicago-1",
     "OCI_BUCKET_NAME": "walkchamp",
+    "OCI_ACCESS_KEY_ID": "bd50db79f0280086f748d8318e96d20ce29ca563",
     "OCI_SECRET_ACCESS_KEY": "ZBrQ6rwVYhK3o3ubh4TNt4DpkYy5jGfyVF8f/JG6hRM="
   },
   "functions": {
