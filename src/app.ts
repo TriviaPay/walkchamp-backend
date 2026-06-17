@@ -1,13 +1,24 @@
-import express, { type Express, type Request } from "express";
+import express, {
+  type Express,
+  type Request,
+  type Response,
+  type RequestHandler,
+} from "express";
 import cors from "cors";
-import helmet from "helmet";
+import helmetImport from "helmet";
+import type { HelmetOptions } from "helmet";
 import compression from "compression";
-import pinoHttp from "pino-http";
-import rateLimit from "express-rate-limit";
+import { pinoHttp } from "pino-http";
+import { rateLimit } from "express-rate-limit";
 import router from "./routes";
 import { recoverStaleRaces, cleanupOverdueRaces } from "./routes/races";
 import { startScheduler } from "./lib/scheduler";
 import { logger } from "./lib/logger";
+
+// Helmet publishes CJS-style types; cast keeps ESM default import compatible with strict TS.
+const helmet = helmetImport as unknown as (
+  options?: Readonly<HelmetOptions>,
+) => RequestHandler;
 
 // ── Env validation — fail fast before any DB connections ─────────────────────
 const REQUIRED_ENV_VARS = [
@@ -152,7 +163,7 @@ app.use(
           url: req.url?.split("?")[0],
         };
       },
-      res(res) {
+      res(res: Response) {
         return {
           statusCode: res.statusCode,
         };

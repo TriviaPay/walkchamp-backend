@@ -4,6 +4,8 @@
     "baseUrl": ".",
     "outDir": "dist",
     "types": ["node"],
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
     "paths": {
       "@db": ["db/src/index.ts"],
       "@db/*": ["db/src/*"],
