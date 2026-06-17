@@ -39,7 +39,7 @@ pnpm db:push      # Push Drizzle schema to PostgreSQL
 ## Deploy on Vercel
 
 1. Connect repo `TriviaPay/walkchamp-backend`, branch `main`
-2. **Settings → General → Output Directory:** leave **empty** (do not use `public`)
+2. **Settings → General → Output Directory:** `public` (or leave blank — `vercel.json` sets this)
 3. **Framework Preset:** Other
 4. Build command: `pnpm run vercel-build` (from `vercel.json`)
 5. Set all variables from `.env.example` in **Settings → Environment Variables**
