@@ -9,7 +9,7 @@ import helmetImport from "helmet";
 import type { HelmetOptions } from "helmet";
 import compression from "compression";
 import { pinoHttp } from "pino-http";
-import { rateLimit } from "express-rate-limit";
+import { rateLimit, ipKeyGenerator } from "express-rate-limit";
 import router from "./routes";
 import { recoverStaleRaces, cleanupOverdueRaces } from "./routes/races";
 import { startScheduler } from "./lib/scheduler";
@@ -42,6 +42,12 @@ if (isProd) {
 }
 
 const app: Express = express();
+
+// Vercel / reverse proxies set Forwarded / X-Forwarded-For — required for rate-limit v8.
+app.set("trust proxy", 1);
+
+const rateLimitKey = (req: Request) =>
+  ipKeyGenerator(req.ip ?? req.socket.remoteAddress ?? "0.0.0.0");
 
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use(
@@ -105,6 +111,7 @@ const globalLimiter = rateLimit({
   max: 400,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: rateLimitKey,
   message: { error: "Too many requests — please try again later." },
   skip: (req: Request) => req.path.startsWith("/api/webhooks/"),
 });
@@ -115,6 +122,7 @@ const authLimiter = rateLimit({
   max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: rateLimitKey,
   message: { error: "Too many auth requests — please try again later." },
 });
 
@@ -124,6 +132,7 @@ const paymentLimiter = rateLimit({
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: rateLimitKey,
   message: { error: "Too many payment requests — please try again later." },
 });
 
@@ -133,6 +142,7 @@ const registrationLimiter = rateLimit({
   max: 20,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: rateLimitKey,
   message: { error: "Too many registration requests — please slow down." },
 });
 
