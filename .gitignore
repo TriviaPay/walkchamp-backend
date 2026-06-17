@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+db/dist/
+api-zod/dist/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Local tooling
+.local/
+.cache/
+
+# Test / coverage
+coverage/
