@@ -14,6 +14,7 @@ import router from "./routes";
 import { recoverStaleRaces, cleanupOverdueRaces } from "./routes/races";
 import { startScheduler } from "./lib/scheduler";
 import { logger } from "./lib/logger";
+import { assertRequiredEnv } from "./lib/env";
 
 // Helmet publishes CJS-style types; cast keeps ESM default import compatible with strict TS.
 const helmet = helmetImport as unknown as (
@@ -21,16 +22,7 @@ const helmet = helmetImport as unknown as (
 ) => RequestHandler;
 
 // ── Env validation — fail fast before any DB connections ─────────────────────
-const REQUIRED_ENV_VARS = [
-  "NEON_DATABASE_URL",
-  "DESCOPE_PROJECT_ID",
-  "SESSION_SECRET",
-];
-const missingVars = REQUIRED_ENV_VARS.filter((v) => !process.env[v]);
-if (missingVars.length > 0) {
-  logger.fatal({ missingVars }, "Missing required environment variables — refusing to start");
-  process.exit(1);
-}
+assertRequiredEnv();
 
 // Warn in production when payment webhook secrets are absent — they default to
 // "disabled" mode which silently accepts unsigned webhooks in dev but MUST be

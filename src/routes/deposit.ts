@@ -30,6 +30,7 @@ import { z } from "zod";
 import Stripe from "stripe";
 import Razorpay from "razorpay";
 import { createHmac } from "crypto";
+import { getAppBaseUrl } from "../lib/env";
 
 const router = Router();
 
@@ -64,9 +65,7 @@ const MIN_RAZORPAY_PAISE = 1000;
 const MAX_RAZORPAY_PAISE = 5000000;
 
 function getBaseUrl(): string {
-  const appBase = process.env.APP_BASE_URL?.replace(/\/$/, "");
-  if (appBase) return appBase;
-  return "http://localhost:8080";
+  return getAppBaseUrl();
 }
 
 /**

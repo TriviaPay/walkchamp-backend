@@ -14,13 +14,59 @@ services:
         value: production
       - key: PORT
         value: 8080
+      - key: LOG_LEVEL
+        value: info
       - key: NEON_DATABASE_URL
         sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: DESCOPE_PROJECT_ID
+        sync: false
+      - key: DESCOPE_MANAGEMENT_KEY
         sync: false
       - key: SESSION_SECRET
         sync: false
       - key: APP_BASE_URL
         sync: false
       - key: ALLOWED_ORIGINS
+        sync: false
+      - key: PUSHER_APP_ID
+        sync: false
+      - key: PUSHER_KEY
+        sync: false
+      - key: PUSHER_SECRET
+        sync: false
+      - key: PUSHER_CLUSTER
+        sync: false
+      - key: ONESIGNAL_APP_ID
+        sync: false
+      - key: ONESIGNAL_REST_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: RAZORPAY_WEBHOOK_SECRET
+        sync: false
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: OCI_NAMESPACE
+        sync: false
+      - key: OCI_REGION
+        sync: false
+      - key: OCI_BUCKET_NAME
+        sync: false
+      - key: OCI_ACCESS_KEY_ID
+        sync: false
+      - key: OCI_SECRET_ACCESS_KEY
+        sync: false
+      - key: ADMIN_API_KEY
         sync: false
