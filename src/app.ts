@@ -196,6 +196,17 @@ app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 // naturally excluded (compression only runs on text content-types).
 app.use(compression());
 
+// Vercel rewrites send `/` to the handler without `/api` prefix — expose health at root too.
+app.get("/", (_req, res) => {
+  res.json({ status: "ok", service: "walkchamp-api", health: "/api/healthz" });
+});
+app.get("/healthz", (_req, res) => {
+  res.json({ status: "ok" });
+});
+app.get(["/favicon.ico", "/favicon.png"], (_req, res) => {
+  res.status(204).end();
+});
+
 app.use("/api", router);
 
 // ── Background jobs ───────────────────────────────────────────────────────────
