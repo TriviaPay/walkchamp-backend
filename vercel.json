@@ -10,7 +10,7 @@
     "NEON_DATABASE_URL": "postgresql://neondb_owner:npg_n4xSPYVl0qCQ@ep-frosty-snow-apc6mszl-pooler.c-7.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
     "APP_BASE_URL": "https://walkchamp-backend-sooty.vercel.app",
     "ALLOWED_ORIGINS": "https://walkchamp.app,http://localhost:8081",
-    "DESCOPE_PROJECT_ID": "SK3E9mQI3V5qdX2zLt9bpUgGCtCVs",
+    "DESCOPE_PROJECT_ID": "P3E9mQAxf0N6l75csydDy6kGeOPR",
     "DESCOPE_MANAGEMENT_KEY": "K3E9nLEHCwFWRoUYllMtVTN56JqTp3BTxglmGrhqwGmiioxbILamdYh0r6LWrmod8qgffBO",
     "SESSION_SECRET": "walkchamp-prod-session-secret-change-me",
     "PUSHER_APP_ID": "2158722",
