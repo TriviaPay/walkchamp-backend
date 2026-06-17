@@ -35,3 +35,10 @@ pnpm db:push      # Push Drizzle schema to PostgreSQL
 ## Health check
 
 `GET /api/healthz`
+
+## Deploy on Vercel
+
+- Production branch: `main`
+- Build command: `pnpm run vercel-build`
+- Install command: `pnpm install --frozen-lockfile`
+- Set all variables from `.env.example` in the Vercel project settings
