@@ -13,5 +13,5 @@
       "@api-zod/*": ["api-zod/src/*"]
     }
   },
-  "include": ["src"]
+  "include": ["src", "api"]
 }
