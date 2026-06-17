@@ -4,6 +4,8 @@
     "lib": ["es2022"],
     "module": "esnext",
     "moduleResolution": "bundler",
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
     "noEmitOnError": true,
     "noFallthroughCasesInSwitch": true,
     "noImplicitOverride": false,
@@ -19,7 +21,6 @@
     "alwaysStrict": true,
     "skipLibCheck": true,
     "target": "es2022",
-    "types": [],
-    "customConditions": ["workspace"]
+    "types": []
   }
 }

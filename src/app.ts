@@ -1,4 +1,4 @@
-import express, { type Express } from "express";
+import express, { type Express, type Request } from "express";
 import cors from "cors";
 import helmet from "helmet";
 import compression from "compression";
@@ -103,7 +103,7 @@ const globalLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many requests — please try again later." },
-  skip: (req) => req.path.startsWith("/api/webhooks/"),
+  skip: (req: Request) => req.path.startsWith("/api/webhooks/"),
 });
 
 // Tighter limit for auth endpoints (login, token verify, username check, etc.)
@@ -145,7 +145,7 @@ app.use(
   pinoHttp({
     logger,
     serializers: {
-      req(req) {
+      req(req: Request) {
         return {
           id: req.id,
           method: req.method,
