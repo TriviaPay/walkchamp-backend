@@ -44,4 +44,4 @@ pnpm db:push      # Push Drizzle schema to PostgreSQL
 4. Build command: `pnpm run vercel-build` (from `vercel.json`)
 5. Set all variables from `.env.example` in **Settings → Environment Variables**
 
-Traffic is routed to `api/index.js` (esbuild bundle of `src/app.ts`), which exports the Express app for Vercel serverless.
+Traffic is routed to `api/index.ts`, which loads the pre-bundled `api/handler.js` (built from `src/app.ts`).

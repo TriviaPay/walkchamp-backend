@@ -122,11 +122,12 @@ async function buildAll() {
 
   await rm(distDir, { recursive: true, force: true });
 
-  // Remove generated serverless bundles but keep api/.gitkeep in the repo.
+  // Remove generated serverless bundles but keep committed api sources.
   for (const file of await readdir(apiDir).catch(() => [])) {
-    if (file !== ".gitkeep") {
-      await rm(path.resolve(apiDir, file), { recursive: true, force: true });
+    if (file === ".gitkeep" || file === "index.ts" || file === "handler.d.ts") {
+      continue;
     }
+    await rm(path.resolve(apiDir, file), { recursive: true, force: true });
   }
 
   await esbuild({
@@ -137,11 +138,11 @@ async function buildAll() {
     outExtension: { ".js": ".mjs" },
   });
 
-  // Vercel serverless entry — bundled so Vercel does not typecheck raw TS with Node16 ESM rules.
+  // Vercel serverless bundle — imported by api/index.ts with an explicit .js extension.
   await esbuild({
     ...sharedBuildOptions,
     entryPoints: {
-      index: path.resolve(artifactDir, "src/app.ts"),
+      handler: path.resolve(artifactDir, "src/app.ts"),
     },
     format: "esm",
     outdir: apiDir,
