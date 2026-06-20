@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, uuid, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, uuid, jsonb, uniqueIndex, index } from "drizzle-orm/pg-core";
 
 // ── User Entitlements ─────────────────────────────────────────────────────────
 // Lifetime product unlocks stored in NeonDB.
@@ -47,7 +47,11 @@ export const userPurchasesTable = pgTable("user_purchases", {
   rawReceiptJson: jsonb("raw_receipt_json"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
-});
+}, (t) => [
+  uniqueIndex("user_purchases_transaction_unique").on(t.transactionId),
+  uniqueIndex("user_purchases_purchase_token_unique").on(t.purchaseToken),
+  index("user_purchases_user_created_idx").on(t.userId, t.createdAt),
+]);
 
 export type UserEntitlement = typeof userEntitlementsTable.$inferSelect;
 export type UserPurchase = typeof userPurchasesTable.$inferSelect;

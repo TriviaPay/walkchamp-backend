@@ -8,8 +8,15 @@ import {
 import { eq, and, asc } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { getCoinBalance, spendCoins } from "../lib/coinsService";
+import {
+  isOciConfigured,
+  isOciConfigError,
+  ociGetObject,
+  ociObjectExists,
+} from "../lib/ociStorage";
 
 const router = Router();
+const THEME_OBJECT_EXTENSIONS = ["", ".png", ".jpg", ".jpeg", ".webp", ".gif"];
 
 // ── Default themes seeded on first request ────────────────────────────────────
 const DEFAULT_THEMES = [
@@ -73,6 +80,39 @@ async function seedThemesIfNeeded(): Promise<void> {
     .onConflictDoNothing();
 }
 
+function buildThemeImageUrl(code: string): string {
+  return `/api/track-themes/${encodeURIComponent(code)}/image`;
+}
+
+async function resolveThemeObjectKey(assetKey: string | null | undefined, themeCode: string): Promise<string | null> {
+  if (!isOciConfigured()) return null;
+
+  const baseKeys = new Set<string>();
+  const normalizedAssetKey = assetKey?.trim() || themeCode;
+
+  if (normalizedAssetKey.includes("/")) {
+    baseKeys.add(normalizedAssetKey);
+  } else {
+    baseKeys.add(`race-themes/${normalizedAssetKey}`);
+  }
+
+  if (!normalizedAssetKey.includes(".")) {
+    for (const baseKey of [...baseKeys]) {
+      for (const ext of THEME_OBJECT_EXTENSIONS) {
+        baseKeys.add(`${baseKey}${ext}`);
+      }
+    }
+  }
+
+  for (const key of baseKeys) {
+    if (await ociObjectExists(key)) {
+      return key;
+    }
+  }
+
+  return null;
+}
+
 // ── GET /api/track-themes ─────────────────────────────────────────────────────
 // Returns all active themes with user ownership state + current coin balance.
 router.get("/track-themes", requireAuth, async (req, res) => {
@@ -112,6 +152,7 @@ router.get("/track-themes", requireAuth, async (req, res) => {
         canPurchase: locked && currentBalance >= t.priceCoins,
         coinsNeeded: locked ? Math.max(0, t.priceCoins - currentBalance) : 0,
         assetKey: t.assetKey,
+        imageUrl: buildThemeImageUrl(t.code),
         sortOrder: t.sortOrder,
       };
     });
@@ -197,6 +238,7 @@ router.post("/track-themes/:code/purchase", requireAuth, async (req, res) => {
         canPurchase: false,
         coinsNeeded: 0,
         assetKey: theme.assetKey,
+        imageUrl: buildThemeImageUrl(theme.code),
         sortOrder: theme.sortOrder,
       },
     });
@@ -251,6 +293,54 @@ router.post("/track-themes/:code/equip", requireAuth, async (req, res) => {
   } catch (err) {
     req.log.error({ err }, "track-themes equip error");
     return res.status(500).json({ error: "Failed to equip theme" });
+  }
+});
+
+// ── GET /api/track-themes/:code/image ─────────────────────────────────────────
+// Public endpoint — streams the OCI-backed track theme preview image.
+router.get("/track-themes/:code/image", async (req, res) => {
+  const code = String(req.params.code);
+  if (!isOciConfigured()) return res.status(503).json({ error: "Theme asset storage is not configured" });
+
+  try {
+    await seedThemesIfNeeded();
+
+    const [theme] = await db
+      .select({ code: raceTrackThemesTable.code, assetKey: raceTrackThemesTable.assetKey })
+      .from(raceTrackThemesTable)
+      .where(and(eq(raceTrackThemesTable.code, code), eq(raceTrackThemesTable.isActive, true)))
+      .limit(1);
+
+    if (!theme) return res.status(404).json({ error: "Theme not found" });
+
+    const objKey = await resolveThemeObjectKey(theme.assetKey, theme.code);
+    if (!objKey) {
+      req.log.warn({ code: theme.code, assetKey: theme.assetKey }, "track theme asset missing from OCI");
+      return res.status(404).json({ error: "Theme image not found" });
+    }
+
+    const obj = await ociGetObject(objKey);
+    if (!obj) return res.status(404).json({ error: "Theme image not found" });
+
+    res.setHeader("Content-Type", obj.contentType);
+    if (req.query.v) {
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+    } else {
+      res.setHeader("Cache-Control", "public, max-age=300");
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      obj.body
+        .on("error", reject)
+        .pipe(res)
+        .on("finish", resolve);
+    });
+  } catch (err) {
+    if (isOciConfigError(err)) {
+      return res.status(503).json({ error: "Theme asset storage is not configured" });
+    }
+    req.log.error({ err, code }, "track theme image fetch failed");
+    return res.status(500).json({ error: "Failed to fetch theme image" });
   }
 });
 

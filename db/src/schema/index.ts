@@ -19,3 +19,5 @@ export * from "./deposits";
 export * from "./groups";
 export * from "./friendActivity";
 export * from "./cashChallengeConsents";
+export * from "./featureFlags";
+export * from "./auditLogs";

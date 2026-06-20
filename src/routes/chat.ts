@@ -14,6 +14,8 @@ import { eq, and, desc, or, sql, inArray, lt } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { triggerEvent } from "../lib/pusher";
 import { z } from "zod";
+import { sanitizePlainText } from "../lib/text";
+import { config } from "../lib/config";
 
 const router = Router();
 
@@ -25,7 +27,7 @@ const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏", "😁
 // Supports cursor pagination via ?before=<ISO-timestamp> (exclusive upper bound).
 // Client fetches next page by passing the `nextCursor` from the previous response.
 router.get("/chat/global", requireAuth, async (req, res) => {
-  const limit = Math.min(Number(req.query.limit) || CHAT_PAGE_SIZE, 100);
+  const limit = Math.min(Number(req.query.limit) || CHAT_PAGE_SIZE, config.runtime.maxPaginationLimit);
   const before = req.query.before as string | undefined;
   const beforeDate = before ? new Date(before) : null;
 
@@ -100,6 +102,8 @@ router.post("/chat/global", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const parsed = sendGlobalSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid message" });
+  const text = sanitizePlainText(parsed.data.text);
+  if (!text) return res.status(400).json({ error: "Invalid message" });
 
   const [profile] = await db
     .select({
@@ -125,7 +129,7 @@ router.post("/chat/global", requireAuth, async (req, res) => {
       username: profile.username,
       countryFlag: profile.countryFlag ?? "🏳️",
       avatarColor: profile.avatarColor ?? "#00E676",
-      text: parsed.data.text,
+      text,
       replyToId: parsed.data.replyToId ?? null,
     })
     .returning();
@@ -279,7 +283,7 @@ router.get("/chat/private/conversations", requireAuth, async (req, res) => {
 router.get("/chat/private/:friendId", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const friendId = String(req.params.friendId);
-  const limit = Math.min(Number(req.query.limit) || CHAT_PAGE_SIZE, 100);
+  const limit = Math.min(Number(req.query.limit) || CHAT_PAGE_SIZE, config.runtime.maxPaginationLimit);
   const before = req.query.before as string | undefined;
   const beforeDate = before ? new Date(before) : null;
 
@@ -368,6 +372,8 @@ router.post("/chat/private/:friendId", requireAuth, async (req, res) => {
 
   const parsed = sendPrivateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid message" });
+  const text = sanitizePlainText(parsed.data.text);
+  if (!text) return res.status(400).json({ error: "Invalid message" });
 
   const [friendship] = await db
     .select()
@@ -386,7 +392,7 @@ router.post("/chat/private/:friendId", requireAuth, async (req, res) => {
         conversationId: conv.id,
         senderId: userId,
         recipientId: friendId,
-        text: parsed.data.text,
+        text,
         replyToId: parsed.data.replyToId ?? null,
       })
       .returning();
@@ -515,7 +521,7 @@ router.delete("/chat/private/react", requireAuth, async (req, res) => {
 router.get("/races/:id/comments", requireAuth, async (req, res) => {
   const { liveRaceCommentsTable } = await import("@db/schema");
   const raceId = String(req.params.id);
-  const limit = Math.min(Number(req.query.limit) || 50, 100);
+  const limit = Math.min(Number(req.query.limit) || 50, config.runtime.maxPaginationLimit);
 
   const rows = await db
     .select()
@@ -544,6 +550,8 @@ router.post("/races/:id/comments", requireAuth, async (req, res) => {
 
   const parsed = z.object({ text: z.string().min(1).max(300).trim() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid comment" });
+  const text = sanitizePlainText(parsed.data.text);
+  if (!text) return res.status(400).json({ error: "Invalid comment" });
 
   const [profile] = await db
     .select({ username: profilesTable.username, countryFlag: profilesTable.countryFlag, avatarColor: profilesTable.avatarColor })
@@ -561,7 +569,7 @@ router.post("/races/:id/comments", requireAuth, async (req, res) => {
       username: profile.username,
       countryFlag: profile.countryFlag ?? "🏳️",
       avatarColor: profile.avatarColor ?? "#00E676",
-      text: parsed.data.text,
+      text,
     })
     .returning();
 

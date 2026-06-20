@@ -4,50 +4,37 @@ import express, {
   type Response,
   type RequestHandler,
 } from "express";
+import { randomUUID } from "node:crypto";
 import cors from "cors";
 import helmetImport from "helmet";
 import type { HelmetOptions } from "helmet";
 import compression from "compression";
 import { pinoHttp } from "pino-http";
-import { rateLimit, ipKeyGenerator } from "express-rate-limit";
 import router from "./routes";
-import { recoverStaleRaces, cleanupOverdueRaces } from "./routes/races";
-import { startScheduler } from "./lib/scheduler";
 import { logger } from "./lib/logger";
-import { assertRequiredEnv } from "./lib/env";
+import { config } from "./lib/config";
+import {
+  createRedisRateLimit,
+  rateLimitByActorOrIp,
+  rateLimitByIp,
+} from "./lib/rateLimit";
+import { errorHandler, notFoundHandler } from "./middleware/errorHandler";
 
 // Helmet publishes CJS-style types; cast keeps ESM default import compatible with strict TS.
 const helmet = helmetImport as unknown as (
   options?: Readonly<HelmetOptions>,
 ) => RequestHandler;
 
-// ── Env validation — fail fast before any DB connections ─────────────────────
-assertRequiredEnv();
-
-// Warn in production when payment webhook secrets are absent — they default to
-// "disabled" mode which silently accepts unsigned webhooks in dev but MUST be
-// set in prod to prevent fake payment injection.
-const isProd = process.env.NODE_ENV === "production";
-if (isProd) {
-  const warnIfMissing = (name: string) => {
-    if (!process.env[name]) {
-      logger.warn({ var: name }, `[Security] ${name} is not set — payment webhooks will be rejected in production`);
-    }
-  };
-  warnIfMissing("STRIPE_WEBHOOK_SECRET");
-  warnIfMissing("RAZORPAY_WEBHOOK_SECRET");
-  if (!process.env.ALLOWED_ORIGINS) {
-    logger.warn("[Security] ALLOWED_ORIGINS is not set — CORS allows all origins in production");
-  }
+function parseAllowedOrigins(raw: string): string[] {
+  return raw
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
 }
 
 const app: Express = express();
-
-// Vercel / reverse proxies set Forwarded / X-Forwarded-For — required for rate-limit v8.
-app.set("trust proxy", 1);
-
-const rateLimitKey = (req: Request) =>
-  ipKeyGenerator(req.ip ?? req.socket.remoteAddress ?? "0.0.0.0");
+app.disable("x-powered-by");
+app.set("trust proxy", config.trustProxy);
 
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use(
@@ -81,20 +68,25 @@ app.use(
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 // In production, restrict to known origins via ALLOWED_ORIGINS env var
-// (comma-separated list of origin prefixes). In development, allow all.
-const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? "")
-  .split(",")
-  .map((o) => o.trim())
-  .filter(Boolean);
+// (comma-separated exact origins). In development, allow all.
+const allowedOrigins = config.allowedOrigins.length > 0
+  ? config.allowedOrigins
+  : parseAllowedOrigins("");
 
 app.use(
   cors({
     origin: (origin, callback) => {
-      if (
-        !origin ||
-        allowedOrigins.length === 0 ||
-        allowedOrigins.some((o) => origin.startsWith(o))
-      ) {
+      if (!origin) {
+        callback(null, true);
+        return;
+      }
+
+      if (!config.isProduction && allowedOrigins.length === 0) {
+        callback(null, true);
+        return;
+      }
+
+      if (allowedOrigins.includes(origin)) {
         callback(null, true);
       } else {
         callback(new Error("CORS: origin not allowed"));
@@ -104,59 +96,16 @@ app.use(
   }),
 );
 
-// ── Rate limiting ─────────────────────────────────────────────────────────────
-// Global guard — prevents abuse from a single IP flooding any endpoint.
-const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 400,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: rateLimitKey,
-  message: { error: "Too many requests — please try again later." },
-  skip: (req: Request) => req.path.startsWith("/api/webhooks/"),
-});
-
-// Tighter limit for auth endpoints (login, token verify, username check, etc.)
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: rateLimitKey,
-  message: { error: "Too many auth requests — please try again later." },
-});
-
-// Payment and deposit endpoints — any IP that hits these 20×/15min is suspicious.
-const paymentLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: rateLimitKey,
-  message: { error: "Too many payment requests — please try again later." },
-});
-
-// Race registration / cancellation — prevent room-fill spam.
-const registrationLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: rateLimitKey,
-  message: { error: "Too many registration requests — please slow down." },
-});
-
-app.use(globalLimiter);
-app.use("/api/auth", authLimiter);
-app.use("/api/deposit", paymentLimiter);
-app.use("/api/payments", paymentLimiter);
-app.use("/api/rooms/:roomId/register", registrationLimiter);
-app.use("/api/rooms/:roomId/cancel-registration", registrationLimiter);
-
 // ── Request logging ───────────────────────────────────────────────────────────
 app.use(
   pinoHttp({
     logger,
+    genReqId(req, res) {
+      const header = req.headers["x-request-id"];
+      const requestId = typeof header === "string" && header.trim() ? header.trim() : randomUUID();
+      res.setHeader("X-Request-Id", requestId);
+      return requestId;
+    },
     serializers: {
       req(req: Request) {
         return {
@@ -174,6 +123,29 @@ app.use(
   }),
 );
 
+// ── Timeouts ──────────────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  const isUploadRoute = /^\/api\/(?:profile\/me\/avatar|groups\/[^/]+\/image)$/.test(req.path);
+  const requestTimeoutMs = isUploadRoute ? config.runtime.uploadTimeoutMs : config.runtime.requestTimeoutMs;
+  const responseTimeoutMs = isUploadRoute ? config.runtime.uploadTimeoutMs : config.runtime.responseTimeoutMs;
+
+  let timedOut = false;
+  const onTimeout = () => {
+    if (timedOut || res.headersSent) return;
+    timedOut = true;
+    req.log.warn({ path: req.path }, "Request timed out");
+    res.status(408).json({
+      error: "Request timed out.",
+      code: "REQUEST_TIMEOUT",
+      requestId: (req as Request & { id?: string }).id ?? null,
+    });
+  };
+
+  req.setTimeout(requestTimeoutMs);
+  res.setTimeout(responseTimeoutMs, onTimeout);
+  next();
+});
+
 // ── Body parsing — Stripe/Razorpay webhooks need raw body ─────────────────────
 // All other routes get parsed JSON with a 2 MB body limit.
 const WEBHOOK_PATHS = new Set([
@@ -186,32 +158,117 @@ app.use((req, res, next) => {
   if (WEBHOOK_PATHS.has(req.path)) {
     express.raw({ type: "application/json", limit: "1mb" })(req, res, next);
   } else {
-    express.json({ limit: "2mb" })(req, res, next);
+    express.json({ limit: config.runtime.jsonBodyLimit })(req, res, next);
   }
 });
-app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+app.use(express.urlencoded({ extended: true, limit: config.runtime.urlencodedBodyLimit }));
 
 // ── Response compression ───────────────────────────────────────────────────────
 // Compresses JSON/text responses. Webhook paths receive raw buffers so they are
 // naturally excluded (compression only runs on text content-types).
 app.use(compression());
 
-// Vercel rewrites send `/` to the handler without `/api` prefix — expose health at root too.
-app.get("/", (_req, res) => {
-  res.json({ status: "ok", service: "walkchamp-api", health: "/api/healthz" });
-});
-app.get("/healthz", (_req, res) => {
-  res.json({ status: "ok" });
-});
-app.get(["/favicon.ico", "/favicon.png"], (_req, res) => {
-  res.status(204).end();
-});
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+if (config.features.rateLimitingEnabled) {
+  const globalLimiter = createRedisRateLimit({
+    bucket: "global",
+    windowMs: 15 * 60 * 1000,
+    max: 400,
+    failureMode: "open",
+    message: "Too many requests — please try again later.",
+    code: "GLOBAL_RATE_LIMITED",
+    key: rateLimitByIp,
+  });
+  app.use((req, res, next) => (
+    WEBHOOK_PATHS.has(req.path)
+      ? next()
+      : globalLimiter(req, res, next)
+  ));
+  app.use("/api/auth", createRedisRateLimit({
+    bucket: "auth",
+    windowMs: 15 * 60 * 1000,
+    max: 30,
+    failureMode: "closed",
+    message: "Too many auth requests — please try again later.",
+    code: "AUTH_RATE_LIMITED",
+    key: rateLimitByIp,
+  }));
+  app.use("/api/payments", createRedisRateLimit({
+    bucket: "payments",
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    failureMode: "closed",
+    message: "Too many payment requests — please try again later.",
+    code: "PAYMENT_RATE_LIMITED",
+    key: rateLimitByActorOrIp,
+  }));
+  app.use("/api/wallet/deposit", createRedisRateLimit({
+    bucket: "deposits",
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    failureMode: "closed",
+    message: "Too many deposit attempts — please try again later.",
+    code: "DEPOSIT_RATE_LIMITED",
+    key: rateLimitByActorOrIp,
+  }));
+  app.use("/api/admin", createRedisRateLimit({
+    bucket: "admin",
+    windowMs: 15 * 60 * 1000,
+    max: 60,
+    failureMode: "closed",
+    message: "Too many admin requests — please try again later.",
+    code: "ADMIN_RATE_LIMITED",
+    key: rateLimitByActorOrIp,
+  }));
+  app.use("/api/realtime/pusher/auth", createRedisRateLimit({
+    bucket: "realtime-auth",
+    windowMs: 60 * 1000,
+    max: 60,
+    failureMode: "open",
+    message: "Too many realtime auth requests — please slow down.",
+    code: "REALTIME_AUTH_RATE_LIMITED",
+    key: rateLimitByActorOrIp,
+  }));
+  app.use("/api/presence/heartbeat", createRedisRateLimit({
+    bucket: "presence-heartbeat",
+    windowMs: 60 * 1000,
+    max: 120,
+    failureMode: "open",
+    message: "Too many presence updates — please slow down.",
+    code: "PRESENCE_RATE_LIMITED",
+    key: rateLimitByActorOrIp,
+  }));
+  app.use("/api/coins/ad-reward", createRedisRateLimit({
+    bucket: "ad-reward",
+    windowMs: 15 * 60 * 1000,
+    max: 30,
+    failureMode: "open",
+    message: "Too many ad reward requests — please try again later.",
+    code: "AD_REWARD_RATE_LIMITED",
+    key: rateLimitByActorOrIp,
+  }));
+  app.use("/api/rooms", createRedisRateLimit({
+    bucket: "room-registration",
+    windowMs: 60 * 1000,
+    max: 20,
+    failureMode: "open",
+    message: "Too many registration requests — please slow down.",
+    code: "ROOM_RATE_LIMITED",
+    key: rateLimitByActorOrIp,
+  }));
+  app.use("/api/races", createRedisRateLimit({
+    bucket: "race-join",
+    windowMs: 60 * 1000,
+    max: 20,
+    failureMode: "open",
+    message: "Too many race requests — please slow down.",
+    code: "RACE_RATE_LIMITED",
+    key: rateLimitByActorOrIp,
+  }));
+}
 
 app.use("/api", router);
-
-// ── Background jobs ───────────────────────────────────────────────────────────
-recoverStaleRaces().catch(() => {});
-setInterval(() => { cleanupOverdueRaces().catch(() => {}); }, 15_000);
-startScheduler();
+app.use(notFoundHandler);
+app.use(errorHandler);
 
 export default app;

@@ -5,11 +5,12 @@ Standalone Express API server.
 ## Setup
 
 ```bash
-cd backend
 pnpm install
 cp .env.example .env
-pnpm db:push
+pnpm db:migrate
 ```
+
+This bootstraps a fresh empty PostgreSQL database from the committed Drizzle migrations in `db/migrations/`.
 
 ## Scripts
 
@@ -19,7 +20,38 @@ pnpm build        # Production bundle
 pnpm start        # Run production bundle
 pnpm typecheck    # TypeScript check
 pnpm test         # Unit tests
-pnpm db:push      # Push Drizzle schema to PostgreSQL
+pnpm db:generate  # Generate a reviewed SQL migration into db/migrations
+pnpm db:migrate   # Apply committed SQL migrations to PostgreSQL
+```
+
+## Database Workflow
+
+Use this project as PostgreSQL-only. The schema uses PostgreSQL types and features, so changing database engines is a porting task, not a config swap.
+
+For any empty PostgreSQL-compatible database:
+
+```bash
+pnpm install
+cp .env.example .env
+# set DATABASE_URL or NEON_DATABASE_URL
+pnpm db:migrate
+```
+
+For an existing PostgreSQL database that already has the old Walk Champ schema but is not yet tracked by Drizzle:
+
+```bash
+pnpm db:adopt-existing
+pnpm db:migrate
+```
+
+`db:adopt-existing` marks the current database as being at migration `0000_baseline` so that only newer migrations are applied.
+
+For schema changes:
+
+```bash
+pnpm db:generate
+# review the generated SQL in db/migrations/
+pnpm db:migrate
 ```
 
 ## Layout
@@ -38,24 +70,7 @@ pnpm db:push      # Push Drizzle schema to PostgreSQL
 
 ## Deploy on Vercel
 
-1. Connect repo `TriviaPay/walkchamp-backend`, branch `main`
-2. **Settings → General → Output Directory:** `public` (or leave blank — `vercel.json` sets this)
-3. **Framework Preset:** Other
-4. Build command: `pnpm run vercel-build` (from `vercel.json`)
-5. **Copy all secrets from Replit** into **Settings → Environment Variables** using `vercel.env.example` as the checklist (same names as Replit except `REPLIT_DOMAINS` → `APP_BASE_URL`)
-6. **Redeploy** after saving env vars
-
-### Required Vercel env vars (minimum to boot)
-
-| Variable | Source |
-|----------|--------|
-| `NEON_DATABASE_URL` | Neon console → connection string (pooled) |
-| `DESCOPE_PROJECT_ID` | Replit secrets / Descope dashboard |
-| `SESSION_SECRET` | Replit secrets (any long random string) |
-| `NODE_ENV` | `production` |
-| `APP_BASE_URL` | `https://walkchamp-backend-sooty.vercel.app` |
-| `ALLOWED_ORIGINS` | Your frontend URL(s), comma-separated |
-
-Traffic is routed to `api/index.ts`, which loads the pre-bundled `api/handler.js` (built from `src/app.ts`).
-
-See also: `.env.example` (full list + Replit mapping), `vercel.env.example` (paste template for Vercel UI).
+- Production branch: `main`
+- Build command: `pnpm run vercel-build`
+- Install command: `pnpm install --frozen-lockfile`
+- Set all variables from `.env.example` in the Vercel project settings

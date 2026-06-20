@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, uuid, jsonb, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, uuid, jsonb, boolean, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const depositTransactionsTable = pgTable("deposit_transactions", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -22,13 +22,19 @@ export const depositTransactionsTable = pgTable("deposit_transactions", {
 export const depositWebhookEventsTable = pgTable("deposit_webhook_events", {
   id: uuid("id").primaryKey().defaultRandom(),
   provider: text("provider").notNull(),
-  providerEventId: text("provider_event_id").notNull().unique(),
+  providerEventId: text("provider_event_id").notNull(),
   eventType: text("event_type").notNull(),
   processed: boolean("processed").notNull().default(false),
+  processingStatus: text("processing_status").notNull().default("pending"),
+  processingAttemptCount: integer("processing_attempt_count").notNull().default(0),
+  failureReason: text("failure_reason"),
   payload: jsonb("payload"),
+  payloadReference: text("payload_reference"),
   receivedAt: timestamp("received_at").notNull().defaultNow(),
   processedAt: timestamp("processed_at"),
-});
+}, (table) => [
+  uniqueIndex("deposit_webhook_events_provider_event_unique_idx").on(table.provider, table.providerEventId),
+]);
 
 export type DepositTransaction = typeof depositTransactionsTable.$inferSelect;
 export type DepositWebhookEvent = typeof depositWebhookEventsTable.$inferSelect;

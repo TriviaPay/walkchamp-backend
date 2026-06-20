@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, pgEnum, uuid, jsonb, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, pgEnum, uuid, jsonb, boolean, uniqueIndex } from "drizzle-orm/pg-core";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 import { profilesTable } from "./profiles";
@@ -49,12 +49,22 @@ export const paymentsTable = pgTable("payments", {
 export const paymentEventsTable = pgTable("payment_events", {
   id: uuid("id").primaryKey().defaultRandom(),
   paymentId: uuid("payment_id").references(() => paymentsTable.id, { onDelete: "set null" }),
-  stripeEventId: text("stripe_event_id").unique(),
+  provider: text("provider").notNull().default("stripe"),
+  providerEventId: text("provider_event_id").notNull(),
+  stripeEventId: text("stripe_event_id"),
   eventType: text("event_type").notNull(),
   rawPayload: jsonb("raw_payload"),
+  payloadReference: text("payload_reference"),
   processed: boolean("processed").notNull().default(false),
+  processingStatus: text("processing_status").notNull().default("pending"),
+  processingAttemptCount: integer("processing_attempt_count").notNull().default(0),
+  failureReason: text("failure_reason"),
+  receivedAt: timestamp("received_at").notNull().defaultNow(),
+  processedAt: timestamp("processed_at"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
-});
+}, (table) => [
+  uniqueIndex("payment_events_provider_event_unique_idx").on(table.provider, table.providerEventId),
+]);
 
 // ── Promo Codes ───────────────────────────────────────────────────────────────
 export const promoCodesTable = pgTable("promo_codes", {

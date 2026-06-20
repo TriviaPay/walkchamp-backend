@@ -19,7 +19,6 @@ import {
   blockedUsersTable,
   scheduledRoomRegistrationsTable,
   coinBalancesTable,
-  coinTransactionsTable,
   cashChallengeConsentsTable,
 } from "@db/schema";
 import { eq, and, desc, asc, sql, ne, inArray, or, notExists } from "drizzle-orm";
@@ -31,6 +30,15 @@ import { logger } from "../lib/logger";
 import { validateThemeOwnership } from "./trackThemes";
 import { grantCoinReward, getRaceWinRewardCode, grantVariableCoinReward } from "../lib/coinRewardService";
 import { evaluateAndNotify } from "./achievementHooks";
+import { requireAdminKey } from "../middleware/requireAdminKey";
+import { recordCoinLedgerEntry } from "../lib/coinsService";
+import {
+  deriveOpenRoomStatus,
+  joinOrReviveParticipant,
+  lockRaceRoom,
+  lockScheduledRegistration,
+  registerOrReviveScheduledRegistration,
+} from "../lib/raceIntegrity";
 
 const router = Router();
 
@@ -191,10 +199,9 @@ export async function cleanupOverdueRaces(): Promise<void> {
 }
 
 // ── Feature flags ─────────────────────────────────────────────────────────────
-/** Set to true to re-enable $1/$3/$5 paid cash challenge creation on the backend. */
-const ENABLE_CASH_CHALLENGES = false; // keeps $1/$5 off globally
-/** Entry types that are currently live for premium challenges. */
-const ENABLED_PREMIUM_ENTRY_TYPES = new Set(["paid_3", "paid_usd"]);
+/** Coins-only v1: all cash and coin-entry challenge types are hard-disabled. */
+const ENABLE_CASH_CHALLENGES = false;
+const ENABLE_COIN_ENTRY_CHALLENGES = false;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -234,6 +241,9 @@ const VALID_TARGET_STEPS_BY_GOAL: Record<string, Set<number>> = {
 const PLATFORM_FEE_PERCENT = 20;
 /** Winner reward % for all paid challenges (80%). */
 const WINNER_REWARD_PERCENT = 100 - PLATFORM_FEE_PERCENT;
+const MAX_PROGRESS_DELTA_FLOOR = 500;
+const MAX_PROGRESS_STEPS_PER_SECOND = 6;
+const MAX_DEVICE_TIME_SKEW_MS = 10 * 60 * 1000;
 
 function calcPrizePool(entryAmountCents: number, playerCount: number) {
   const total = entryAmountCents * playerCount;
@@ -1455,50 +1465,61 @@ router.post("/rooms/:roomId/register", requireAuth, async (req, res) => {
   const roomId = String(req.params.roomId);
 
   req.log.info({ roomId, userId }, "[ScheduleRoom] registerClicked");
-
-  const [room] = await db
-    .select()
-    .from(raceRoomsTable)
-    .where(eq(raceRoomsTable.id, roomId))
-    .limit(1);
-
-  if (!room) return res.status(404).json({ error: "Room not found." });
-  if (room.status !== "scheduled") return res.status(409).json({ error: "Room is no longer accepting registrations." });
-  if (room.registeredCount >= room.maxPlayers) return res.status(409).json({ error: "Room is full." });
-
-  const existing = await db
-    .select()
-    .from(scheduledRoomRegistrationsTable)
-    .where(
-      and(
-        eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
-        eq(scheduledRoomRegistrationsTable.userId, userId),
-        eq(scheduledRoomRegistrationsTable.status, "registered")
-      )
-    )
-    .limit(1);
-
-  if (existing.length > 0) return res.status(409).json({ error: "Already registered." });
+  let registeredCount = 0;
+  let errorStatus: number | null = null;
+  let errorBody: Record<string, string> | null = null;
 
   await db.transaction(async (tx) => {
-    await tx.insert(scheduledRoomRegistrationsTable).values({ raceRoomId: roomId, userId, status: "registered" });
-    await tx
-      .update(raceRoomsTable)
-      .set({ registeredCount: room.registeredCount + 1, updatedAt: new Date() })
-      .where(eq(raceRoomsTable.id, roomId));
+    const room = await lockRaceRoom(tx, roomId);
+    if (!room) {
+      errorStatus = 404;
+      errorBody = { error: "Room not found." };
+      return;
+    }
+    if (room.status !== "scheduled") {
+      errorStatus = 409;
+      errorBody = { error: "Room is no longer accepting registrations." };
+      return;
+    }
+
+    const existing = await lockScheduledRegistration(tx, roomId, userId);
+    if (existing && (existing.status === "registered" || existing.status === "active")) {
+      errorStatus = 409;
+      errorBody = { error: "Already registered." };
+      return;
+    }
+    if ((!existing || existing.status === "cancelled") && room.registeredCount >= room.maxPlayers) {
+      errorStatus = 409;
+      errorBody = { error: "Room is full." };
+      return;
+    }
+
+    const registrationResult = await registerOrReviveScheduledRegistration(tx, roomId, userId);
+    registeredCount = room.registeredCount + (registrationResult.changed ? 1 : 0);
+
+    if (registrationResult.changed) {
+      await tx
+        .update(raceRoomsTable)
+        .set({ registeredCount, updatedAt: new Date() })
+        .where(eq(raceRoomsTable.id, roomId));
+    }
   });
+
+  if (errorStatus !== null && errorBody) {
+    return res.status(errorStatus).json(errorBody);
+  }
 
   req.log.info({ roomId, userId }, "[ScheduleRoom] registerResponse");
 
   triggerEvent("public-rooms-available", "room:registered", {
     room_id: roomId,
-    registered_count: room.registeredCount + 1,
+    registered_count: registeredCount,
   }).catch(() => {});
 
   return res.json({
     success: true,
     registered: true,
-    registered_count: room.registeredCount + 1,
+    registered_count: registeredCount,
   });
 });
 
@@ -1506,45 +1527,48 @@ router.post("/rooms/:roomId/register", requireAuth, async (req, res) => {
 router.post("/rooms/:roomId/cancel-registration", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const roomId = String(req.params.roomId);
-
-  const [room] = await db
-    .select()
-    .from(raceRoomsTable)
-    .where(eq(raceRoomsTable.id, roomId))
-    .limit(1);
-
-  if (!room) return res.status(404).json({ error: "Room not found." });
-  if (room.status !== "scheduled") return res.status(409).json({ error: "Room has already started or been cancelled." });
-
-  const [reg] = await db
-    .select()
-    .from(scheduledRoomRegistrationsTable)
-    .where(
-      and(
-        eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
-        eq(scheduledRoomRegistrationsTable.userId, userId),
-        eq(scheduledRoomRegistrationsTable.status, "registered")
-      )
-    )
-    .limit(1);
-
-  if (!reg) return res.status(404).json({ error: "Registration not found." });
+  let registeredCount = 0;
+  let errorStatus: number | null = null;
+  let errorBody: Record<string, string> | null = null;
 
   await db.transaction(async (tx) => {
+    const room = await lockRaceRoom(tx, roomId);
+    if (!room) {
+      errorStatus = 404;
+      errorBody = { error: "Room not found." };
+      return;
+    }
+    if (room.status !== "scheduled") {
+      errorStatus = 409;
+      errorBody = { error: "Room has already started or been cancelled." };
+      return;
+    }
+
+    const reg = await lockScheduledRegistration(tx, roomId, userId);
+    if (!reg || reg.status !== "registered") {
+      errorStatus = 404;
+      errorBody = { error: "Registration not found." };
+      return;
+    }
+
+    registeredCount = Math.max(0, room.registeredCount - 1);
     await tx
       .update(scheduledRoomRegistrationsTable)
-      .set({ status: "cancelled", cancelledAt: new Date() })
+      .set({ status: "cancelled", cancelledAt: new Date(), activatedAt: null })
       .where(eq(scheduledRoomRegistrationsTable.id, reg.id));
-    const newCount = Math.max(0, room.registeredCount - 1);
     await tx
       .update(raceRoomsTable)
-      .set({ registeredCount: newCount, updatedAt: new Date() })
+      .set({ registeredCount, updatedAt: new Date() })
       .where(eq(raceRoomsTable.id, roomId));
   });
 
+  if (errorStatus !== null && errorBody) {
+    return res.status(errorStatus).json(errorBody);
+  }
+
   triggerEvent("public-rooms-available", "room:registration_cancelled", {
     room_id: roomId,
-    registered_count: Math.max(0, room.registeredCount - 1),
+    registered_count: registeredCount,
   }).catch(() => {});
 
   return res.json({ success: true, registered: false });
@@ -1637,11 +1661,11 @@ router.post("/races/host", requireAuth, async (req, res) => {
 
   const { entryType, maxPlayers, targetSteps, trackLayout, isPrivate, coinEntryAmount, customEntryAmountCents, goalType, countryCode, isCountryVs, teamACountry, teamACountryCode, teamBCountry, teamBCountryCode, scheduledStartAtIso, challengeEndAtIso, challengeDurationDays } = parsed.data;
 
-  // Guard: allow individually-enabled premium types even while the global flag is off
   if (!ENABLE_CASH_CHALLENGES && ["paid_1", "paid_3", "paid_5", "paid_usd"].includes(entryType)) {
-    if (!ENABLED_PREMIUM_ENTRY_TYPES.has(entryType)) {
-      return res.status(403).json({ error: "This challenge type is currently disabled." });
-    }
+    return res.status(403).json({ error: "Cash challenges are disabled for this build." });
+  }
+  if (!ENABLE_COIN_ENTRY_CHALLENGES && entryType === "coins_battle") {
+    return res.status(403).json({ error: "Coin-entry challenges are disabled for this build." });
   }
 
   // For paid_usd, validate and resolve the custom entry amount
@@ -1920,25 +1944,19 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
             .limit(1);
           const toDeduct = Math.min(bal?.currentBalance ?? 0, room.coinEntryAmount);
           if (toDeduct <= 0) continue;
-          const [updated] = await tx
-            .update(coinBalancesTable)
-            .set({
-              currentBalance: sql`${coinBalancesTable.currentBalance} - ${toDeduct}`,
-              lifetimeSpent: sql`${coinBalancesTable.lifetimeSpent} + ${toDeduct}`,
-              updatedAt: new Date(),
-            })
-            .where(eq(coinBalancesTable.userId, p.userId))
-            .returning({ currentBalance: coinBalancesTable.currentBalance });
-          newBalanceMap.set(p.userId, updated?.currentBalance ?? (bal?.currentBalance ?? 0) - toDeduct);
-          await tx.insert(coinTransactionsTable).values({
+          const ledger = await recordCoinLedgerEntry(tx, {
             userId: p.userId,
             amount: -toDeduct,
             transactionType: "spend",
             source: "coins_battle_entry",
             sourceId: raceId,
             rewardCode: null,
+            reasonCode: "coins_battle_entry",
+            idempotencyKey: `coins-battle-entry:${p.userId}:${raceId}`,
             description: `Coins Battle entry: ${toDeduct} coins`,
+            metadata: { raceId, entryAmount: toDeduct },
           });
+          newBalanceMap.set(p.userId, ledger.newBalance);
           totalCollected += toDeduct;
         }
         if (totalCollected > 0) {
@@ -2380,6 +2398,9 @@ router.post("/races", requireAuth, async (req, res) => {
   }
 
   const data = parsed.data;
+  if (!ENABLE_CASH_CHALLENGES && data.entryType !== "free") {
+    return res.status(403).json({ error: "Only free races are enabled in v1." });
+  }
   const amountCents = entryAmountCents(data.entryType);
 
   // Validate host owns the selected track theme (default themes always pass)
@@ -2486,25 +2507,42 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
     .limit(5);
 
   let targetRoomId: string | null = null;
+  let participant: typeof raceParticipantsTable.$inferSelect | null = null;
+  let joinedRoom: typeof raceRoomsTable.$inferSelect | null = null;
+
   for (const room of openRooms) {
-    const [already] = await db
-      .select({ id: raceParticipantsTable.id })
-      .from(raceParticipantsTable)
-      .where(
-        and(
-          eq(raceParticipantsTable.raceRoomId, room.id),
-          eq(raceParticipantsTable.userId, userId),
-          ne(raceParticipantsTable.status, "left"),
-        ),
-      )
-      .limit(1);
-    if (!already) {
-      targetRoomId = room.id;
-      break;
-    }
+    let joined = false;
+
+    await db.transaction(async (tx) => {
+      const lockedRoom = await lockRaceRoom(tx, room.id);
+      if (!lockedRoom || (lockedRoom.status !== "open" && lockedRoom.status !== "full")) return;
+      if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) return;
+
+      const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: lockedRoom.id, userId });
+      if (!participantResult.changed) return;
+
+      const newPlayerCount = lockedRoom.currentPlayers + 1;
+      const nextStatus = deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers);
+
+      await tx
+        .update(raceRoomsTable)
+        .set({
+          currentPlayers: newPlayerCount,
+          status: nextStatus,
+          updatedAt: new Date(),
+        })
+        .where(eq(raceRoomsTable.id, lockedRoom.id));
+
+      participant = participantResult.participant;
+      joinedRoom = { ...lockedRoom, currentPlayers: newPlayerCount, status: nextStatus };
+      targetRoomId = lockedRoom.id;
+      joined = true;
+    });
+
+    if (joined) break;
   }
 
-  if (!targetRoomId) {
+  if (!targetRoomId || !participant || !joinedRoom) {
     const [newRoom] = await db
       .insert(raceRoomsTable)
       .values({
@@ -2516,41 +2554,29 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
         targetSteps,
         maxPlayers,
         currentPlayers: 1,
-      })
+    })
       .returning();
     targetRoomId = newRoom.id;
 
-    // Creator is auto-joined as host
-    await db
+    [participant] = await db
       .insert(raceParticipantsTable)
-      .values({ raceRoomId: targetRoomId, userId, status: "joined" });
+      .values({ raceRoomId: targetRoomId, userId, status: "joined" })
+      .returning();
 
     req.log.info({ raceId: targetRoomId, userId }, "user quick-joined (created) free race");
     return res.status(201).json({ raceId: targetRoomId, isHost: true });
   }
 
-  const [participant] = await db.transaction(async (tx) => {
-    const [p] = await tx
-      .insert(raceParticipantsTable)
-      .values({ raceRoomId: targetRoomId!, userId, status: "joined" })
-      .returning();
-
-    await tx
-      .update(raceRoomsTable)
-      .set({ currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`, updatedAt: new Date() })
-      .where(eq(raceRoomsTable.id, targetRoomId!));
-
-    return [p];
-  });
-
-  const [room] = await db.select({ creatorId: raceRoomsTable.creatorId }).from(raceRoomsTable).where(eq(raceRoomsTable.id, targetRoomId)).limit(1);
   req.log.info({ raceId: targetRoomId, userId }, "user quick-joined free race");
-  return res.status(201).json({ raceId: targetRoomId, participant, isHost: room?.creatorId === userId });
+  return res.status(201).json({ raceId: targetRoomId, participant, isHost: joinedRoom.creatorId === userId });
 });
 
 // ── POST /api/races/:id/join-paid ─────────────────────────────────────────────
 // Deducts entry fee from the user's available wallet balance and joins the race.
 router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
+  if (!ENABLE_CASH_CHALLENGES) {
+    return res.status(404).json({ error: "Cash race joins are disabled for this build." });
+  }
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const raceId = String(req.params.id);
 
@@ -2571,8 +2597,6 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
     .limit(1);
 
   if (!room) return res.status(404).json({ error: "Race not found." });
-  if (room.status !== "open") return res.status(409).json({ error: "Race is no longer open to join." });
-  if (room.currentPlayers >= room.maxPlayers) return res.status(409).json({ error: "Race is full." });
   if (room.entryAmountCents === 0) return res.status(400).json({ error: "Use the free join endpoint for free races." });
 
   // Eligibility checks
@@ -2581,20 +2605,6 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   if (!profile.isAdult) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
   if (!profile.paidRaceEnabled) return res.status(403).json({ error: "Paid challenges are not available for your account." });
   if (profile.accountStatus !== "active") return res.status(403).json({ error: "Your account is under review." });
-
-  // Already in the race?
-  const [existing] = await db
-    .select()
-    .from(raceParticipantsTable)
-    .where(
-      and(
-        eq(raceParticipantsTable.raceRoomId, raceId),
-        eq(raceParticipantsTable.userId, userId),
-        ne(raceParticipantsTable.status, "left"),
-      ),
-    )
-    .limit(1);
-  if (existing) return res.status(409).json({ error: "You are already in this race." });
 
   // Wallet check
   const [wallet] = await db.select().from(walletsTable).where(eq(walletsTable.userId, userId)).limit(1);
@@ -2605,24 +2615,65 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
     });
   }
 
-  const [participant] = await db.transaction(async (tx) => {
-    // Insert participant — fee is held (not yet deducted); charged when race starts
-    const [p] = await tx
-      .insert(raceParticipantsTable)
-      .values({ raceRoomId: raceId, userId, status: "joined" })
-      .returning();
+  let participant: typeof raceParticipantsTable.$inferSelect | null = null;
+  let lockedRoom: typeof raceRoomsTable.$inferSelect | null = null;
+  let joinedCurrentPlayers = room.currentPlayers;
+  let joinErrorStatus: number | null = null;
+  let joinErrorBody: Record<string, string> | null = null;
 
-    // Increment player count
+  await db.transaction(async (tx) => {
+    lockedRoom = await lockRaceRoom(tx, raceId);
+    if (!lockedRoom) {
+      joinErrorStatus = 404;
+      joinErrorBody = { error: "Race not found." };
+      return;
+    }
+    if (lockedRoom.status !== "open" && lockedRoom.status !== "full") {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "Race is no longer open to join." };
+      return;
+    }
+    if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "Race is full." };
+      return;
+    }
+
+    const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: raceId, userId });
+    if (participantResult.reason === "blocked") {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "You cannot rejoin this race." };
+      return;
+    }
+    if (participantResult.reason === "already_joined") {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "You are already in this race." };
+      return;
+    }
+
+    participant = participantResult.participant;
+    const newPlayerCount = lockedRoom.currentPlayers + 1;
     await tx
       .update(raceRoomsTable)
-      .set({ currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`, updatedAt: new Date() })
-      .where(eq(raceRoomsTable.id, raceId));
-
-    return [p];
+      .set({
+        currentPlayers: newPlayerCount,
+        status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers),
+        updatedAt: new Date(),
+      })
+      .where(eq(raceRoomsTable.id, lockedRoom.id));
+    joinedCurrentPlayers = newPlayerCount;
+    lockedRoom = { ...lockedRoom, currentPlayers: newPlayerCount, status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers) };
   });
 
+  if (joinErrorStatus !== null && joinErrorBody) {
+    return res.status(joinErrorStatus).json(joinErrorBody);
+  }
+  if (!participant) {
+    return res.status(409).json({ error: "Unable to join this race." });
+  }
+
   await triggerEvent(`public-live-race-${raceId}`, "race:player-joined", { userId, raceId });
-  triggerEvent("public-rooms-available", "room:participant_joined", { room_id: raceId, current_players: room.currentPlayers + 1 }).catch(() => {});
+  triggerEvent("public-rooms-available", "room:participant_joined", { room_id: raceId, current_players: joinedCurrentPlayers }).catch(() => {});
   req.log.info({ raceId, userId, amountCents: room.entryAmountCents }, "user joined paid race");
   return res.status(201).json({ participant, isHost: false });
 });
@@ -2649,10 +2700,12 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
     .limit(1);
 
   if (!room) return res.status(404).json({ error: "Race not found" });
-  if (room.status !== "open") return res.status(409).json({ error: "Race is no longer open to join." });
-  if (room.currentPlayers >= room.maxPlayers) return res.status(409).json({ error: "Race is full." });
   if (room.entryAmountCents > 0) {
-    return res.status(400).json({ error: "Use the payment API to join paid races." });
+    return res.status(ENABLE_CASH_CHALLENGES ? 400 : 404).json({
+      error: ENABLE_CASH_CHALLENGES
+        ? "Use the payment API to join paid races."
+        : "Cash races are disabled for this build.",
+    });
   }
 
   if (room.type === "country_battle" && room.teamACountryCode && room.teamBCountryCode) {
@@ -2670,36 +2723,65 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
     }
   }
 
-  const [existing] = await db
-    .select()
-    .from(raceParticipantsTable)
-    .where(
-      and(
-        eq(raceParticipantsTable.raceRoomId, raceId),
-        eq(raceParticipantsTable.userId, userId),
-        ne(raceParticipantsTable.status, "left"),
-      ),
-    )
-    .limit(1);
+  let participant: typeof raceParticipantsTable.$inferSelect | null = null;
+  let lockedRoom: typeof raceRoomsTable.$inferSelect | null = null;
+  let joinedCurrentPlayers = room.currentPlayers;
+  let joinErrorStatus: number | null = null;
+  let joinErrorBody: Record<string, string | undefined> | null = null;
 
-  if (existing) return res.status(409).json({ error: "You are already in this race." });
+  await db.transaction(async (tx) => {
+    lockedRoom = await lockRaceRoom(tx, raceId);
+    if (!lockedRoom) {
+      joinErrorStatus = 404;
+      joinErrorBody = { error: "Race not found" };
+      return;
+    }
+    if (lockedRoom.status !== "open" && lockedRoom.status !== "full") {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "Race is no longer open to join." };
+      return;
+    }
+    if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "Race is full." };
+      return;
+    }
 
-  const [participant] = await db.transaction(async (tx) => {
-    const [p] = await tx
-      .insert(raceParticipantsTable)
-      .values({ raceRoomId: raceId, userId, status: "joined" })
-      .returning();
+    const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: raceId, userId });
+    if (participantResult.reason === "blocked") {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "You cannot rejoin this race." };
+      return;
+    }
+    if (participantResult.reason === "already_joined") {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "You are already in this race." };
+      return;
+    }
 
+    participant = participantResult.participant;
+    const newPlayerCount = lockedRoom.currentPlayers + 1;
     await tx
       .update(raceRoomsTable)
-      .set({ currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`, updatedAt: new Date() })
-      .where(eq(raceRoomsTable.id, raceId));
-
-    return [p];
+      .set({
+        currentPlayers: newPlayerCount,
+        status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers),
+        updatedAt: new Date(),
+      })
+      .where(eq(raceRoomsTable.id, lockedRoom.id));
+    joinedCurrentPlayers = newPlayerCount;
+    lockedRoom = { ...lockedRoom, currentPlayers: newPlayerCount, status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers) };
   });
 
+  if (joinErrorStatus !== null && joinErrorBody) {
+    return res.status(joinErrorStatus).json(joinErrorBody);
+  }
+  if (!participant) {
+    return res.status(409).json({ error: "Unable to join this race." });
+  }
+
   await triggerEvent(`public-live-race-${raceId}`, "race:player-joined", { userId, raceId });
-  triggerEvent("public-rooms-available", "room:participant_joined", { room_id: raceId, current_players: room.currentPlayers + 1 }).catch(() => {});
+  triggerEvent("public-rooms-available", "room:participant_joined", { room_id: raceId, current_players: joinedCurrentPlayers }).catch(() => {});
   req.log.info({ raceId, userId }, "user joined race (free)");
   return res.status(201).json({ participant, isHost: room.creatorId === userId });
 });
@@ -2853,6 +2935,9 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
   // Cash challenge consent enforcement — must be accepted before join
   const rulesVersion = (acceptedRulesVersion as string | undefined) ?? "2026-06";
   if (room.entryAmountCents > 0 && !acceptedCashChallengeConsent) {
+    if (!ENABLE_CASH_CHALLENGES) {
+      return res.status(404).json({ success: false, error: "Cash challenges are disabled for this build." });
+    }
     return res.status(403).json({
       success: false,
       code: "CASH_CHALLENGE_CONSENT_REQUIRED",
@@ -2862,6 +2947,12 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
 
   // Paid room: profile + wallet check
   if (room.entryAmountCents > 0) {
+    if (!ENABLE_CASH_CHALLENGES) {
+      return res.status(404).json({
+        success: false,
+        error: "Cash challenges are disabled for this build.",
+      });
+    }
     const [profile] = await db.select().from(profilesTable).where(eq(profilesTable.id, userId)).limit(1);
     if (!profile || !profile.isAdult || !profile.paidRaceEnabled || profile.accountStatus !== "active") {
       return res.status(403).json({ success: false, error: "Paid challenges are not available for your account." });
@@ -2874,16 +2965,70 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
         error: `Insufficient balance. You need $${(room.entryAmountCents / 100).toFixed(2)} but have $${(balance / 100).toFixed(2)}.`,
       });
     }
+  }
 
-    // Join only — fee held, charged when race starts
-    await db.transaction(async (tx) => {
-      await tx.insert(raceParticipantsTable).values({ raceRoomId: room.id, userId, status: "joined" });
-      await tx.update(raceRoomsTable)
-        .set({ currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`, updatedAt: new Date() })
-        .where(eq(raceRoomsTable.id, room.id));
-    });
+  let lockedRoom: typeof raceRoomsTable.$inferSelect | null = null;
+  let joinedCurrentPlayers = room.currentPlayers;
+  let joinErrorStatus: number | null = null;
+  let joinErrorBody: Record<string, string | boolean> | null = null;
 
-    // Store consent record for compliance (upsert — idempotent on same user/room/version)
+  await db.transaction(async (tx) => {
+    lockedRoom = await lockRaceRoom(tx, room.id);
+    if (!lockedRoom) {
+      joinErrorStatus = 404;
+      joinErrorBody = { success: false, error: "Invalid room code." };
+      return;
+    }
+    if (lockedRoom.status === "completed" || lockedRoom.status === "cancelled") {
+      joinErrorStatus = 409;
+      joinErrorBody = { success: false, code: "ROOM_CODE_EXPIRED", error: "This room code has expired." };
+      return;
+    }
+    if (lockedRoom.status === "in_progress") {
+      joinErrorStatus = 409;
+      joinErrorBody = { success: false, code: "RACE_ALREADY_STARTED", error: "This race has already started." };
+      return;
+    }
+    if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
+      joinErrorStatus = 409;
+      joinErrorBody = { success: false, code: "ROOM_FULL", error: "This room is full." };
+      return;
+    }
+
+    const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: lockedRoom.id, userId });
+    if (participantResult.reason === "blocked") {
+      joinErrorStatus = 409;
+      joinErrorBody = { success: false, code: "RACE_ALREADY_FORFEITED", error: "You already quit this race and cannot rejoin while it is active." };
+      return;
+    }
+    if (participantResult.reason === "already_joined") {
+      joinErrorStatus = 409;
+      joinErrorBody = { success: false, error: "You are already in this race." };
+      return;
+    }
+
+    const newPlayerCount = lockedRoom.currentPlayers + 1;
+    await tx.update(raceRoomsTable)
+      .set({
+        currentPlayers: newPlayerCount,
+        status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers),
+        updatedAt: new Date(),
+      })
+      .where(eq(raceRoomsTable.id, lockedRoom.id));
+    joinedCurrentPlayers = newPlayerCount;
+
+    lockedRoom = {
+      ...lockedRoom,
+      currentPlayers: newPlayerCount,
+      status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers),
+    };
+  });
+
+  if (joinErrorStatus !== null && joinErrorBody) {
+    return res.status(joinErrorStatus).json(joinErrorBody);
+  }
+
+  if (room.entryAmountCents > 0) {
     await db
       .insert(cashChallengeConsentsTable)
       .values({
@@ -2894,17 +3039,10 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
         rulesVersion,
       })
       .onConflictDoNothing();
-  } else {
-    await db.transaction(async (tx) => {
-      await tx.insert(raceParticipantsTable).values({ raceRoomId: room.id, userId, status: "joined" });
-      await tx.update(raceRoomsTable)
-        .set({ currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`, updatedAt: new Date() })
-        .where(eq(raceRoomsTable.id, room.id));
-    });
   }
 
   await triggerEvent(`public-live-race-${room.id}`, "race:player-joined", { userId, raceId: room.id });
-  triggerEvent("public-rooms-available", "room:participant_joined", { room_id: room.id, current_players: room.currentPlayers + 1 }).catch(() => {});
+  triggerEvent("public-rooms-available", "room:participant_joined", { room_id: room.id, current_players: joinedCurrentPlayers }).catch(() => {});
   req.log.info({ raceId: room.id, userId, code: normalizedCode }, "[JoinWithCode] user joined private room");
 
   const newJoinParticipants = await db
@@ -3174,16 +3312,24 @@ router.get("/races/:id", requireAuth, async (req, res) => {
           ))
           .limit(1);
         if (reg) {
-          await db.insert(raceParticipantsTable).values({
-            raceRoomId: raceId,
-            userId,
-            status: "joined",
-            currentSteps: 0,
-            raceBaselineSteps: 0,
-          }).onConflictDoNothing();
-          await db.update(raceRoomsTable)
-            .set({ currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`, updatedAt: new Date() })
-            .where(eq(raceRoomsTable.id, raceId));
+          await db.transaction(async (tx) => {
+            const lockedRoom = await lockRaceRoom(tx, raceId);
+            if (!lockedRoom || lockedRoom.status !== "in_progress") return;
+            const lockedReg = await lockScheduledRegistration(tx, raceId, userId);
+            if (!lockedReg || (lockedReg.status !== "registered" && lockedReg.status !== "active")) return;
+
+            const participantResult = await joinOrReviveParticipant(tx, {
+              raceRoomId: raceId,
+              userId,
+              currentSteps: 0,
+              raceBaselineSteps: 0,
+            });
+            if (participantResult.changed) {
+              await tx.update(raceRoomsTable)
+                .set({ currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`, updatedAt: new Date() })
+                .where(eq(raceRoomsTable.id, raceId));
+            }
+          });
           req.log.info({ raceId, userId }, "[SponsoredRace] auto-created participant on GET");
           const [profile] = await db
             .select({
@@ -3356,6 +3502,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
         finishedGoal: raceParticipantsTable.finishedGoal,
         lastStepSequenceId: raceParticipantsTable.lastStepSequenceId,
         raceBaselineSteps: raceParticipantsTable.raceBaselineSteps,
+        lastStepSyncAt: raceParticipantsTable.lastStepSyncAt,
       })
       .from(raceParticipantsTable)
       .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId)))
@@ -3389,19 +3536,25 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
       .limit(1);
 
     if (reg) {
-      await db.insert(raceParticipantsTable)
-        .values({
+      await db.transaction(async (tx) => {
+        const lockedRoom = await lockRaceRoom(tx, raceId);
+        if (!lockedRoom || lockedRoom.status !== "in_progress") return;
+        const lockedReg = await lockScheduledRegistration(tx, raceId, userId);
+        if (!lockedReg || (lockedReg.status !== "registered" && lockedReg.status !== "active")) return;
+
+        const participantResult = await joinOrReviveParticipant(tx, {
           raceRoomId: raceId,
           userId,
-          status: "joined",
           currentSteps: 0,
           raceBaselineSteps: 0,
-        })
-        .onConflictDoNothing();
-
-      await db.update(raceRoomsTable)
-        .set({ currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`, updatedAt: new Date() })
-        .where(eq(raceRoomsTable.id, raceId));
+          latestDeviceSteps: deviceTotal,
+        });
+        if (participantResult.changed) {
+          await tx.update(raceRoomsTable)
+            .set({ currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`, updatedAt: new Date() })
+            .where(eq(raceRoomsTable.id, raceId));
+        }
+      });
 
       const newPRows = await db
         .select({
@@ -3410,6 +3563,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
           finishedGoal: raceParticipantsTable.finishedGoal,
           lastStepSequenceId: raceParticipantsTable.lastStepSequenceId,
           raceBaselineSteps: raceParticipantsTable.raceBaselineSteps,
+          lastStepSyncAt: raceParticipantsTable.lastStepSyncAt,
         })
         .from(raceParticipantsTable)
         .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId)))
@@ -3441,6 +3595,35 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
 
   if (room && room.status !== "in_progress") {
     return res.json({ steps: participantData.currentSteps, race_status: room.status });
+  }
+
+  const nowMs = Date.now();
+  if (devTime && Math.abs(nowMs - devTime.getTime()) > MAX_DEVICE_TIME_SKEW_MS) {
+    req.log.warn({ raceId, userId, deviceTime, serverTime: new Date(nowMs).toISOString() }, "[RaceStepsSync] rejected due to device time skew");
+    return res.status(400).json({
+      error: "deviceTime is outside the allowed skew window",
+      code: "DEVICE_TIME_SKEW",
+    });
+  }
+
+  const lastSyncAtMs = participantData.lastStepSyncAt?.getTime() ?? room?.startedAt?.getTime() ?? nowMs;
+  const elapsedSinceLastSyncSeconds = Math.max(1, (nowMs - lastSyncAtMs) / 1000);
+  const maxAllowedDelta = Math.max(
+    MAX_PROGRESS_DELTA_FLOOR,
+    Math.ceil(elapsedSinceLastSyncSeconds * MAX_PROGRESS_STEPS_PER_SECOND),
+  );
+  const requestedSteps = Math.floor(steps);
+  const requestedDelta = requestedSteps - participantData.currentSteps;
+  if (requestedDelta > maxAllowedDelta) {
+    req.log.warn(
+      { raceId, userId, requestedSteps, currentSteps: participantData.currentSteps, requestedDelta, maxAllowedDelta, elapsedSinceLastSyncSeconds },
+      "[RaceStepsSync] rejected due to excessive progress delta",
+    );
+    return res.status(409).json({
+      error: "Progress jump exceeds the allowed sync delta.",
+      code: "STEP_DELTA_TOO_LARGE",
+      max_allowed_delta: maxAllowedDelta,
+    });
   }
 
   let newSteps = Math.max(participantData.currentSteps, Math.floor(steps));
@@ -3482,7 +3665,6 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
   const baselineNeedsRegistration = baselineToStore !== null;
 
   // ── Elapsed time + suspicious early-jump detection ────────────────────────
-  const nowMs = Date.now();
   const elapsedSeconds = room?.startedAt
     ? Math.max(0, (nowMs - room.startedAt.getTime()) / 1000)
     : 0;
@@ -3556,36 +3738,68 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
 
   if (newSteps > participantData.currentSteps) {
     if (justFinishedGoal) {
-      // Count participants who have already finished this race (for rank assignment)
-      const [finisherRow] = await db
-        .select({ cnt: sql<number>`count(*)::int` })
-        .from(raceParticipantsTable)
-        .where(and(
-          eq(raceParticipantsTable.raceRoomId, raceId),
-          eq(raceParticipantsTable.finishedGoal, true),
-        ));
-      const computedFinishRank = (finisherRow?.cnt ?? 0) + 1;
-
-      // Atomically mark finished — WHERE finishedGoal=false guards against duplicate events
       const finishedAtMs = Date.now();
-      const [updated] = await db
-        .update(raceParticipantsTable)
-        .set({
-          currentSteps: newSteps,
-          finishedGoal: true,
-          finishedAt: new Date(finishedAtMs),
-          finishedAtMs,
-          finishRank: computedFinishRank,
-          ...syncCols,
-        })
-        .where(and(
-          eq(raceParticipantsTable.id, participantData.id),
-          eq(raceParticipantsTable.finishedGoal, false),
-        ))
-        .returning({ id: raceParticipantsTable.id, finishRank: raceParticipantsTable.finishRank });
+      const updated = await db.transaction(async (tx) => {
+        const lockedRoom = await lockRaceRoom(tx, raceId);
+        if (!lockedRoom) return null;
+
+        const [lockedParticipant] = await tx
+          .select({
+            id: raceParticipantsTable.id,
+            finishedGoal: raceParticipantsTable.finishedGoal,
+          })
+          .from(raceParticipantsTable)
+          .where(eq(raceParticipantsTable.id, participantData.id))
+          .limit(1)
+          .for("update");
+
+        if (!lockedParticipant || lockedParticipant.finishedGoal) {
+          return null;
+        }
+
+        const [rankRow] = await tx
+          .select({ maxRank: sql<number>`coalesce(max(${raceParticipantsTable.finishRank}), 0)::int` })
+          .from(raceParticipantsTable)
+          .where(eq(raceParticipantsTable.raceRoomId, raceId));
+        const computedFinishRank = (rankRow?.maxRank ?? 0) + 1;
+
+        const [nextParticipant] = await tx
+          .update(raceParticipantsTable)
+          .set({
+            currentSteps: newSteps,
+            finishedGoal: true,
+            finishedAt: new Date(finishedAtMs),
+            finishedAtMs,
+            finishRank: computedFinishRank,
+            ...syncCols,
+          })
+          .where(and(
+            eq(raceParticipantsTable.id, participantData.id),
+            eq(raceParticipantsTable.finishedGoal, false),
+          ))
+          .returning({ finishRank: raceParticipantsTable.finishRank });
+
+        if (!nextParticipant) {
+          return null;
+        }
+
+        const [finishedCountRow] = await tx
+          .select({ cnt: sql<number>`count(distinct ${raceParticipantsTable.userId})::int` })
+          .from(raceParticipantsTable)
+          .where(and(
+            eq(raceParticipantsTable.raceRoomId, raceId),
+            eq(raceParticipantsTable.finishedGoal, true),
+          ));
+
+        return {
+          finishRank: nextParticipant.finishRank ?? computedFinishRank,
+          finishedCount: finishedCountRow?.cnt ?? 0,
+          playerCount: lockedRoom.currentPlayers ?? 2,
+        };
+      });
 
       if (updated) {
-        const actualRank = updated.finishRank ?? computedFinishRank;
+        const actualRank = updated.finishRank;
 
         // Fetch username for broadcast
         const [profile] = await db
@@ -3620,18 +3834,10 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
         ]);
 
         // ── Early finalization: end race immediately when required winners are set ──
-        // Re-count finished participants now (including the one we just marked).
         // numWinners is based on currentPlayers captured at race start.
-        const playerCount = room?.currentPlayers ?? 2;
+        const playerCount = updated.playerCount;
         const winnersNeeded = numWinners(playerCount);
-        const [finishedCountRow] = await db
-          .select({ cnt: sql<number>`count(distinct ${raceParticipantsTable.userId})::int` })
-          .from(raceParticipantsTable)
-          .where(and(
-            eq(raceParticipantsTable.raceRoomId, raceId),
-            eq(raceParticipantsTable.finishedGoal, true),
-          ));
-        const finishedCount = finishedCountRow?.cnt ?? 0;
+        const finishedCount = updated.finishedCount;
 
         req.log.info(
           { raceId, finishedCount, winnersNeeded, playerCount },
@@ -3746,24 +3952,26 @@ router.post("/races/:id/reconcile-steps", requireAuth, async (req, res) => {
 
 // ── POST /api/races/:id/force-complete (TESTING ONLY) ─────────────────────────
 // Immediately marks an in_progress race as completed, stores race_results, announces winners.
-router.post("/races/:id/force-complete", requireAuth, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
-  const raceId = String(req.params.id);
+if (process.env.NODE_ENV !== "production") {
+  router.post("/races/:id/force-complete", requireAuth, requireAdminKey, async (req, res) => {
+    const userId = (req as AuthenticatedRequest).descopeUserId;
+    const raceId = String(req.params.id);
 
-  const [room] = await db
-    .select()
-    .from(raceRoomsTable)
-    .where(eq(raceRoomsTable.id, raceId))
-    .limit(1);
+    const [room] = await db
+      .select()
+      .from(raceRoomsTable)
+      .where(eq(raceRoomsTable.id, raceId))
+      .limit(1);
 
-  if (!room) return res.status(404).json({ error: "Race not found" });
-  if (room.creatorId !== userId) return res.status(403).json({ error: "Only the host can force-complete." });
-  if (room.status !== "in_progress") return res.status(409).json({ error: "Race is not in progress." });
+    if (!room) return res.status(404).json({ error: "Race not found" });
+    if (room.creatorId !== userId) return res.status(403).json({ error: "Only the host can force-complete." });
+    if (room.status !== "in_progress") return res.status(409).json({ error: "Race is not in progress." });
 
-  await autoCompleteRace(raceId);
-  req.log.info({ raceId, userId }, "race force-completed");
-  return res.json({ success: true });
-});
+    await autoCompleteRace(raceId);
+    req.log.info({ raceId, userId }, "race force-completed");
+    return res.json({ success: true });
+  });
+}
 
 // ── GET /api/races/:id/comments ───────────────────────────────────────────────
 router.get("/races/:id/comments", requireAuth, async (req, res) => {

@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, date, uniqueIndex, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, date, uniqueIndex, boolean, jsonb, index } from "drizzle-orm/pg-core";
 
 // ── Coin Balances ─────────────────────────────────────────────────────────────
 // One row per user. userId is the PK.
@@ -22,9 +22,16 @@ export const coinTransactionsTable = pgTable("coin_transactions", {
   source: text("source").notNull(), // daily_walk | daily_goal | streak | race | achievement | theme_purchase | admin
   sourceId: text("source_id"),
   rewardCode: text("reward_code"),
+  reasonCode: text("reason_code").notNull().default("unspecified"),
+  idempotencyKey: text("idempotency_key").notNull(),
   description: text("description").notNull(),
+  balanceAfter: integer("balance_after"),
+  metadata: jsonb("metadata"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (t) => [
+  uniqueIndex("coin_transactions_user_idempotency_idx").on(t.userId, t.idempotencyKey),
+  index("coin_transactions_source_idx").on(t.source, t.sourceId),
+]);
 
 // ── Daily Coin Rewards (idempotency) ──────────────────────────────────────────
 // Prevents duplicate awards for the same reward on the same day.
@@ -59,6 +66,25 @@ export const coinRewardGrantsTable = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex("coin_reward_grants_unique").on(t.userId, t.rewardCode, t.sourceId)],
+);
+
+export const adRewardClaimsTable = pgTable(
+  "ad_reward_claims",
+  {
+    id: text("id")
+      .primaryKey()
+      .$defaultFn(() => crypto.randomUUID()),
+    userId: text("user_id").notNull(),
+    claimId: text("claim_id").notNull(),
+    rewardDate: date("reward_date").notNull(),
+    network: text("network"),
+    placement: text("placement"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("ad_reward_claims_claim_idx").on(t.claimId),
+    index("ad_reward_claims_user_date_idx").on(t.userId, t.rewardDate),
+  ],
 );
 
 // ── Spectate Sessions ─────────────────────────────────────────────────────────

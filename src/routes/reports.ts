@@ -1,20 +1,33 @@
-import { Router } from "express";
+import { Router, type RequestHandler } from "express";
 import { db } from "@db";
 import {
   chatMessageReportsTable,
   globalChatMessagesTable,
   privateChatMessagesTable,
-  profilesTable,
 } from "@db/schema";
-import { eq, countDistinct } from "drizzle-orm";
+import { and, eq, countDistinct } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { triggerEvent } from "../lib/pusher";
 import { z } from "zod";
+import { requireActiveAccount } from "../middleware/requireActiveAccount";
+import { writeAuditLog } from "../lib/auditLog";
+import { config } from "../lib/config";
+import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit";
+import { sanitizePlainText } from "../lib/text";
 
 const router = Router();
+const reportLimiter: RequestHandler = config.features.rateLimitingEnabled
+  ? createRedisRateLimit({
+      bucket: "chat-report",
+      windowMs: 10 * 60 * 1000,
+      max: 5,
+      failureMode: "closed",
+      message: "You are submitting reports too quickly. Please try again later.",
+      code: "REPORT_RATE_LIMITED",
+      key: rateLimitByActorOrIp,
+    })
+  : ((_req, _res, next) => next());
 
 const VALID_REASONS = ["spam", "harassment", "inappropriate", "hate_or_threat", "other"] as const;
-const AUTO_DELETE_THRESHOLD = 1;
 
 const reportSchema = z.object({
   reason: z.enum(VALID_REASONS),
@@ -24,57 +37,19 @@ const reportSchema = z.object({
   messageSnapshot: z.string().max(1000).optional(),
 });
 
-// ── In-memory rate limiter ────────────────────────────────────────────────────
-// 5 reports per 10 minutes, 20 per day per user.
-interface RateBucket { count10m: number; count1d: number; reset10m: number; reset1d: number }
-const _rateStore = new Map<string, RateBucket>();
-
-function checkRateLimit(userId: string): { allowed: boolean } {
-  const now = Date.now();
-  const existing = _rateStore.get(userId);
-  const bucket: RateBucket = existing ?? {
-    count10m: 0, count1d: 0,
-    reset10m: now + 10 * 60 * 1000,
-    reset1d: now + 24 * 60 * 60 * 1000,
-  };
-  if (now >= bucket.reset10m) { bucket.count10m = 0; bucket.reset10m = now + 10 * 60 * 1000; }
-  if (now >= bucket.reset1d)  { bucket.count1d  = 0; bucket.reset1d  = now + 24 * 60 * 60 * 1000; }
-  if (bucket.count10m >= 5 || bucket.count1d >= 20) return { allowed: false };
-  bucket.count10m++;
-  bucket.count1d++;
-  _rateStore.set(userId, bucket);
-  return { allowed: true };
-}
-
-// Prune stale rate-limit entries once per hour to avoid memory leaks
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of _rateStore) {
-    if (now >= v.reset1d) _rateStore.delete(k);
-  }
-}, 60 * 60 * 1000);
-
 // ── POST /api/chat/messages/:messageId/report ─────────────────────────────────
-router.post("/chat/messages/:messageId/report", requireAuth, async (req, res) => {
+router.post("/chat/messages/:messageId/report", requireAuth, requireActiveAccount, reportLimiter, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const { messageId } = req.params as { messageId: string };
-
-  // Rate limit
-  const { allowed } = checkRateLimit(userId);
-  if (!allowed) {
-    return res.status(429).json({
-      success: false,
-      code: "REPORT_RATE_LIMITED",
-      message: "You are submitting reports too quickly. Please try again later.",
-    });
-  }
 
   const parsed = reportSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ success: false, message: "Invalid report payload", errors: parsed.error.flatten() });
   }
 
-  const { reason, note, chatType, reportedUserId, messageSnapshot } = parsed.data;
+  const { reason, chatType, reportedUserId } = parsed.data;
+  const note = parsed.data.note ? sanitizePlainText(parsed.data.note) : undefined;
+  const messageSnapshot = parsed.data.messageSnapshot ? sanitizePlainText(parsed.data.messageSnapshot) : undefined;
 
   try {
     // Fetch message snapshot + conversationId from DB
@@ -97,20 +72,22 @@ router.post("/chat/messages/:messageId/report", requireAuth, async (req, res) =>
       } catch {}
     }
 
-    // Check if this user already reported this message (prevent duplicate reports)
-    const existingReports = await db
-      .select({ id: chatMessageReportsTable.id })
-      .from(chatMessageReportsTable)
-      .where(eq(chatMessageReportsTable.messageId, messageId))
-      .limit(50);
-
-    const alreadyReported = existingReports.some((r) => (r as { reportedByUserId?: string }).reportedByUserId === userId);
-    // Note: drizzle select only returns selected columns, so re-query for the check
     const [myPriorReport] = await db
       .select({ id: chatMessageReportsTable.id })
       .from(chatMessageReportsTable)
-      .where(eq(chatMessageReportsTable.messageId, messageId))
+      .where(and(
+        eq(chatMessageReportsTable.messageId, messageId),
+        eq(chatMessageReportsTable.reportedByUserId, userId),
+      ))
       .limit(1);
+
+    if (myPriorReport) {
+      return res.status(409).json({
+        success: false,
+        code: "REPORT_ALREADY_SUBMITTED",
+        message: "You have already reported this message.",
+      });
+    }
 
     // Count how many distinct users have already reported this message
     const [{ count: priorCount }] = await db
@@ -119,10 +96,6 @@ router.post("/chat/messages/:messageId/report", requireAuth, async (req, res) =>
       .where(eq(chatMessageReportsTable.messageId, messageId));
 
     // Get reporter profile for logging
-    const [reporter] = await db
-      .select({ username: profilesTable.username })
-      .from(profilesTable).where(eq(profilesTable.id, userId)).limit(1);
-
     // Save report
     const [report] = await db.insert(chatMessageReportsTable).values({
       messageId,
@@ -138,39 +111,25 @@ router.post("/chat/messages/:messageId/report", requireAuth, async (req, res) =>
     }).returning({ id: chatMessageReportsTable.id });
 
     req.log.info({ reportId: report.id, userId, messageId, reason, chatType, priorCount }, "[Report] saved to DB");
-
-    // After inserting, total distinct reporters = priorCount + 1 (this user)
-    const totalDistinctReporters = Number(priorCount) + 1;
-
-    if (totalDistinctReporters >= AUTO_DELETE_THRESHOLD) {
-      // Auto-delete the message
-      if (chatType === "global") {
-        await db.update(globalChatMessagesTable)
-          .set({ isDeleted: true })
-          .where(eq(globalChatMessagesTable.id, messageId));
-        void triggerEvent("public-global-chat", "chat:message_deleted", { messageId });
-      } else if (chatType === "private" && conversationId) {
-        await db.update(privateChatMessagesTable)
-          .set({ isDeleted: true })
-          .where(eq(privateChatMessagesTable.id, messageId));
-        void triggerEvent(`private-chat-${conversationId}`, "chat:message_deleted", { messageId });
-      }
-
-      // Mark all reports for this message as auto-actioned
-      await db.update(chatMessageReportsTable)
-        .set({ status: "actioned", autoDeleted: true, updatedAt: new Date() })
-        .where(eq(chatMessageReportsTable.messageId, messageId));
-
-      req.log.info(
-        { messageId, chatType, conversationId, totalDistinctReporters },
-        "[Report] auto-deleted message after reaching report threshold",
-      );
-    }
+    await writeAuditLog({
+      actorUserId: userId,
+      actorType: "user",
+      action: "chat.report.create",
+      entityType: "chat_message",
+      entityId: messageId,
+      reason,
+      metadata: {
+        chatType,
+        reportedUserId: reportedUserId ?? null,
+        priorCount: Number(priorCount),
+      },
+    });
 
     return res.json({
       success: true,
       report_id: report.id,
-      message: "Message reported.",
+      status: "pending_review",
+      message: "Message reported for review.",
     });
   } catch (err) {
     req.log.error({ err }, "chat message report error");

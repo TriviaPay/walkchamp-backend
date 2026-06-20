@@ -1,0 +1,105 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+groups:
+  - walkchamp
+  - deploy
+
+users:
+  - name: deploy
+    primary_group: deploy
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    lock_passwd: true
+  - name: walkchamp
+    primary_group: walkchamp
+    shell: /usr/sbin/nologin
+    lock_passwd: true
+
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - jq
+  - logrotate
+  - openssh-client
+  - redis-server
+  - ufw
+
+write_files:
+  - path: /etc/logrotate.d/walkchamp
+    permissions: "0644"
+    encoding: b64
+    content: ${logrotate_b64}
+  - path: /etc/systemd/system/walkchamp-api.service
+    permissions: "0644"
+    encoding: b64
+    content: ${api_unit_b64}
+  - path: /etc/systemd/system/walkchamp-worker.service
+    permissions: "0644"
+    encoding: b64
+    content: ${worker_unit_b64}
+  - path: /etc/walkchamp/api.env
+    owner: walkchamp:walkchamp
+    permissions: "0600"
+    encoding: b64
+    content: ${api_env_b64}
+  - path: /etc/walkchamp/worker.env
+    owner: walkchamp:walkchamp
+    permissions: "0600"
+    encoding: b64
+    content: ${worker_env_b64}
+  - path: /etc/walkchamp/migrate.env
+    owner: walkchamp:walkchamp
+    permissions: "0600"
+    encoding: b64
+    content: ${migrate_env_b64}
+%{ if repo_deploy_key_b64 != "" ~}
+  - path: /home/deploy/.ssh/id_ed25519
+    owner: deploy:deploy
+    permissions: "0600"
+    encoding: b64
+    content: ${repo_deploy_key_b64}
+%{ endif ~}
+
+runcmd:
+  - mkdir -p /srv/walkchamp/releases /srv/walkchamp/shared /var/log/walkchamp /etc/walkchamp
+  - chown -R walkchamp:walkchamp /srv/walkchamp /var/log/walkchamp /etc/walkchamp
+  - chmod 0750 /etc/walkchamp
+  - runuser -u deploy -- mkdir -p /home/deploy/.ssh
+%{ if repo_deploy_key_b64 != "" ~}
+  - runuser -u deploy -- ssh-keyscan -H ${repo_ssh_host} >> /home/deploy/.ssh/known_hosts
+%{ endif ~}
+  - curl -fsSL https://deb.nodesource.com/setup_${node_major_version}.x | bash -
+  - apt-get install -y nodejs
+  - corepack enable
+  - sed -i 's/^supervised .*/supervised systemd/' /etc/redis/redis.conf
+  - sed -i 's/^bind .*/bind 127.0.0.1 ::1/' /etc/redis/redis.conf
+  - systemctl enable redis-server
+  - systemctl restart redis-server
+  - ufw default deny incoming
+  - ufw default allow outgoing
+%{ for cidr in ssh_allowed_cidrs ~}
+  - ufw allow from ${cidr} to any port 22 proto tcp
+%{ endfor ~}
+  - ufw allow from ${public_subnet_cidr} to any port ${app_port} proto tcp
+  - ufw --force enable
+  - systemctl restart ssh
+%{ if enable_initial_deploy ~}
+  - mkdir -p ${release_root}/${release_id}
+%{ if repo_deploy_key_b64 != "" ~}
+  - runuser -u deploy -- sh -lc 'GIT_SSH_COMMAND="ssh -i /home/deploy/.ssh/id_ed25519 -o StrictHostKeyChecking=yes" git clone --depth 1 --branch ${repo_ref} ${repo_clone_url} ${release_root}/${release_id}'
+%{ else ~}
+  - runuser -u deploy -- git clone --depth 1 --branch ${repo_ref} ${repo_clone_url} ${release_root}/${release_id}
+%{ endif ~}
+  - chown -R walkchamp:walkchamp ${release_root}/${release_id}
+  - runuser -u walkchamp -- bash -lc 'cd ${release_root}/${release_id} && corepack pnpm install --frozen-lockfile && node ./build.mjs'
+  - ln -sfn ${release_root}/${release_id} /srv/walkchamp/current
+  - runuser -u walkchamp -- bash -lc 'cd /srv/walkchamp/current && set -a && source /etc/walkchamp/migrate.env && set +a && ./node_modules/.bin/drizzle-kit migrate --config ./db/drizzle.config.ts'
+  - systemctl daemon-reload
+  - systemctl enable walkchamp-api walkchamp-worker
+  - systemctl restart walkchamp-worker
+  - systemctl restart walkchamp-api
+%{ endif ~}

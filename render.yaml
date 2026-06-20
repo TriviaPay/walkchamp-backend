@@ -14,15 +14,9 @@ services:
         value: production
       - key: PORT
         value: 8080
-      - key: LOG_LEVEL
-        value: info
       - key: NEON_DATABASE_URL
         sync: false
-      - key: DATABASE_URL
-        sync: false
       - key: DESCOPE_PROJECT_ID
-        sync: false
-      - key: DESCOPE_MANAGEMENT_KEY
         sync: false
       - key: SESSION_SECRET
         sync: false
@@ -30,43 +24,32 @@ services:
         sync: false
       - key: ALLOWED_ORIGINS
         sync: false
-      - key: PUSHER_APP_ID
+      - key: CASH_FEATURES_ENABLED
+        value: false
+      - key: REDIS_URL
         sync: false
-      - key: PUSHER_KEY
+      - key: ADMIN_SERVICE_KEY
         sync: false
-      - key: PUSHER_SECRET
+      - key: ADMIN_USER_IDS
         sync: false
-      - key: PUSHER_CLUSTER
+  - type: worker
+    name: walkchamp-worker
+    runtime: node
+    plan: starter
+    buildCommand: pnpm install --frozen-lockfile && pnpm run build
+    startCommand: pnpm run worker
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NEON_DATABASE_URL
         sync: false
-      - key: ONESIGNAL_APP_ID
+      - key: DESCOPE_PROJECT_ID
         sync: false
-      - key: ONESIGNAL_REST_API_KEY
+      - key: SESSION_SECRET
         sync: false
-      - key: STRIPE_SECRET_KEY
+      - key: REDIS_URL
         sync: false
-      - key: STRIPE_WEBHOOK_SECRET
-        sync: false
-      - key: RAZORPAY_KEY_ID
-        sync: false
-      - key: RAZORPAY_KEY_SECRET
-        sync: false
-      - key: RAZORPAY_WEBHOOK_SECRET
-        sync: false
-      - key: LIVEKIT_URL
-        sync: false
-      - key: LIVEKIT_API_KEY
-        sync: false
-      - key: LIVEKIT_API_SECRET
-        sync: false
-      - key: OCI_NAMESPACE
-        sync: false
-      - key: OCI_REGION
-        sync: false
-      - key: OCI_BUCKET_NAME
-        sync: false
-      - key: OCI_ACCESS_KEY_ID
-        sync: false
-      - key: OCI_SECRET_ACCESS_KEY
-        sync: false
-      - key: ADMIN_API_KEY
-        sync: false
+      - key: RUN_BACKGROUND_JOBS
+        value: true
+      - key: CASH_FEATURES_ENABLED
+        value: false

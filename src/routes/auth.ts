@@ -55,6 +55,14 @@ function calcAge(dob: string): number {
   return age;
 }
 
+function getExpectedAppleAudiences(): Set<string> {
+  const raw = process.env.APPLE_EXPECTED_AUDIENCES?.trim();
+  const values = raw
+    ? raw.split(",").map((value) => value.trim()).filter(Boolean)
+    : ["com.globalwalkerleague.app"];
+  return new Set(values);
+}
+
 // ── GET /api/me — authenticated: return profile for the JWT owner ─────────────
 router.get("/me", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
@@ -185,6 +193,7 @@ router.post("/auth/profile", requireAuth, async (req, res) => {
         referralCode,
         referredBy: data.referredBy ?? null,
         accountStatus: "active",
+        profileCompleted: true,
         lastLoginAt: new Date(),
       })
       .returning();
@@ -200,12 +209,15 @@ router.post("/auth/profile", requireAuth, async (req, res) => {
   }
 });
 
-// ── GET /api/auth/profile/:userId — internal use (profile restore on startup) ─
-// No auth required here because it's called during session restore
-// before we know if the JWT is still valid.
-// The userId comes from decoding the locally stored JWT — not from the network.
-router.get("/auth/profile/:userId", async (req, res) => {
+// ── GET /api/auth/profile/:userId — authenticated self profile restore ────────
+router.get("/auth/profile/:userId", requireAuth, async (req, res) => {
   const { userId } = req.params;
+  const authUserId = (req as AuthenticatedRequest).descopeUserId;
+
+  if (userId !== authUserId) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
   const [profile] = await db
     .select()
     .from(profilesTable)
@@ -393,51 +405,6 @@ router.post("/auth/verify-token", async (req, res) => {
   }
 });
 
-// ── GET /api/auth/reset-password/open ─────────────────────────────────────────
-// HTTPS bridge for password-reset emails on mobile. Descope appends ?t=&loginId=
-// to the redirectUrl; this page immediately deep-links into the native app.
-// Required because walkchamp.app may not have DNS yet — email clients need HTTPS.
-const APP_DEEP_LINK_SCHEME = process.env.APP_DEEP_LINK_SCHEME ?? "globalwalkerleague";
-
-router.get("/auth/reset-password/open", (req, res) => {
-  const token = String(req.query.t ?? req.query.token ?? req.query.code ?? "").trim();
-  const loginId = String(req.query.loginId ?? "").trim();
-
-  const params = new URLSearchParams();
-  if (token) params.set("t", token);
-  if (loginId) params.set("loginId", loginId);
-  const qs = params.toString();
-  const deepLink = `${APP_DEEP_LINK_SCHEME}://reset-password${qs ? `?${qs}` : ""}`;
-
-  const href = deepLink
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;");
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store");
-  res.status(200).send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Walk Champ — Reset Password</title>
-  <meta http-equiv="refresh" content="0;url=${href}" />
-  <style>
-    body { font-family: system-ui, sans-serif; background: #0A0B14; color: #fff; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 24px; text-align: center; }
-    a { color: #00E676; }
-  </style>
-</head>
-<body>
-  <div>
-    <p>Opening Walk Champ…</p>
-    <p><a href="${href}">Tap here if the app doesn’t open automatically</a></p>
-  </div>
-  <script>location.replace(${JSON.stringify(deepLink)});</script>
-</body>
-</html>`);
-});
-
 // ── POST /api/auth/reset-password/complete ───────────────────────────────────
 // Completes the password reset flow entirely server-side:
 //  1. Verifies the magic-link token from the reset email (needs DESCOPE_PROJECT_ID)
@@ -501,8 +468,10 @@ interface AppleClaims {
   sub: string;
   email?: string;
   emailVerified?: boolean;
+  aud: string | string[];
+  nonce?: string;
 }
-async function verifyAppleIdentityToken(token: string): Promise<AppleClaims> {
+async function verifyAppleIdentityToken(token: string, expectedAudiences: Set<string>, expectedNonce?: string): Promise<AppleClaims> {
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("Malformed Apple JWT");
   const [headerB64, payloadB64, sigB64] = parts as [string, string, string];
@@ -513,11 +482,20 @@ async function verifyAppleIdentityToken(token: string): Promise<AppleClaims> {
   const payload = JSON.parse(Buffer.from(payloadB64, "base64url").toString()) as {
     iss?: string; sub?: string; email?: string;
     email_verified?: boolean | string; exp?: number;
+    aud?: string | string[];
+    nonce?: string;
   };
 
   if (payload.iss !== "https://appleid.apple.com") throw new Error("Invalid Apple token issuer");
   if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) throw new Error("Apple token expired");
   if (!payload.sub) throw new Error("Missing sub in Apple token");
+  const audiences = Array.isArray(payload.aud) ? payload.aud : payload.aud ? [payload.aud] : [];
+  if (audiences.length === 0 || !audiences.some((audience) => expectedAudiences.has(audience))) {
+    throw new Error("Apple token audience mismatch");
+  }
+  if (expectedNonce && payload.nonce !== expectedNonce) {
+    throw new Error("Apple token nonce mismatch");
+  }
 
   const keysRes = await fetch("https://appleid.apple.com/auth/keys");
   if (!keysRes.ok) throw new Error("Failed to fetch Apple public keys");
@@ -545,6 +523,8 @@ async function verifyAppleIdentityToken(token: string): Promise<AppleClaims> {
     sub: payload.sub,
     email: payload.email,
     emailVerified: payload.email_verified === true || payload.email_verified === "true",
+    aud: payload.aud ?? audiences[0] ?? "",
+    nonce: payload.nonce,
   };
 }
 
@@ -555,6 +535,7 @@ async function verifyAppleIdentityToken(token: string): Promise<AppleClaims> {
 const appleNativeSchema = z.object({
   identityToken: z.string().min(1),
   authorizationCode: z.string().optional(),
+  nonce: z.string().optional(),
   user: z
     .object({
       name: z.string().nullable().optional(),
@@ -568,14 +549,14 @@ router.post("/auth/apple/native", async (req, res) => {
   if (!parse.success) {
     return res.status(400).json({ error: "invalid_request", details: parse.error.issues });
   }
-  const { identityToken, user: appleUser } = parse.data;
+  const { identityToken, nonce, user: appleUser } = parse.data;
   req.log.info("[AuthApple] native sign-in requested");
 
   try {
     // 1. Verify Apple identity token cryptographically
     let claims: AppleClaims;
     try {
-      claims = await verifyAppleIdentityToken(identityToken);
+      claims = await verifyAppleIdentityToken(identityToken, getExpectedAppleAudiences(), nonce);
     } catch (verifyErr: unknown) {
       req.log.warn({ err: verifyErr }, "[AuthApple] identity token verification failed");
       const msg = (verifyErr as Error).message ?? "Apple identity token is invalid";
@@ -702,103 +683,6 @@ router.post("/auth/oauth/start", async (req, res) => {
   } catch (err: unknown) {
     req.log.error(err, "oauth/start: unexpected error");
     return res.status(500).json({ error: "server_error", message: "Unable to start sign-in" });
-  }
-});
-
-// ── POST /api/auth/password/signin — password login via Descope SDK ───────────
-// Proxied through the backend so sessionJwt + refreshJwt are always returned in
-// the JSON body. Direct mobile calls to Descope REST can miss refreshJwt when
-// Descope sets it only as an HttpOnly cookie (invisible to React Native fetch).
-const passwordSigninSchema = z.object({
-  loginId: z.string().email(),
-  password: z.string().min(1),
-});
-
-router.post("/auth/password/signin", async (req, res) => {
-  const ip = req.ip ?? "unknown";
-  if (!checkIpRateLimit(ip, 30, 60_000).allowed) {
-    return res.status(429).json({ error: "rate_limited", message: "Too many sign-in attempts. Try again shortly." });
-  }
-
-  const parse = passwordSigninSchema.safeParse(req.body);
-  if (!parse.success) {
-    return res.status(400).json({ error: "invalid_request", details: parse.error.issues });
-  }
-
-  const { loginId, password } = parse.data;
-  req.log.info({ loginId }, "[AuthPassword] sign-in requested");
-
-  try {
-    const client = getDescopeClient();
-    const resp = await client.password.signIn(loginId, password);
-    if (!resp.ok || !resp.data?.sessionJwt) {
-      const msg = resp.error?.errorDescription ?? "Invalid email or password";
-      req.log.warn({ descopeCode: resp.code }, "[AuthPassword] sign-in rejected");
-      return res.status(401).json({ error: "signin_failed", message: msg });
-    }
-
-    const { sessionJwt, refreshJwt, user } = resp.data;
-    if (!refreshJwt) {
-      req.log.warn({ loginId }, "[AuthPassword] sign-in succeeded but Descope returned no refreshJwt");
-    } else {
-      req.log.info({ loginId }, "[AuthPassword] sign-in success — refresh token issued");
-    }
-
-    return res.json({
-      sessionJwt,
-      refreshJwt: refreshJwt ?? null,
-      user: user
-        ? {
-            userId: user.userId,
-            loginIds: user.loginIds ?? [],
-            name: user.name ?? null,
-            email: user.email ?? null,
-            verifiedEmail: user.verifiedEmail ?? false,
-          }
-        : null,
-    });
-  } catch (err: unknown) {
-    req.log.error(err, "[AuthPassword] unexpected error");
-    return res.status(500).json({ error: "server_error", message: "Unable to sign in right now." });
-  }
-});
-
-// ── POST /api/auth/session/refresh — exchange refresh JWT for new session ─────
-const sessionRefreshSchema = z.object({
-  refreshJwt: z.string().min(1),
-});
-
-router.post("/auth/session/refresh", async (req, res) => {
-  const ip = req.ip ?? "unknown";
-  if (!checkIpRateLimit(ip, 120, 60_000).allowed) {
-    return res.status(429).json({ error: "rate_limited", message: "Too many refresh attempts." });
-  }
-
-  const parse = sessionRefreshSchema.safeParse(req.body);
-  if (!parse.success) {
-    return res.status(400).json({ error: "invalid_request", details: parse.error.issues });
-  }
-
-  const { refreshJwt } = parse.data;
-
-  try {
-    const client = getDescopeClient();
-    const authInfo = await client.refreshSession(refreshJwt);
-    const sessionJwt = authInfo.jwt;
-    if (!sessionJwt) {
-      req.log.warn("[AuthRefresh] Descope refresh returned no session JWT");
-      return res.status(502).json({ error: "refresh_failed", message: "Unable to refresh session." });
-    }
-
-    return res.json({
-      sessionJwt,
-      // Rotation disabled in Descope → refreshJwt may be absent; client keeps existing.
-      refreshJwt: authInfo.refreshJwt ?? refreshJwt,
-    });
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Refresh rejected";
-    req.log.warn({ err: msg }, "[AuthRefresh] refresh rejected by Descope");
-    return res.status(401).json({ error: "refresh_failed", message: msg });
   }
 });
 

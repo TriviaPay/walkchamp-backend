@@ -15,15 +15,27 @@ import { eq, and, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { z } from "zod";
 import Stripe from "stripe";
-import { randomUUID } from "crypto";
+import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
+import {
+  deriveOpenRoomStatus,
+  joinOrReviveParticipant,
+  lockPaymentById,
+  lockPromoCodeByCode,
+  lockRaceRoom,
+  lockWalletByUserId,
+  type DbTx,
+} from "../lib/raceIntegrity";
+import { config } from "../lib/config";
 
 const router = Router();
+
+router.use("/payments", requireCashFeaturesEnabled);
 
 // ── Stripe client (lazy init so missing key just disables payments) ───────────
 let _stripe: Stripe | null = null;
 function getStripe(): Stripe {
   if (_stripe) return _stripe;
-  const key = process.env.STRIPE_SECRET_KEY;
+  const key = config.payments.stripeSecretKey;
   if (!key) throw new Error("STRIPE_SECRET_KEY is not configured.");
   _stripe = new Stripe(key, { apiVersion: "2026-05-27.dahlia" });
   return _stripe;
@@ -63,6 +75,89 @@ async function getOrCreateWallet(userId: string) {
   if (existing) return existing;
   const [created] = await db.insert(walletsTable).values({ userId }).returning();
   return created;
+}
+
+function getPaymentMetadata(payment: typeof paymentsTable.$inferSelect): Record<string, unknown> {
+  return ((payment.metadata as Record<string, unknown> | null) ?? {});
+}
+
+function hasRefundRequested(payment: typeof paymentsTable.$inferSelect): boolean {
+  return getPaymentMetadata(payment).refundRequested === true;
+}
+
+async function ensureLockedWallet(tx: DbTx, userId: string, currency: string) {
+  let wallet = await lockWalletByUserId(tx, userId);
+  if (!wallet) {
+    const [created] = await tx.insert(walletsTable).values({ userId, currency }).returning();
+    wallet = created;
+  }
+  return wallet;
+}
+
+async function creditWalletRefund(tx: DbTx, payment: typeof paymentsTable.$inferSelect, reason: string) {
+  const wallet = await ensureLockedWallet(tx, payment.userId, payment.currency);
+  await tx
+    .update(walletsTable)
+    .set({
+      availableBalanceCents: sql`${walletsTable.availableBalanceCents} + ${payment.amountCents}`,
+      updatedAt: new Date(),
+    })
+    .where(eq(walletsTable.id, wallet.id));
+
+  await tx.insert(walletTransactionsTable).values({
+    walletId: wallet.id,
+    userId: payment.userId,
+    transactionType: "race_entry_refund",
+    amountCents: payment.amountCents,
+    currency: payment.currency,
+    status: "completed",
+    description: reason,
+    paymentId: payment.id,
+  });
+}
+
+async function settlePromoRedemption(tx: DbTx, payment: typeof paymentsTable.$inferSelect) {
+  const metadata = getPaymentMetadata(payment);
+  const promoCode = typeof metadata.promoCode === "string" && metadata.promoCode.trim()
+    ? metadata.promoCode.trim().toUpperCase()
+    : null;
+
+  if (!promoCode) {
+    return { ok: true as const };
+  }
+
+  const promo = await lockPromoCodeByCode(tx, promoCode);
+  if (!promo || !promo.active) {
+    return { ok: false as const, reason: "Promo code is invalid or inactive." };
+  }
+  if (promo.endsAt && promo.endsAt < new Date()) {
+    return { ok: false as const, reason: "Promo code has expired." };
+  }
+  if (promo.maxUses !== null && promo.usedCount >= promo.maxUses) {
+    return { ok: false as const, reason: "Promo code has reached its usage limit." };
+  }
+
+  const inserted = await tx
+    .insert(promoRedemptionsTable)
+    .values({
+      promoCodeId: promo.id,
+      userId: payment.userId,
+      paymentId: payment.id,
+      discountAmountCents: Number(metadata.discountCents ?? 0),
+    })
+    .onConflictDoNothing()
+    .returning({ id: promoRedemptionsTable.id });
+
+  if (inserted.length === 0) {
+    return { ok: true as const };
+  }
+
+  await tx
+    .update(promoCodesTable)
+    .set({ usedCount: sql`${promoCodesTable.usedCount} + 1` })
+    .where(eq(promoCodesTable.id, promo.id));
+
+  return { ok: true as const };
 }
 
 // ── POST /api/payments/create-race-entry-intent ───────────────────────────────
@@ -238,7 +333,7 @@ router.post(
   "/payments/webhook",
   async (req, res) => {
     const sig = req.headers["stripe-signature"] as string;
-    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    const webhookSecret = config.payments.stripeWebhookSecret;
 
     if (!webhookSecret) {
       return res.status(500).json({ error: "Webhook secret not configured" });
@@ -257,7 +352,10 @@ router.post(
     const [existingEvent] = await db
       .select()
       .from(paymentEventsTable)
-      .where(eq(paymentEventsTable.stripeEventId, event.id))
+      .where(and(
+        eq(paymentEventsTable.provider, "stripe"),
+        eq(paymentEventsTable.providerEventId, event.id),
+      ))
       .limit(1);
 
     if (existingEvent?.processed) {
@@ -268,116 +366,164 @@ router.post(
     await db
       .insert(paymentEventsTable)
       .values({
+        provider: "stripe",
+        providerEventId: event.id,
         stripeEventId: event.id,
         eventType: event.type,
         rawPayload: event as unknown as Record<string, unknown>,
         processed: false,
+        processingStatus: "pending",
       })
       .onConflictDoNothing();
 
-    // Handle payment_intent.succeeded
-    if (event.type === "payment_intent.succeeded") {
-      const pi = event.data.object as Stripe.PaymentIntent;
-      const meta = pi.metadata;
+    await db
+      .update(paymentEventsTable)
+      .set({
+        processingStatus: "processing",
+        processingAttemptCount: sql`${paymentEventsTable.processingAttemptCount} + 1`,
+        failureReason: null,
+      })
+      .where(and(
+        eq(paymentEventsTable.provider, "stripe"),
+        eq(paymentEventsTable.providerEventId, event.id),
+      ));
 
-      const [payment] = await db
-        .select()
-        .from(paymentsTable)
-        .where(eq(paymentsTable.stripePaymentIntentId, pi.id))
-        .limit(1);
+    try {
+      if (event.type === "payment_intent.succeeded") {
+        const pi = event.data.object as Stripe.PaymentIntent;
+        const meta = pi.metadata;
 
-      if (payment && payment.status !== "succeeded") {
-        const raceId = meta.raceRoomId;
-        const payUserId = meta.descopeUserId;
+        const [payment] = await db
+          .select()
+          .from(paymentsTable)
+          .where(eq(paymentsTable.stripePaymentIntentId, pi.id))
+          .limit(1);
 
-        await db.transaction(async (tx) => {
-          // Mark payment succeeded
-          await tx
-            .update(paymentsTable)
-            .set({ status: "succeeded", updatedAt: new Date() })
-            .where(eq(paymentsTable.id, payment.id));
+        if (payment && payment.status !== "succeeded") {
+          const raceId = meta.raceRoomId;
 
-          // Check race still valid (not full, still open)
-          const [room] = await tx
-            .select()
-            .from(raceRoomsTable)
-            .where(eq(raceRoomsTable.id, raceId))
-            .limit(1);
+          await db.transaction(async (tx) => {
+            const lockedPayment = await lockPaymentById(tx, payment.id);
+            if (!lockedPayment || lockedPayment.status === "succeeded") {
+              return;
+            }
 
-          if (!room || room.status !== "open" || room.currentPlayers >= room.maxPlayers) {
-            // Race is no longer joinable — credit wallet for refund
-            const wallet = await (async () => {
-              const [w] = await tx
-                .select()
-                .from(walletsTable)
-                .where(eq(walletsTable.userId, payUserId))
-                .limit(1);
-              if (w) return w;
-              const [created] = await tx
-                .insert(walletsTable)
-                .values({ userId: payUserId })
-                .returning();
-              return created;
-            })();
+            const room = await lockRaceRoom(tx, raceId);
+
+            if (!room || (room.status !== "open" && room.status !== "full") || room.currentPlayers >= room.maxPlayers) {
+              await creditWalletRefund(tx, lockedPayment, "Race entry refunded — race full or cancelled");
+              await tx
+                .update(paymentsTable)
+                .set({
+                  status: "succeeded",
+                  metadata: {
+                    ...getPaymentMetadata(lockedPayment),
+                    autoRefundReason: "race_unavailable",
+                    autoRefundedAt: new Date().toISOString(),
+                  },
+                  updatedAt: new Date(),
+                })
+                .where(eq(paymentsTable.id, lockedPayment.id));
+              return;
+            }
+
+            const promoResult = await settlePromoRedemption(tx, lockedPayment);
+
+            if (!promoResult.ok) {
+              await creditWalletRefund(tx, lockedPayment, "Race entry refunded — promo code could not be fulfilled");
+              await tx
+                .update(paymentsTable)
+                .set({
+                  status: "succeeded",
+                  metadata: {
+                    ...getPaymentMetadata(lockedPayment),
+                    autoRefundReason: "promo_unavailable",
+                    autoRefundedAt: new Date().toISOString(),
+                  },
+                  updatedAt: new Date(),
+                })
+                .where(eq(paymentsTable.id, lockedPayment.id));
+              return;
+            }
+
+            const participantResult = await joinOrReviveParticipant(tx, {
+              raceRoomId: raceId,
+              userId: lockedPayment.userId,
+              paymentId: lockedPayment.id,
+            });
+
+            if (participantResult.reason === "blocked" || participantResult.reason === "already_joined") {
+              await creditWalletRefund(tx, lockedPayment, "Race entry refunded — duplicate or blocked participation");
+              await tx
+                .update(paymentsTable)
+                .set({
+                  status: "succeeded",
+                  metadata: {
+                    ...getPaymentMetadata(lockedPayment),
+                    autoRefundReason: participantResult.reason,
+                    autoRefundedAt: new Date().toISOString(),
+                  },
+                  updatedAt: new Date(),
+                })
+                .where(eq(paymentsTable.id, lockedPayment.id));
+              return;
+            }
+
+            const newPlayerCount = room.currentPlayers + 1;
 
             await tx
-              .update(walletsTable)
+              .update(raceRoomsTable)
               .set({
-                availableBalanceCents: sql`${walletsTable.availableBalanceCents} + ${payment.amountCents}`,
+                currentPlayers: newPlayerCount,
+                status: deriveOpenRoomStatus(newPlayerCount, room.maxPlayers),
+                prizePoolCents: sql`${raceRoomsTable.prizePoolCents} + ${lockedPayment.amountCents}`,
                 updatedAt: new Date(),
               })
-              .where(eq(walletsTable.id, wallet.id));
+              .where(eq(raceRoomsTable.id, room.id));
 
-            await tx.insert(walletTransactionsTable).values({
-              walletId: wallet.id,
-              userId: payUserId,
-              transactionType: "race_entry_refund",
-              amountCents: payment.amountCents,
-              currency: payment.currency,
-              status: "completed",
-              description: "Race entry refunded — race full or cancelled",
-              paymentId: payment.id,
-            });
-            return;
-          }
-
-          // Join user to race
-          await tx.insert(raceParticipantsTable).values({
-            raceRoomId: raceId,
-            userId: payUserId,
-            status: "joined",
-            paymentId: payment.id,
+            await tx
+              .update(paymentsTable)
+              .set({ status: "succeeded", updatedAt: new Date() })
+              .where(eq(paymentsTable.id, lockedPayment.id));
           });
-
-          await tx
-            .update(raceRoomsTable)
-            .set({
-              currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`,
-              prizePoolCents: sql`${raceRoomsTable.prizePoolCents} + ${payment.amountCents}`,
-              updatedAt: new Date(),
-            })
-            .where(eq(raceRoomsTable.id, raceId));
-        });
+        }
       }
 
-      // Mark event processed
-      await db
-        .update(paymentEventsTable)
-        .set({ processed: true })
-        .where(eq(paymentEventsTable.stripeEventId, event.id));
-    }
-
-    if (event.type === "payment_intent.payment_failed") {
-      const pi = event.data.object as Stripe.PaymentIntent;
-      await db
-        .update(paymentsTable)
-        .set({ status: "failed", updatedAt: new Date() })
-        .where(eq(paymentsTable.stripePaymentIntentId, pi.id));
+      if (event.type === "payment_intent.payment_failed") {
+        const pi = event.data.object as Stripe.PaymentIntent;
+        await db
+          .update(paymentsTable)
+          .set({ status: "failed", updatedAt: new Date() })
+          .where(eq(paymentsTable.stripePaymentIntentId, pi.id));
+      }
 
       await db
         .update(paymentEventsTable)
-        .set({ processed: true })
-        .where(eq(paymentEventsTable.stripeEventId, event.id));
+        .set({
+          processed: true,
+          processedAt: new Date(),
+          processingStatus: "processed",
+          failureReason: null,
+        })
+        .where(and(
+          eq(paymentEventsTable.provider, "stripe"),
+          eq(paymentEventsTable.providerEventId, event.id),
+        ));
+    } catch (err) {
+      const failureReason = err instanceof Error ? err.message : "Unknown webhook processing failure";
+      await db
+        .update(paymentEventsTable)
+        .set({
+          processed: false,
+          processingStatus: "failed",
+          failureReason,
+        })
+        .where(and(
+          eq(paymentEventsTable.provider, "stripe"),
+          eq(paymentEventsTable.providerEventId, event.id),
+        ));
+      req.log.error({ err, eventId: event.id, eventType: event.type }, "Stripe webhook processing failed");
+      return res.status(500).json({ error: "Webhook processing failed" });
     }
 
     return res.json({ received: true });
@@ -403,6 +549,7 @@ router.get("/payments/:id", requireAuth, async (req, res) => {
       amount: payment.amountCents / 100,
       currency: payment.currency,
       status: payment.status,
+      refundRequested: hasRefundRequested(payment),
       paymentType: payment.paymentType,
       raceRoomId: payment.raceRoomId,
       createdAt: payment.createdAt,
@@ -425,14 +572,16 @@ router.post("/payments/:id/refund-request", requireAuth, async (req, res) => {
   if (payment.status !== "succeeded") {
     return res.status(400).json({ error: "Only succeeded payments can be refunded." });
   }
+  if (hasRefundRequested(payment)) {
+    return res.json({ message: "Refund request already submitted for admin review." });
+  }
 
   // Store refund request in metadata for admin review
   await db
     .update(paymentsTable)
     .set({
-      status: "refunded",
       metadata: {
-        ...(payment.metadata as Record<string, unknown> ?? {}),
+        ...getPaymentMetadata(payment),
         refundRequested: true,
         refundRequestedAt: new Date().toISOString(),
         refundReason: req.body.reason ?? "user_request",

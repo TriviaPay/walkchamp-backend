@@ -84,6 +84,7 @@ export const chatMessageReportsTable = pgTable(
     index("msg_reports_reporter_idx").on(t.reportedByUserId),
     index("msg_reports_status_idx").on(t.status),
     index("msg_reports_created_idx").on(t.createdAt),
+    uniqueIndex("msg_reports_message_reporter_idx").on(t.messageId, t.reportedByUserId),
   ],
 );
 

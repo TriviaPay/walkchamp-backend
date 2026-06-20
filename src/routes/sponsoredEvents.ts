@@ -5,18 +5,16 @@ import {
   scheduledRoomRegistrationsTable,
   raceParticipantsTable,
 } from "@db/schema";
-import {
-  coinBalancesTable,
-  coinTransactionsTable,
-} from "@db/schema";
 import { sendPushToUser } from "./push";
+import { requireAdminKey } from "../middleware/requireAdminKey";
 import { profilesTable } from "@db/schema";
 import { eq, and, sql, inArray, lte, or, gte, asc, ne, desc } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { triggerEvent } from "../lib/pusher";
-import { spendCoins, getCoinBalance } from "../lib/coinsService";
+import { spendCoins, getCoinBalance, recordCoinLedgerEntry } from "../lib/coinsService";
 import { grantVariableCoinReward } from "../lib/coinRewardService";
 import { logger } from "../lib/logger";
+import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration } from "../lib/raceIntegrity";
 
 const router = Router();
 
@@ -83,22 +81,18 @@ function getUpcomingWeekends(count = 2): Array<{ sat: Date; sun: Date }> {
 async function refundCoins(userId: string, amount: number, roomId: string, description: string) {
   try {
     await db.transaction(async (tx) => {
-      await tx.insert(coinTransactionsTable).values({
+      await recordCoinLedgerEntry(tx, {
         userId,
         amount,
         transactionType: "refund",
         source: "sponsored_event_refund",
         sourceId: roomId,
+        rewardCode: null,
+        reasonCode: "sponsored_event_refund",
+        idempotencyKey: `sponsored-refund:${userId}:${roomId}:${amount}`,
         description,
+        metadata: { roomId },
       });
-      await tx
-        .update(coinBalancesTable)
-        .set({
-          currentBalance: sql`${coinBalancesTable.currentBalance} + ${amount}`,
-          lifetimeSpent: sql`GREATEST(0, ${coinBalancesTable.lifetimeSpent} - ${amount})`,
-          updatedAt: new Date(),
-        })
-        .where(eq(coinBalancesTable.userId, userId));
     });
   } catch (err) {
     logger.error({ err, userId, roomId }, "[SponsoredEvents] refundCoins failed");
@@ -217,14 +211,29 @@ async function processSponsuredEvents() {
       }
 
       logger.info({ roomId: room.id, count: paidUserIds.length }, "[SponsoredEventsJob] event started");
-      await db
-        .update(raceRoomsTable)
-        .set({ status: "in_progress", startedAt: now, updatedAt: new Date(),
-          registeredCount: paidUserIds.length })
-        .where(eq(raceRoomsTable.id, room.id));
+      await db.transaction(async (tx) => {
+        const lockedRoom = await lockRaceRoom(tx, room.id);
+        if (!lockedRoom || lockedRoom.status !== "scheduled") return;
 
-      if (paidUserIds.length > 0) {
-        await db
+        await tx
+          .update(raceRoomsTable)
+          .set({
+            status: "in_progress",
+            startedAt: now,
+            updatedAt: now,
+            registeredCount: paidUserIds.length,
+          })
+          .where(eq(raceRoomsTable.id, room.id));
+
+        if (paidUserIds.length === 0) {
+          await tx
+            .update(raceRoomsTable)
+            .set({ currentPlayers: 0, updatedAt: now })
+            .where(eq(raceRoomsTable.id, room.id));
+          return;
+        }
+
+        await tx
           .update(scheduledRoomRegistrationsTable)
           .set({ status: "active", activatedAt: now })
           .where(
@@ -234,11 +243,9 @@ async function processSponsuredEvents() {
             ),
           );
 
-        // Auto-insert registered users as race participants — skip any who are
-        // already active in a different race to enforce one-race-at-a-time.
         let insertedCount = 0;
         for (const uid of paidUserIds) {
-          const [existingActive] = await db
+          const [existingActive] = await tx
             .select({ id: raceParticipantsTable.id })
             .from(raceParticipantsTable)
             .innerJoin(raceRoomsTable, eq(raceRoomsTable.id, raceParticipantsTable.raceRoomId))
@@ -257,25 +264,27 @@ async function processSponsuredEvents() {
             continue;
           }
 
-          await db
-            .insert(raceParticipantsTable)
-            .values({
-              raceRoomId: room.id,
-              userId: uid,
-              status: "joined",
-              currentSteps: 0,
-              raceBaselineSteps: 0,
-            })
-            .onConflictDoNothing();
-          insertedCount++;
+          const lockedReg = await lockScheduledRegistration(tx, room.id, uid);
+          if (!lockedReg || (lockedReg.status !== "active" && lockedReg.status !== "registered")) {
+            continue;
+          }
+
+          const participantResult = await joinOrReviveParticipant(tx, {
+            raceRoomId: room.id,
+            userId: uid,
+            currentSteps: 0,
+            raceBaselineSteps: 0,
+          });
+          if (participantResult.changed) {
+            insertedCount += 1;
+          }
         }
 
-        // Update currentPlayers to reflect how many were actually inserted
-        await db
+        await tx
           .update(raceRoomsTable)
-          .set({ currentPlayers: insertedCount, updatedAt: new Date() })
+          .set({ currentPlayers: insertedCount, updatedAt: now })
           .where(eq(raceRoomsTable.id, room.id));
-      }
+      });
 
       triggerEvent(PUSHER_CHANNEL, "sponsored_event.started", { room_id: room.id }).catch(() => {});
       for (const uid of paidUserIds) {
@@ -402,10 +411,15 @@ async function finalizeSponsoredEvents(now: Date) {
   }
 }
 
-// Start background job — runs every 60 seconds
-setInterval(() => { processSponsuredEvents().catch(() => {}); }, 60_000);
-// Also run once on startup after a short delay (fills schedule immediately)
-setTimeout(() => { processSponsuredEvents().catch(() => {}); }, 5_000);
+let sponsoredEventsJobStarted = false;
+
+export function startSponsoredEventsJob(): void {
+  if (sponsoredEventsJobStarted) return;
+  sponsoredEventsJobStarted = true;
+
+  setInterval(() => { processSponsuredEvents().catch(() => {}); }, 60_000);
+  setTimeout(() => { processSponsuredEvents().catch(() => {}); }, 5_000);
+}
 
 // ── GET /api/sponsored-events ──────────────────────────────────────────────────
 router.get("/sponsored-events", requireAuth, async (req, res) => {
@@ -576,7 +590,7 @@ router.get("/sponsored-events", requireAuth, async (req, res) => {
 // ── POST /api/sponsored-events/generate-weekend ───────────────────────────────
 // Generates events for the next 8 upcoming weekends (~2 months, 16 events total).
 // Idempotent — skips any that already exist.
-router.post("/sponsored-events/generate-weekend", requireAuth, async (req, res) => {
+router.post("/sponsored-events/generate-weekend", requireAuth, requireAdminKey, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   req.log.info({ userId }, "[SponsoredEventsJob] generate weekend events");
 
@@ -875,14 +889,31 @@ router.post("/sponsored-events/:roomId/steps/sync", requireAuth, async (req, res
           inArray(scheduledRoomRegistrationsTable.status, ["registered", "active"]),
         )).limit(1);
       if (!reg) return res.status(403).json({ error: "Not registered for this event." });
-      const [created] = await db.insert(raceParticipantsTable).values({
-        raceRoomId: roomId,
-        userId,
-        status: "joined",
-        currentSteps: 0,
-        raceBaselineSteps: latestDeviceSteps,
-        latestDeviceSteps,
-      }).returning();
+      await db.transaction(async (tx) => {
+        const lockedRoom = await lockRaceRoom(tx, roomId);
+        if (!lockedRoom || lockedRoom.status !== "in_progress") return;
+
+        const lockedReg = await lockScheduledRegistration(tx, roomId, userId);
+        if (!lockedReg || (lockedReg.status !== "registered" && lockedReg.status !== "active")) return;
+
+        const participantResult = await joinOrReviveParticipant(tx, {
+          raceRoomId: roomId,
+          userId,
+          currentSteps: 0,
+          raceBaselineSteps: latestDeviceSteps,
+          latestDeviceSteps,
+        });
+        if (participantResult.changed) {
+          await tx
+            .update(raceRoomsTable)
+            .set({ currentPlayers: sql`${raceRoomsTable.currentPlayers} + 1`, updatedAt: now })
+            .where(eq(raceRoomsTable.id, roomId));
+        }
+      });
+
+      const [created] = await db.select().from(raceParticipantsTable)
+        .where(and(eq(raceParticipantsTable.raceRoomId, roomId), eq(raceParticipantsTable.userId, userId)))
+        .limit(1);
       participant = created;
     }
 
