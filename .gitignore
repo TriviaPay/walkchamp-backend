@@ -31,6 +31,11 @@ Thumbs.db
 .terraform/
 *.tfstate
 *.tfstate.*
+terraform.tfvars*
+*.auto.tfvars
+*.auto.tfvars.json
+!*.tfvars.example
+!*.tfvars.json.example
 crash.log
 
 # Test / coverage
