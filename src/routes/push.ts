@@ -1,9 +1,8 @@
+import { sendOneSignalNotification } from "../lib/oneSignalService";
 import { Router } from "express";
 import { db } from "@db";
 import {
   notificationDevicesTable,
-  userNotificationPreferencesTable,
-  pushNotificationLogsTable,
 } from "@db/schema";
 import { eq } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
@@ -87,7 +86,7 @@ router.post("/push/send", requireAuth, async (req, res) => {
 });
 
 // ── Core push sending helper (called from other routes) ───────────────────────
-// Signature: (userId, title, body, data?)
+// Signature: (userId, title, body, data?, url?)
 // Targeting uses OneSignal external_id (set via OneSignal.login(userId)) —
 // more reliable than storing subscription IDs, and works even if device
 // registration hasn't completed yet.
@@ -96,71 +95,25 @@ export async function sendPushToUser(
   title: string,
   body: string,
   data?: Record<string, unknown>,
+  url?: string,
 ): Promise<string> {
-  const oneSignalKey = process.env.ONESIGNAL_REST_API_KEY;
-  const oneSignalAppId = process.env.ONESIGNAL_APP_ID;
-
-  if (!oneSignalKey || !oneSignalAppId) return "skipped_no_config";
-
   const notificationType = String(data?.type ?? "notification");
+  const checkInvitePreference =
+    notificationType === "friend_request" ||
+    notificationType === "friend_request_received" ||
+    notificationType === "friend_request_accepted" ||
+    notificationType === "group_invite";
 
-  // Check user notification preference — default to enabled if no row yet
-  const [prefs] = await db
-    .select({ pushNotificationsEnabled: userNotificationPreferencesTable.pushNotificationsEnabled })
-    .from(userNotificationPreferencesTable)
-    .where(eq(userNotificationPreferencesTable.userId, userId))
-    .limit(1);
-
-  if (prefs && !prefs.pushNotificationsEnabled) {
-    await db.insert(pushNotificationLogsTable).values({
-      userId,
-      notificationType,
-      title,
-      body,
-      data,
-      status: "skipped_disabled",
-    });
-    return "skipped_disabled";
-  }
-
-  let status: "sent" | "failed" = "sent";
-  let onesignalResponse: Record<string, unknown> | undefined;
-
-  try {
-    // Use include_aliases with external_id (set via OneSignal.login(userId) on
-    // the client) — this is the correct v5 approach and removes reliance on
-    // stored subscription IDs which may lag behind due to registration race.
-    const resp = await fetch("https://onesignal.com/api/v1/notifications", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Basic ${oneSignalKey}`,
-      },
-      body: JSON.stringify({
-        app_id: oneSignalAppId,
-        include_aliases: { external_id: [userId] },
-        target_channel: "push",
-        headings: { en: title },
-        contents: { en: body },
-        data: data ?? {},
-      }),
-    });
-    onesignalResponse = (await resp.json()) as Record<string, unknown>;
-  } catch {
-    status = "failed";
-  }
-
-  await db.insert(pushNotificationLogsTable).values({
-    userId,
-    notificationType,
+  const result = await sendOneSignalNotification({
+    recipientUserIds: [userId],
     title,
     body,
     data,
-    onesignalResponse,
-    status,
+    url: url ?? (typeof data?.deepLink === "string" ? data.deepLink : undefined),
+    checkInvitePreference,
   });
 
-  return status;
+  return result.status;
 }
 
 export default router;

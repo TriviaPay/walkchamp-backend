@@ -147,6 +147,32 @@ const INDEXES: Array<{ name: string; ddl: string }> = [
     name: "idx_withdrawals_user_created",
     ddl: "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_withdrawals_user_created ON withdrawals(user_id, created_at DESC)",
   },
+  // ── Notification events (push dedup) ───────────────────────────────────────
+  {
+    name: "notification_events_table",
+    ddl: `CREATE TABLE IF NOT EXISTS notification_events (
+      id TEXT PRIMARY KEY,
+      event_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      recipient_user_id TEXT NOT NULL,
+      onesignal_notification_id TEXT,
+      sent_at TIMESTAMPTZ,
+      metadata JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`,
+  },
+  {
+    name: "notification_events_dedup_idx",
+    ddl: "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS notification_events_dedup_idx ON notification_events(event_type, entity_id, recipient_user_id)",
+  },
+  {
+    name: "notification_events_recipient_idx",
+    ddl: "CREATE INDEX CONCURRENTLY IF NOT EXISTS notification_events_recipient_idx ON notification_events(recipient_user_id)",
+  },
+  {
+    name: "push_notification_status_skipped_duplicate",
+    ddl: "ALTER TYPE push_notification_status ADD VALUE IF NOT EXISTS 'skipped_duplicate'",
+  },
 ];
 
 async function run() {
