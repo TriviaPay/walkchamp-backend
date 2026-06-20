@@ -1,4 +1,4 @@
-import { Router, type Request, type Response, type NextFunction } from "express";
+import { Router } from "express";
 import { db } from "@db";
 import {
   profilesTable,
@@ -12,26 +12,14 @@ import {
 import { eq, and, desc, ilike, or, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger";
 import { z } from "zod";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAdminRole } from "../middleware/requireAdminRole";
+import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
+import { writeAuditLog } from "../lib/auditLog";
 
 const router = Router();
 
-// ── Admin API key middleware ───────────────────────────────────────────────────
-// All /api/admin/* routes require the ADMIN_API_KEY header.
-// This is intentionally separate from Descope JWT auth — it's a server-to-server key.
-function requireAdminKey(req: Request, res: Response, next: NextFunction) {
-  const adminKey = process.env.ADMIN_API_KEY;
-  if (!adminKey) {
-    return res.status(503).json({ error: "Admin API not configured" });
-  }
-  const provided = req.headers["x-admin-key"] as string | undefined;
-  if (!provided || provided !== adminKey) {
-    logger.warn({ ip: req.ip, path: req.path }, "Admin API: unauthorized attempt");
-    return res.status(401).json({ error: "Unauthorized" });
-  }
-  return next();
-}
-
-router.use("/admin", requireAdminKey);
+router.use("/admin", requireAuth, requireAdminRole);
 
 // ── GET /api/admin/stats ──────────────────────────────────────────────────────
 router.get("/admin/stats", async (_req, res) => {
@@ -124,6 +112,14 @@ router.post("/admin/users/:id/ban", async (req, res) => {
     .where(eq(profilesTable.id, userId));
 
   logger.info({ userId, reason: parsed.data.reason }, "Admin: user banned");
+  void writeAuditLog({
+    actorUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
+    actorType: "admin",
+    action: "admin.user.ban",
+    entityType: "user",
+    entityId: userId,
+    reason: parsed.data.reason,
+  });
   return res.json({ ok: true, status: "banned" });
 });
 
@@ -144,6 +140,15 @@ router.post("/admin/users/:id/suspend", async (req, res) => {
     .where(eq(profilesTable.id, userId));
 
   logger.info({ userId, reason: parsed.data.reason, durationHours: parsed.data.durationHours }, "Admin: user suspended");
+  void writeAuditLog({
+    actorUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
+    actorType: "admin",
+    action: "admin.user.suspend",
+    entityType: "user",
+    entityId: userId,
+    reason: parsed.data.reason,
+    metadata: { durationHours: parsed.data.durationHours },
+  });
   return res.json({ ok: true, status: "suspended" });
 });
 
@@ -155,6 +160,13 @@ router.post("/admin/users/:id/reinstate", async (req, res) => {
     .set({ accountStatus: "active" })
     .where(eq(profilesTable.id, userId));
   logger.info({ userId }, "Admin: user reinstated");
+  void writeAuditLog({
+    actorUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
+    actorType: "admin",
+    action: "admin.user.reinstate",
+    entityType: "user",
+    entityId: userId,
+  });
   return res.json({ ok: true, status: "active" });
 });
 
@@ -217,11 +229,19 @@ router.post("/admin/races/:id/cancel", async (req, res) => {
     .where(eq(raceRoomsTable.id, raceId));
 
   logger.info({ raceId, reason: parsed.success ? parsed.data.reason : undefined }, "Admin: race cancelled");
+  void writeAuditLog({
+    actorUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
+    actorType: "admin",
+    action: "admin.race.cancel",
+    entityType: "race",
+    entityId: raceId,
+    reason: parsed.success ? parsed.data.reason : null,
+  });
   return res.json({ ok: true });
 });
 
 // ── GET /api/admin/withdrawals ────────────────────────────────────────────────
-router.get("/admin/withdrawals", async (req, res) => {
+router.get("/admin/withdrawals", requireCashFeaturesEnabled, async (req, res) => {
   const status = (req.query.status as string) || "pending";
   const limit  = Math.min(Number(req.query.limit) || 50, 200);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
@@ -238,7 +258,7 @@ router.get("/admin/withdrawals", async (req, res) => {
 });
 
 // ── POST /api/admin/withdrawals/:id/approve ───────────────────────────────────
-router.post("/admin/withdrawals/:id/approve", async (req, res) => {
+router.post("/admin/withdrawals/:id/approve", requireCashFeaturesEnabled, async (req, res) => {
   const withdrawalId = String(req.params.id);
 
   const [row] = await db
@@ -256,13 +276,21 @@ router.post("/admin/withdrawals/:id/approve", async (req, res) => {
     .where(eq(withdrawalsTable.id, withdrawalId));
 
   logger.info({ withdrawalId, userId: row.userId, amountCents: row.amountCents }, "Admin: withdrawal approved");
+  void writeAuditLog({
+    actorUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
+    actorType: "admin",
+    action: "admin.withdrawal.approve",
+    entityType: "withdrawal",
+    entityId: withdrawalId,
+    metadata: { userId: row.userId, amountCents: row.amountCents },
+  });
   return res.json({ ok: true });
 });
 
 // ── POST /api/admin/withdrawals/:id/reject ────────────────────────────────────
 const rejectSchema = z.object({ reason: z.string().min(3).max(500) });
 
-router.post("/admin/withdrawals/:id/reject", async (req, res) => {
+router.post("/admin/withdrawals/:id/reject", requireCashFeaturesEnabled, async (req, res) => {
   const withdrawalId = String(req.params.id);
   const parsed = rejectSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "reason is required" });
@@ -292,6 +320,15 @@ router.post("/admin/withdrawals/:id/reject", async (req, res) => {
     .catch((err) => logger.error({ withdrawalId, err }, "Admin: failed to refund wallet on rejection"));
 
   logger.info({ withdrawalId, userId: row.userId, reason: parsed.data.reason }, "Admin: withdrawal rejected");
+  void writeAuditLog({
+    actorUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
+    actorType: "admin",
+    action: "admin.withdrawal.reject",
+    entityType: "withdrawal",
+    entityId: withdrawalId,
+    reason: parsed.data.reason,
+    metadata: { userId: row.userId, amountCents: row.amountCents },
+  });
   return res.json({ ok: true });
 });
 

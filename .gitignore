@@ -3,10 +3,6 @@ node_modules/
 
 # Build output
 dist/
-api/*.js
-api/*.mjs
-api/*.map
-!api/.gitkeep
 *.tsbuildinfo
 db/dist/
 api-zod/dist/
@@ -32,6 +28,10 @@ Thumbs.db
 # Local tooling
 .local/
 .cache/
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
 
 # Test / coverage
 coverage/

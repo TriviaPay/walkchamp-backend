@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type RequestHandler } from "express";
 import multer from "multer";
 import { db, pool } from "@db";
 import {
@@ -16,7 +16,11 @@ import { z } from "zod";
 import { triggerEvent } from "../lib/pusher";
 import { evaluateAndNotify } from "./achievementHooks";
 import { sendPushToUser } from "./push";
-import { ociPutObject, ociGetObject, ociDeleteObject, ociObjectUrl } from "../lib/ociStorage";
+import { ociPutObject, ociGetObject, ociDeleteObject, ociObjectUrl, ociObjectKeyFromUrl, isOciConfigured, isOciConfigError } from "../lib/ociStorage";
+import { buildGeneratedObjectKey, validateRasterUpload } from "../lib/uploadPolicy";
+import { sanitizePlainText } from "../lib/text";
+import { config } from "../lib/config";
+import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -28,6 +32,17 @@ const upload = multer({
 });
 
 const router = Router();
+const groupImageUploadLimiter: RequestHandler = config.features.rateLimitingEnabled
+  ? createRedisRateLimit({
+      bucket: "group-image-upload",
+      windowMs: 15 * 60 * 1000,
+      max: 20,
+      failureMode: "closed",
+      message: "Too many upload attempts — please try again later.",
+      code: "UPLOAD_RATE_LIMITED",
+      key: rateLimitByActorOrIp,
+    })
+  : (_req, _res, next) => next();
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -364,7 +379,12 @@ router.post("/groups", requireAuth, async (req, res) => {
   const parsed = createGroupSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid payload", details: parsed.error.flatten() });
 
-  const { groupName, groupType, customGroupType, dailyGoalSteps, colorThemeKey } = parsed.data;
+  const groupName = sanitizePlainText(parsed.data.groupName);
+  const groupType = parsed.data.groupType;
+  const customGroupType = parsed.data.customGroupType ? sanitizePlainText(parsed.data.customGroupType) : undefined;
+  const dailyGoalSteps = parsed.data.dailyGoalSteps;
+  const colorThemeKey = parsed.data.colorThemeKey;
+  if (!groupName) return res.status(400).json({ error: "Group name is required." });
   req.log.info({ userId, groupType, customGroupType }, "[Groups] create clicked");
 
   const [existing] = await db
@@ -656,7 +676,12 @@ router.patch("/groups/:groupId", requireAuth, async (req, res) => {
   const parsed = updateGroupSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid payload" });
 
-  const { groupName, dailyGoalSteps, themeKey, customGroupType } = parsed.data;
+  const groupName = parsed.data.groupName !== undefined ? sanitizePlainText(parsed.data.groupName) : undefined;
+  const dailyGoalSteps = parsed.data.dailyGoalSteps;
+  const themeKey = parsed.data.themeKey;
+  const customGroupType = parsed.data.customGroupType !== undefined
+    ? sanitizePlainText(parsed.data.customGroupType)
+    : undefined;
 
   const updates: Partial<typeof walkingGroupsTable.$inferInsert> = { updatedAt: new Date() };
   if (groupName !== undefined) updates.groupName = groupName;
@@ -1090,20 +1115,25 @@ router.post("/groups/:groupId/archive", requireAuth, async (req, res) => {
 });
 
 // ── POST /api/groups/:groupId/image ───────────────────────────────────────────
-router.post("/groups/:groupId/image", requireAuth, upload.single("image"), async (req, res) => {
+router.post("/groups/:groupId/image", requireAuth, groupImageUploadLimiter, upload.single("image"), async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const groupId = String(req.params.groupId);
   const file = req.file;
   if (!file) return res.status(400).json({ error: "No image provided" });
+  if (!isOciConfigured()) return res.status(503).json({ error: "Group image storage is not configured" });
 
   const [group] = await db.select().from(walkingGroupsTable).where(eq(walkingGroupsTable.id, groupId)).limit(1);
   if (!group || group.status !== "active") return res.status(404).json({ error: "Group not found" });
   if (group.adminUserId !== userId) return res.status(403).json({ error: "Admin only" });
 
-  const objKey = `group-images/${groupId}`;
   try {
-    await ociDeleteObject(objKey).catch(() => {});
-    await ociPutObject(objKey, file.buffer, file.mimetype);
+    const contentType = validateRasterUpload(file);
+    const oldKey = ociObjectKeyFromUrl(group.groupImageUrl);
+    const objKey = buildGeneratedObjectKey("group-images", groupId, contentType);
+    if (oldKey) {
+      await ociDeleteObject(oldKey).catch(() => {});
+    }
+    await ociPutObject(objKey, file.buffer, contentType);
     const imageUrl = ociObjectUrl(objKey);
     const displayUrl = `/api/groups/${groupId}/image`;
 
@@ -1117,6 +1147,9 @@ router.post("/groups/:groupId/image", requireAuth, upload.single("image"), async
 
     return res.json({ success: true, imageUrl, displayUrl });
   } catch (err) {
+    if (isOciConfigError(err)) {
+      return res.status(503).json({ error: "Group image storage is not configured" });
+    }
     req.log.error(err, "[Groups] group image upload failed");
     return res.status(500).json({ error: "Upload failed" });
   }
@@ -1125,8 +1158,15 @@ router.post("/groups/:groupId/image", requireAuth, upload.single("image"), async
 // ── GET /api/groups/:groupId/image ────────────────────────────────────────────
 router.get("/groups/:groupId/image", async (req, res) => {
   const groupId = String(req.params.groupId);
-  const objKey = `group-images/${groupId}`;
+  if (!isOciConfigured()) return res.status(503).end();
   try {
+    const [group] = await db
+      .select({ groupImageUrl: walkingGroupsTable.groupImageUrl })
+      .from(walkingGroupsTable)
+      .where(eq(walkingGroupsTable.id, groupId))
+      .limit(1);
+    const objKey = ociObjectKeyFromUrl(group?.groupImageUrl);
+    if (!objKey) return res.status(404).end();
     const obj = await ociGetObject(objKey);
     if (!obj) return res.status(404).end();
     res.setHeader("Content-Type", obj.contentType);
@@ -1141,7 +1181,10 @@ router.get("/groups/:groupId/image", async (req, res) => {
     return new Promise<void>((resolve, reject) => {
       obj.body.on("error", reject).pipe(res).on("finish", resolve);
     });
-  } catch (_) {
+  } catch (err) {
+    if (isOciConfigError(err)) {
+      return res.status(503).end();
+    }
     return res.status(404).end();
   }
 });
@@ -1405,7 +1448,10 @@ router.delete("/groups/:groupId", requireAuth, async (req, res) => {
 
   req.log.info({ groupId, userId }, "[Groups] group deleted");
   triggerEvent(`public-group-${groupId}`, "group.deleted", { groupId }).catch(() => {});
-  ociDeleteObject(`group-images/${groupId}`).catch(() => {});
+  const oldKey = ociObjectKeyFromUrl(group.groupImageUrl);
+  if (oldKey) {
+    ociDeleteObject(oldKey).catch(() => {});
+  }
 
   return res.json({ success: true });
 });

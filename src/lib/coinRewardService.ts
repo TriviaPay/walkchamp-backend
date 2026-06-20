@@ -1,9 +1,10 @@
 import { db } from "@db";
-import { coinBalancesTable, coinTransactionsTable, coinRewardGrantsTable } from "@db/schema";
-import { and, eq, sql } from "drizzle-orm";
+import { coinRewardGrantsTable } from "@db/schema";
+import { and, eq } from "drizzle-orm";
 import { logger } from "./logger";
 import { triggerEvent } from "./pusher";
 import { evaluateUserTitles } from "./titleEvaluation";
+import { recordCoinLedgerEntry } from "./coinsService";
 
 // ── Grant a variable-amount coin reward (idempotent by rewardCode + sourceId) ──
 // Use for coins_battle prizes where amounts vary per race.
@@ -38,30 +39,18 @@ export async function grantVariableCoinReward(opts: {
 
       await tx.insert(coinRewardGrantsTable).values({ userId, rewardCode, sourceId, coinsAwarded: amount });
 
-      await tx.insert(coinTransactionsTable).values({
+      const { newBalance } = await recordCoinLedgerEntry(tx, {
         userId,
         amount,
         transactionType: "earn",
         source: "coins_battle",
         sourceId,
         rewardCode,
+        reasonCode: rewardCode.toLowerCase(),
+        idempotencyKey: `coins-battle:${userId}:${rewardCode}:${sourceId}`,
         description,
+        metadata: { rewardType: "coins_battle" },
       });
-
-      const [balRow] = await tx
-        .insert(coinBalancesTable)
-        .values({ userId, currentBalance: amount, lifetimeEarned: amount, lifetimeSpent: 0 })
-        .onConflictDoUpdate({
-          target: [coinBalancesTable.userId],
-          set: {
-            currentBalance: sql`${coinBalancesTable.currentBalance} + ${amount}`,
-            lifetimeEarned: sql`${coinBalancesTable.lifetimeEarned} + ${amount}`,
-            updatedAt: new Date(),
-          },
-        })
-        .returning({ currentBalance: coinBalancesTable.currentBalance });
-
-      const newBalance = balRow?.currentBalance ?? amount;
       logger.info({ userId, rewardCode, sourceId, amount, newBalance }, "grantVariableCoinReward: granted");
 
       void triggerEvent(`private-user-${userId}`, "wallet.updated", {
@@ -157,30 +146,18 @@ export async function grantCoinReward(
         coinsAwarded: amount,
       });
 
-      await tx.insert(coinTransactionsTable).values({
+      const { newBalance } = await recordCoinLedgerEntry(tx, {
         userId,
         amount,
         transactionType: "earn",
         source: rewardCode.toLowerCase(),
         sourceId,
         rewardCode,
+        reasonCode: rewardCode.toLowerCase(),
+        idempotencyKey: `reward:${userId}:${rewardCode}:${sourceId}`,
         description,
+        metadata: { rewardType: rewardCode },
       });
-
-      const [balRow] = await tx
-        .insert(coinBalancesTable)
-        .values({ userId, currentBalance: amount, lifetimeEarned: amount, lifetimeSpent: 0 })
-        .onConflictDoUpdate({
-          target: [coinBalancesTable.userId],
-          set: {
-            currentBalance: sql`${coinBalancesTable.currentBalance} + ${amount}`,
-            lifetimeEarned: sql`${coinBalancesTable.lifetimeEarned} + ${amount}`,
-            updatedAt: new Date(),
-          },
-        })
-        .returning({ currentBalance: coinBalancesTable.currentBalance });
-
-      const newBalance = balRow?.currentBalance ?? amount;
       logger.info({ userId, rewardCode, sourceId, amount, newBalance }, "grantCoinReward: granted");
 
       // Notify the user in real-time — include exact new balance so frontend can set it directly

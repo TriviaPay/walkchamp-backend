@@ -12,7 +12,9 @@ import {
 } from "@db/schema";
 import { eq, and, desc, sql, gte, lte } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { getCoinBalance, awardCoins, evaluateStepMilestones } from "../lib/coinsService";
+import { requireActiveAccount } from "../middleware/requireActiveAccount";
+import { getCoinBalance, awardCoins, evaluateStepMilestones, recordAdRewardClaim } from "../lib/coinsService";
+import { z } from "zod";
 
 const EARNING_RULES = [
   { id: "walk_any_steps",      icon: "🚶", title: "Walk any steps today",         rewardText: "+1"                             },
@@ -439,11 +441,23 @@ router.post("/coins/tasks/refresh", requireAuth, async (req, res) => {
 const AD_REWARD_COINS = 30;
 const MAX_DAILY_AD_REWARDS = 5;
 
-router.post("/coins/ad-reward", requireAuth, async (req, res) => {
+const adRewardSchema = z.object({
+  localDate: z.string().optional(),
+  claim_id: z.string().min(8).max(200).optional(),
+  network: z.string().max(50).optional(),
+  placement: z.string().max(100).optional(),
+});
+
+router.post("/coins/ad-reward", requireAuth, requireActiveAccount, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
 
   try {
-    const rawLD = typeof req.body?.localDate === "string" ? req.body.localDate : "";
+    const parsed = adRewardSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: "Invalid ad reward payload" });
+    }
+
+    const rawLD = typeof parsed.data.localDate === "string" ? parsed.data.localDate : "";
     const today = /^\d{4}-\d{2}-\d{2}$/.test(rawLD) ? rawLD : new Date().toISOString().split("T")[0]!;
 
     // Count how many rewarded-ad coins have been granted today
@@ -471,14 +485,42 @@ router.post("/coins/ad-reward", requireAuth, async (req, res) => {
 
     const slot = todayCount + 1;
     const rewardCode = `ad_reward_${slot}`;
+    const claimId = parsed.data.claim_id?.trim() || `${userId}:${today}:${rewardCode}`;
+    const claimAccepted = await recordAdRewardClaim({
+      userId,
+      claimId,
+      date: today,
+      network: parsed.data.network,
+      placement: parsed.data.placement,
+    });
+
+    if (!claimAccepted) {
+      const balance = await getCoinBalance(userId);
+      return res.json({
+        success: true,
+        duplicate: true,
+        coins_awarded: 0,
+        new_balance: balance.currentBalance,
+        ads_today: todayCount,
+        ads_remaining: MAX_DAILY_AD_REWARDS - todayCount,
+      });
+    }
 
     const awarded = await awardCoins({
       userId,
       amount: AD_REWARD_COINS,
       source: "ad_reward",
+      sourceId: claimId,
       rewardCode,
+      reasonCode: "ad_reward",
+      idempotencyKey: `ad:${userId}:${claimId}`,
       description: "Watched an ad for free coins",
       date: today,
+      metadata: {
+        claimId,
+        network: parsed.data.network ?? null,
+        placement: parsed.data.placement ?? null,
+      },
     });
 
     const balance = await getCoinBalance(userId);

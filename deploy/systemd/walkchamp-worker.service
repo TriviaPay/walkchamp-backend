@@ -1,0 +1,25 @@
+[Unit]
+Description=WalkChamp Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=walkchamp
+Group=walkchamp
+Environment=APP_PROCESS_ROLE=worker
+EnvironmentFile=/etc/walkchamp/worker.env
+WorkingDirectory=/srv/walkchamp/current
+ExecStart=/usr/bin/node --enable-source-maps ./dist/worker.mjs
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/srv/walkchamp /var/log/walkchamp /tmp
+StandardOutput=append:/var/log/walkchamp/worker.log
+StandardError=append:/var/log/walkchamp/worker.log
+
+[Install]
+WantedBy=multi-user.target

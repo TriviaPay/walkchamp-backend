@@ -9,8 +9,11 @@ import {
 import { eq, desc, sql, lt, and } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { z } from "zod";
+import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
 
 const router = Router();
+
+router.use("/wallet", requireCashFeaturesEnabled);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

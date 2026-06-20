@@ -13,8 +13,18 @@ import { z } from "zod";
 import { triggerEvent } from "../lib/pusher";
 import { logger } from "../lib/logger";
 import { getCoinBalance } from "../lib/coinsService";
+import { requireFeatureEnabled } from "../middleware/requireFeatureEnabled";
+import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "../lib/raceIntegrity";
 
 const router = Router();
+
+router.use(
+  "/coins-battle",
+  requireFeatureEnabled("coin_entry_challenges", {
+    statusCode: 404,
+    message: "Coin-entry challenges are disabled for this build.",
+  }),
+);
 
 const VALID_COIN_ENTRIES = [500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000];
 
@@ -168,22 +178,6 @@ router.post("/coins-battle/:id/join", requireAuth, async (req, res) => {
     });
   }
 
-  const [existingParticipant] = await db
-    .select({ id: raceParticipantsTable.id })
-    .from(raceParticipantsTable)
-    .where(
-      and(
-        eq(raceParticipantsTable.raceRoomId, raceId),
-        eq(raceParticipantsTable.userId, userId),
-        ne(raceParticipantsTable.status, "left"),
-      ),
-    )
-    .limit(1);
-
-  if (existingParticipant) {
-    return res.status(409).json({ error: "Already joined this room", code: "ALREADY_JOINED" });
-  }
-
   // Soft balance check — actual deduction happens at race start
   const balance = await getCoinBalance(userId);
   if (balance.currentBalance < room.coinEntryAmount) {
@@ -195,22 +189,85 @@ router.post("/coins-battle/:id/join", requireAuth, async (req, res) => {
     });
   }
 
-  const [participant] = await db
-    .insert(raceParticipantsTable)
-    .values({ raceRoomId: raceId, userId, status: "joined" })
-    .returning();
+  let participant: typeof raceParticipantsTable.$inferSelect | null = null;
+  let updatedRoomState: {
+    creatorId: string;
+    currentPlayers: number;
+    maxPlayers: number;
+    coinPrizePool: number;
+  } | null = null;
+  let newPlayerCount = room.currentPlayers;
+  let joinErrorStatus: number | null = null;
+  let joinErrorBody: Record<string, string> | null = null;
 
-  const newPlayerCount = room.currentPlayers + 1;
+  await db.transaction(async (tx) => {
+    const lockedRoom = await lockRaceRoom(tx, raceId);
+    if (!lockedRoom) {
+      joinErrorStatus = 404;
+      joinErrorBody = { error: "Room not found" };
+      return;
+    }
+    if (lockedRoom.entryType !== "coins_battle") {
+      joinErrorStatus = 400;
+      joinErrorBody = { error: "Not a Coins Battle room" };
+      return;
+    }
+    if (lockedRoom.status !== "open" && lockedRoom.status !== "full") {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "Room is not open for joining", code: "ROOM_NOT_OPEN" };
+      return;
+    }
+    if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "Room is full", code: "ROOM_FULL" };
+      return;
+    }
 
-  const [updatedRoom] = await db
-    .update(raceRoomsTable)
-    .set({
-      currentPlayers: newPlayerCount,
-      status: newPlayerCount >= room.maxPlayers ? "full" : "open",
-      updatedAt: new Date(),
-    })
-    .where(eq(raceRoomsTable.id, raceId))
-    .returning();
+    const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: raceId, userId });
+    if (participantResult.reason === "blocked") {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "You cannot rejoin this room", code: "REJOIN_BLOCKED" };
+      return;
+    }
+    if (participantResult.reason === "already_joined") {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "Already joined this room", code: "ALREADY_JOINED" };
+      return;
+    }
+
+    participant = participantResult.participant;
+    const newPlayerCount = lockedRoom.currentPlayers + 1;
+    const nextStatus = deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers);
+
+    const [nextRoom] = await tx
+      .update(raceRoomsTable)
+      .set({
+        currentPlayers: newPlayerCount,
+        status: nextStatus,
+        updatedAt: new Date(),
+      })
+      .where(eq(raceRoomsTable.id, raceId))
+      .returning();
+    updatedRoomState = {
+      creatorId: (nextRoom ?? lockedRoom).creatorId,
+      currentPlayers: (nextRoom ?? lockedRoom).currentPlayers,
+      maxPlayers: (nextRoom ?? lockedRoom).maxPlayers,
+      coinPrizePool: (nextRoom ?? lockedRoom).coinPrizePool,
+    };
+  });
+
+  if (joinErrorStatus !== null && joinErrorBody) {
+    return res.status(joinErrorStatus).json(joinErrorBody);
+  }
+  if (!participant) {
+    return res.status(409).json({ error: "Unable to join room" });
+  }
+  const finalRoomState = updatedRoomState ?? {
+    creatorId: room.creatorId,
+    currentPlayers: newPlayerCount,
+    maxPlayers: room.maxPlayers,
+    coinPrizePool: room.coinPrizePool,
+  };
 
   const profile = await db
     .select({ username: profilesTable.username, avatarColor: profilesTable.avatarColor, countryFlag: profilesTable.countryFlag })
@@ -226,29 +283,29 @@ router.post("/coins-battle/:id/join", requireAuth, async (req, res) => {
     username: profile[0]?.username ?? "Player",
     avatarColor: profile[0]?.avatarColor ?? "#00E676",
     countryFlag: profile[0]?.countryFlag ?? "🏳️",
-    currentPlayers: updatedRoom.currentPlayers,
-    maxPlayers: updatedRoom.maxPlayers,
-    coinPrizePool: updatedRoom.coinPrizePool,
+    currentPlayers: finalRoomState.currentPlayers,
+    maxPlayers: finalRoomState.maxPlayers,
+    coinPrizePool: finalRoomState.coinPrizePool,
   }).catch(() => {});
 
   triggerEvent("public-rooms-available", "room:participant_joined", {
     room_id: raceId,
-    current_players: updatedRoom.currentPlayers,
-    coin_prize_pool: updatedRoom.coinPrizePool,
+    current_players: finalRoomState.currentPlayers,
+    coin_prize_pool: finalRoomState.coinPrizePool,
   }).catch(() => {});
 
-  triggerEvent(`private-user-${room.creatorId}`, "coins_battle.joined", {
+  triggerEvent(`private-user-${finalRoomState.creatorId}`, "coins_battle.joined", {
     raceId,
     newPlayer: { username: profile[0]?.username ?? "Player" },
-    currentPlayers: updatedRoom.currentPlayers,
+    currentPlayers: finalRoomState.currentPlayers,
   }).catch(() => {});
 
   return res.json({
     success: true,
     raceId,
     participant,
-    currentPlayers: updatedRoom.currentPlayers,
-    coinPrizePool: updatedRoom.coinPrizePool,
+    currentPlayers: finalRoomState.currentPlayers,
+    coinPrizePool: finalRoomState.coinPrizePool,
     coinBalance: balance.currentBalance,
   });
 });

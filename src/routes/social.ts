@@ -11,10 +11,7 @@ import {
 } from "@db/schema";
 import { eq, and, or, desc, inArray, sql, gte, ne } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import {
-  sendFriendRequestAcceptedPush,
-  sendFriendRequestReceivedPush,
-} from "../lib/friendPushService";
+import { sendNotification } from "./notifications";
 import { triggerEvent } from "../lib/pusher";
 import { z } from "zod";
 import { grantCoinReward } from "../lib/coinRewardService";
@@ -208,12 +205,13 @@ router.post("/friends/request", requireAuth, async (req, res) => {
     .where(eq(profilesTable.id, userId))
     .limit(1);
 
-  sendFriendRequestReceivedPush({
-    friendRequestId: request.id,
-    senderUserId: userId,
-    receiverUserId: targetId,
-    senderUsername: senderProfile?.username ?? "Someone",
-  }).catch(() => {});
+  sendNotification(
+    targetId,
+    "friend_request",
+    "New friend request",
+    `@${senderProfile?.username ?? "Someone"} sent you a friend request`,
+    { requestId: request.id },
+  ).catch(() => {});
 
   const senderSummary = {
     id: userId,
@@ -291,12 +289,13 @@ router.post("/friends/accept", requireAuth, async (req, res) => {
 
   req.log.info({ requestId: request.id, senderId: request.senderId, receiverId: userId }, "friend request accepted — friendship rows inserted for both directions");
 
-  sendFriendRequestAcceptedPush({
-    friendRequestId: request.id,
-    requesterUserId: request.senderId,
-    acceptedByUserId: userId,
-    acceptedByUsername: receiverProfile?.username ?? "Someone",
-  }).catch(() => {});
+  sendNotification(
+    request.senderId,
+    "friend_request_accepted",
+    "Friend request accepted",
+    `@${receiverProfile?.username ?? "Someone"} accepted your friend request`,
+    { friendId: userId },
+  ).catch(() => {});
 
   const acceptPayload = {
     requestId: request.id,

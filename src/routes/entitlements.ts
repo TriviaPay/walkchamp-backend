@@ -13,6 +13,9 @@ import {
 import { eq, and, inArray, desc, sql, gte, lte } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { z } from "zod";
+import { recordCoinLedgerEntry } from "../lib/coinsService";
+import { writeAuditLog } from "../lib/auditLog";
+import { requireActiveAccount } from "../middleware/requireActiveAccount";
 
 const router = Router();
 
@@ -93,13 +96,17 @@ const ALL_VALID_PRODUCT_IDS = new Set([
 const verifySchema = z.object({
   product_id:     z.string(),
   platform:       z.enum(["ios", "android", "dev"]),
-  transaction_id: z.string().optional(),
+  transaction_id: z.string().min(1),
   purchase_token: z.string().optional(),
   receipt:        z.string().optional(),
   package_name:   z.string().optional(),
 });
 
-router.post("/purchases/verify", requireAuth, async (req, res) => {
+function providerNameForPlatform(platform: "ios" | "android" | "dev") {
+  return platform === "ios" ? "apple" : platform === "android" ? "google" : "dev";
+}
+
+router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const parse  = verifySchema.safeParse(req.body);
   if (!parse.success) {
@@ -111,6 +118,25 @@ router.post("/purchases/verify", requireAuth, async (req, res) => {
   }
 
   const { product_id, platform, transaction_id, purchase_token, receipt, package_name } = parse.data;
+
+  if (process.env.NODE_ENV === "production") {
+    req.log.error({ userId, product_id, platform }, "[IAP] rejecting unverified client-side purchase in production");
+    return res.status(503).json({
+      success: false,
+      code: "IAP_VERIFICATION_NOT_CONFIGURED",
+      message: "Secure store receipt verification is not configured on this server.",
+    });
+  }
+
+  if (platform === "dev") {
+    req.log.warn({ userId, product_id, transaction_id }, "[IAP] allowing development-only purchase verification");
+  } else if (!purchase_token && !receipt) {
+    return res.status(400).json({
+      success: false,
+      code: "MISSING_PURCHASE_PROOF",
+      message: "receipt or purchase_token is required.",
+    });
+  }
 
   // Validate product exists
   if (!ALL_VALID_PRODUCT_IDS.has(product_id)) {
@@ -130,47 +156,59 @@ router.post("/purchases/verify", requireAuth, async (req, res) => {
     });
   }
 
-  // Duplicate detection: check if this transactionId was already processed for this user
-  if (transaction_id) {
-    const [existing] = await db
-      .select({ id: userPurchasesTable.id })
-      .from(userPurchasesTable)
+  // Duplicate detection: reject replay across the entire system, not just per-user.
+  const [existing] = await db
+    .select({ id: userPurchasesTable.id, userId: userPurchasesTable.userId })
+    .from(userPurchasesTable)
+    .where(
+      eq(userPurchasesTable.transactionId, transaction_id),
+    )
+    .limit(1);
+
+  if (existing) {
+    // Return success with current state — do not double-credit
+    const [balRow] = await db
+      .select({ currentBalance: coinBalancesTable.currentBalance })
+      .from(coinBalancesTable)
+      .where(eq(coinBalancesTable.userId, userId))
+      .limit(1);
+
+    const [micRow] = await db
+      .select({ id: userEntitlementsTable.id })
+      .from(userEntitlementsTable)
       .where(
         and(
-          eq(userPurchasesTable.userId, userId),
-          eq(userPurchasesTable.transactionId, transaction_id),
+          eq(userEntitlementsTable.userId, userId),
+          eq(userEntitlementsTable.entitlementKey, "mic_pass"),
+          eq(userEntitlementsTable.status, "active"),
         ),
       )
       .limit(1);
 
-    if (existing) {
-      // Return success with current state — do not double-credit
-      const [balRow] = await db
-        .select({ currentBalance: coinBalancesTable.currentBalance })
-        .from(coinBalancesTable)
-        .where(eq(coinBalancesTable.userId, userId))
-        .limit(1);
+    req.log.info({ userId, product_id, transaction_id }, "[IAP] duplicate purchase detected");
+    return res.json({
+      success: true,
+      duplicate: true,
+      message: "Purchase already processed.",
+      coin_balance: balRow?.currentBalance ?? 0,
+      entitlements: { mic_pass: !!micRow },
+      has_mic_pass: !!micRow,
+      original_user_id: existing.userId,
+    });
+  }
 
-      const [micRow] = await db
-        .select({ id: userEntitlementsTable.id })
-        .from(userEntitlementsTable)
-        .where(
-          and(
-            eq(userEntitlementsTable.userId, userId),
-            eq(userEntitlementsTable.entitlementKey, "mic_pass"),
-            eq(userEntitlementsTable.status, "active"),
-          ),
-        )
-        .limit(1);
+  if (purchase_token) {
+    const [existingToken] = await db
+      .select({ id: userPurchasesTable.id })
+      .from(userPurchasesTable)
+      .where(eq(userPurchasesTable.purchaseToken, purchase_token))
+      .limit(1);
 
-      req.log.info({ userId, product_id, transaction_id }, "[IAP] duplicate purchase detected");
-      return res.json({
-        success: true,
-        duplicate: true,
-        message: "Purchase already processed.",
-        coin_balance: balRow?.currentBalance ?? 0,
-        entitlements: { mic_pass: !!micRow },
-        has_mic_pass: !!micRow,
+    if (existingToken) {
+      return res.status(409).json({
+        success: false,
+        code: "PURCHASE_TOKEN_REPLAYED",
+        message: "Purchase token has already been processed.",
       });
     }
   }
@@ -188,52 +226,43 @@ router.post("/purchases/verify", requireAuth, async (req, res) => {
           productId:       product_id,
           productType:     "consumable",
           platform,
-          paymentProvider: platform === "ios" ? "apple" : platform === "android" ? "google" : "dev",
+          paymentProvider: providerNameForPlatform(platform),
           transactionId:   transaction_id,
           purchaseToken:   purchase_token,
           status:          "verified",
           rawReceiptJson:  receipt ? { receipt } : null,
         });
 
-        // 2. Upsert coin balance (atomic increment)
-        await tx
-          .insert(coinBalancesTable)
-          .values({
-            userId,
-            currentBalance: coinAmount,
-            lifetimeEarned: coinAmount,
-            lifetimeSpent:  0,
-          })
-          .onConflictDoUpdate({
-            target: coinBalancesTable.userId,
-            set: {
-              currentBalance: sql`${coinBalancesTable.currentBalance} + ${coinAmount}`,
-              lifetimeEarned: sql`${coinBalancesTable.lifetimeEarned} + ${coinAmount}`,
-              updatedAt:      new Date(),
-            },
-          });
-
-        // 3. Insert coin ledger row
-        await tx.insert(coinTransactionsTable).values({
+        const ledger = await recordCoinLedgerEntry(tx, {
           userId,
-          amount:          coinAmount,
+          amount: coinAmount,
           transactionType: "earn",
-          source:          "iap_purchase",
-          sourceId:        transaction_id ?? product_id,
-          description:     `${coinAmount} coins from in-app purchase (${product_id})`,
+          source: "iap_purchase",
+          sourceId: transaction_id ?? product_id,
+          rewardCode: null,
+          reasonCode: "iap_purchase",
+          idempotencyKey: `iap:${userId}:${transaction_id}`,
+          description: `${coinAmount} coins from in-app purchase (${product_id})`,
+          metadata: {
+            productId: product_id,
+            platform,
+            provider: providerNameForPlatform(platform),
+          },
         });
 
-        // 4. Read back the new balance
-        const [balRow] = await tx
-          .select({ currentBalance: coinBalancesTable.currentBalance })
-          .from(coinBalancesTable)
-          .where(eq(coinBalancesTable.userId, userId))
-          .limit(1);
-
-        return balRow?.currentBalance ?? coinAmount;
+        return ledger.newBalance;
       });
 
       req.log.info({ userId, product_id, coinAmount, newBalance }, "[IAP] coins credited");
+      await writeAuditLog({
+        actorUserId: userId,
+        actorType: "user",
+        action: "coin.iap_credit",
+        entityType: "purchase",
+        entityId: transaction_id,
+        reason: product_id,
+        metadata: { productId: product_id, amount: coinAmount, platform },
+      });
 
       return res.json({
         success:          true,
@@ -275,7 +304,7 @@ router.post("/purchases/verify", requireAuth, async (req, res) => {
         productId:       product_id,
         productType:     "non_consumable",
         platform,
-        paymentProvider: platform === "ios" ? "apple" : platform === "android" ? "google" : "dev",
+        paymentProvider: providerNameForPlatform(platform),
         transactionId:   transaction_id,
         purchaseToken:   purchase_token,
         status:          "verified",
@@ -310,6 +339,15 @@ router.post("/purchases/verify", requireAuth, async (req, res) => {
         });
 
       req.log.info({ userId, product_id, entitlementKey, alreadyOwned: !!existingEnt }, "[IAP] entitlement granted");
+      await writeAuditLog({
+        actorUserId: userId,
+        actorType: "user",
+        action: "entitlement.restore_or_grant",
+        entityType: "entitlement",
+        entityId: entitlementKey,
+        reason: product_id,
+        metadata: { platform, transactionId: transaction_id },
+      });
 
       return res.json({
         success:         true,
@@ -331,6 +369,50 @@ router.post("/purchases/verify", requireAuth, async (req, res) => {
 
   // Should never reach here given the ALL_VALID_PRODUCT_IDS check above
   return res.status(400).json({ success: false, code: "INVALID_PRODUCT_ID", message: "Unknown product." });
+});
+
+router.post("/purchases/restore", requireAuth, requireActiveAccount, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+
+  const [purchases, entitlements, balanceRows] = await Promise.all([
+    db
+      .select({
+        productId: userPurchasesTable.productId,
+        transactionId: userPurchasesTable.transactionId,
+        createdAt: userPurchasesTable.createdAt,
+      })
+      .from(userPurchasesTable)
+      .where(eq(userPurchasesTable.userId, userId))
+      .orderBy(desc(userPurchasesTable.createdAt)),
+    db
+      .select({
+        entitlementKey: userEntitlementsTable.entitlementKey,
+        status: userEntitlementsTable.status,
+        productId: userEntitlementsTable.productId,
+      })
+      .from(userEntitlementsTable)
+      .where(eq(userEntitlementsTable.userId, userId)),
+    db
+      .select({ currentBalance: coinBalancesTable.currentBalance })
+      .from(coinBalancesTable)
+      .where(eq(coinBalancesTable.userId, userId))
+      .limit(1),
+  ]);
+
+  return res.json({
+    success: true,
+    coin_balance: balanceRows[0]?.currentBalance ?? 0,
+    purchases: purchases.map((row) => ({
+      product_id: row.productId,
+      transaction_id: row.transactionId,
+      created_at: row.createdAt.toISOString(),
+    })),
+    entitlements: entitlements.map((row) => ({
+      entitlement_key: row.entitlementKey,
+      product_id: row.productId,
+      status: row.status,
+    })),
+  });
 });
 
 // ── GET /api/iap/history ──────────────────────────────────────────────────────
@@ -503,7 +585,7 @@ router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
     return res.status(403).json({ success: false, code: "RACE_NOT_LIVE", message: "Race is not currently live." });
   }
 
-  // 2. Verify user is an active participant (not forfeited / left / disqualified).
+  // 2. Check whether the user is an active participant.
   const [participant] = await db
     .select({ status: raceParticipantsTable.status })
     .from(raceParticipantsTable)
@@ -516,8 +598,8 @@ router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
     )
     .limit(1);
 
-  // 3. Publishing rights — Mic Pass holders who are active participants may speak.
-  // Non-participants (spectators) and participants without Mic Pass join listen-only.
+  // 3. Publishing rights — active participants with Mic Pass may speak.
+  // Spectators can still join the room, but only as listen-only.
   let canPublishAudio = false;
   if (participant) {
     const [micPassRow] = await db
@@ -531,6 +613,7 @@ router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
         ),
       )
       .limit(1);
+
     canPublishAudio = !!micPassRow;
     req.log.info({ userId, raceId, canPublishAudio }, "[MicPass] has_mic_pass: %s", canPublishAudio);
   } else {
