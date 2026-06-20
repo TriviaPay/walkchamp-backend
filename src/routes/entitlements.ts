@@ -516,25 +516,26 @@ router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
     )
     .limit(1);
 
-  if (!participant) {
-    return res.status(403).json({ success: false, code: "NOT_A_PARTICIPANT", message: "User is not an active participant." });
+  // 3. Publishing rights — Mic Pass holders who are active participants may speak.
+  // Non-participants (spectators) and participants without Mic Pass join listen-only.
+  let canPublishAudio = false;
+  if (participant) {
+    const [micPassRow] = await db
+      .select({ id: userEntitlementsTable.id })
+      .from(userEntitlementsTable)
+      .where(
+        and(
+          eq(userEntitlementsTable.userId, userId),
+          eq(userEntitlementsTable.entitlementKey, "mic_pass"),
+          eq(userEntitlementsTable.status, "active"),
+        ),
+      )
+      .limit(1);
+    canPublishAudio = !!micPassRow;
+    req.log.info({ userId, raceId, canPublishAudio }, "[MicPass] has_mic_pass: %s", canPublishAudio);
+  } else {
+    req.log.info({ userId, raceId }, "[Voice] spectator listen-only token issued");
   }
-
-  // 3. Check Mic Pass ownership — backend is source of truth for publishing rights.
-  const [micPassRow] = await db
-    .select({ id: userEntitlementsTable.id })
-    .from(userEntitlementsTable)
-    .where(
-      and(
-        eq(userEntitlementsTable.userId, userId),
-        eq(userEntitlementsTable.entitlementKey, "mic_pass"),
-        eq(userEntitlementsTable.status, "active"),
-      ),
-    )
-    .limit(1);
-
-  const canPublishAudio = !!micPassRow;
-  req.log.info({ userId, raceId, canPublishAudio }, "[MicPass] has_mic_pass: %s", canPublishAudio);
 
   // 4. Generate a short-lived LiveKit token scoped to this race's room.
   const roomName = `race_${raceId}`;

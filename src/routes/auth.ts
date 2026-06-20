@@ -393,6 +393,51 @@ router.post("/auth/verify-token", async (req, res) => {
   }
 });
 
+// ── GET /api/auth/reset-password/open ─────────────────────────────────────────
+// HTTPS bridge for password-reset emails on mobile. Descope appends ?t=&loginId=
+// to the redirectUrl; this page immediately deep-links into the native app.
+// Required because walkchamp.app may not have DNS yet — email clients need HTTPS.
+const APP_DEEP_LINK_SCHEME = process.env.APP_DEEP_LINK_SCHEME ?? "globalwalkerleague";
+
+router.get("/auth/reset-password/open", (req, res) => {
+  const token = String(req.query.t ?? req.query.token ?? req.query.code ?? "").trim();
+  const loginId = String(req.query.loginId ?? "").trim();
+
+  const params = new URLSearchParams();
+  if (token) params.set("t", token);
+  if (loginId) params.set("loginId", loginId);
+  const qs = params.toString();
+  const deepLink = `${APP_DEEP_LINK_SCHEME}://reset-password${qs ? `?${qs}` : ""}`;
+
+  const href = deepLink
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;");
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.status(200).send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Walk Champ — Reset Password</title>
+  <meta http-equiv="refresh" content="0;url=${href}" />
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0A0B14; color: #fff; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 24px; text-align: center; }
+    a { color: #00E676; }
+  </style>
+</head>
+<body>
+  <div>
+    <p>Opening Walk Champ…</p>
+    <p><a href="${href}">Tap here if the app doesn’t open automatically</a></p>
+  </div>
+  <script>location.replace(${JSON.stringify(deepLink)});</script>
+</body>
+</html>`);
+});
+
 // ── POST /api/auth/reset-password/complete ───────────────────────────────────
 // Completes the password reset flow entirely server-side:
 //  1. Verifies the magic-link token from the reset email (needs DESCOPE_PROJECT_ID)
@@ -657,6 +702,103 @@ router.post("/auth/oauth/start", async (req, res) => {
   } catch (err: unknown) {
     req.log.error(err, "oauth/start: unexpected error");
     return res.status(500).json({ error: "server_error", message: "Unable to start sign-in" });
+  }
+});
+
+// ── POST /api/auth/password/signin — password login via Descope SDK ───────────
+// Proxied through the backend so sessionJwt + refreshJwt are always returned in
+// the JSON body. Direct mobile calls to Descope REST can miss refreshJwt when
+// Descope sets it only as an HttpOnly cookie (invisible to React Native fetch).
+const passwordSigninSchema = z.object({
+  loginId: z.string().email(),
+  password: z.string().min(1),
+});
+
+router.post("/auth/password/signin", async (req, res) => {
+  const ip = req.ip ?? "unknown";
+  if (!checkIpRateLimit(ip, 30, 60_000).allowed) {
+    return res.status(429).json({ error: "rate_limited", message: "Too many sign-in attempts. Try again shortly." });
+  }
+
+  const parse = passwordSigninSchema.safeParse(req.body);
+  if (!parse.success) {
+    return res.status(400).json({ error: "invalid_request", details: parse.error.issues });
+  }
+
+  const { loginId, password } = parse.data;
+  req.log.info({ loginId }, "[AuthPassword] sign-in requested");
+
+  try {
+    const client = getDescopeClient();
+    const resp = await client.password.signIn(loginId, password);
+    if (!resp.ok || !resp.data?.sessionJwt) {
+      const msg = resp.error?.errorDescription ?? "Invalid email or password";
+      req.log.warn({ descopeCode: resp.code }, "[AuthPassword] sign-in rejected");
+      return res.status(401).json({ error: "signin_failed", message: msg });
+    }
+
+    const { sessionJwt, refreshJwt, user } = resp.data;
+    if (!refreshJwt) {
+      req.log.warn({ loginId }, "[AuthPassword] sign-in succeeded but Descope returned no refreshJwt");
+    } else {
+      req.log.info({ loginId }, "[AuthPassword] sign-in success — refresh token issued");
+    }
+
+    return res.json({
+      sessionJwt,
+      refreshJwt: refreshJwt ?? null,
+      user: user
+        ? {
+            userId: user.userId,
+            loginIds: user.loginIds ?? [],
+            name: user.name ?? null,
+            email: user.email ?? null,
+            verifiedEmail: user.verifiedEmail ?? false,
+          }
+        : null,
+    });
+  } catch (err: unknown) {
+    req.log.error(err, "[AuthPassword] unexpected error");
+    return res.status(500).json({ error: "server_error", message: "Unable to sign in right now." });
+  }
+});
+
+// ── POST /api/auth/session/refresh — exchange refresh JWT for new session ─────
+const sessionRefreshSchema = z.object({
+  refreshJwt: z.string().min(1),
+});
+
+router.post("/auth/session/refresh", async (req, res) => {
+  const ip = req.ip ?? "unknown";
+  if (!checkIpRateLimit(ip, 120, 60_000).allowed) {
+    return res.status(429).json({ error: "rate_limited", message: "Too many refresh attempts." });
+  }
+
+  const parse = sessionRefreshSchema.safeParse(req.body);
+  if (!parse.success) {
+    return res.status(400).json({ error: "invalid_request", details: parse.error.issues });
+  }
+
+  const { refreshJwt } = parse.data;
+
+  try {
+    const client = getDescopeClient();
+    const authInfo = await client.refreshSession(refreshJwt);
+    const sessionJwt = authInfo.jwt;
+    if (!sessionJwt) {
+      req.log.warn("[AuthRefresh] Descope refresh returned no session JWT");
+      return res.status(502).json({ error: "refresh_failed", message: "Unable to refresh session." });
+    }
+
+    return res.json({
+      sessionJwt,
+      // Rotation disabled in Descope → refreshJwt may be absent; client keeps existing.
+      refreshJwt: authInfo.refreshJwt ?? refreshJwt,
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Refresh rejected";
+    req.log.warn({ err: msg }, "[AuthRefresh] refresh rejected by Descope");
+    return res.status(401).json({ error: "refresh_failed", message: msg });
   }
 });
 
