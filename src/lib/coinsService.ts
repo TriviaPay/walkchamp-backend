@@ -5,7 +5,7 @@ import {
   coinTransactionsTable,
   dailyCoinRewardsTable,
 } from "@db/schema";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, sql, gte, lte } from "drizzle-orm";
 import { triggerEvent } from "./pusher";
 import { logger } from "./logger";
 import { writeAuditLog } from "./auditLog";
@@ -214,6 +214,133 @@ export async function awardCoins(opts: {
 
   logger.info({ userId, rewardCode, amount, newBalance }, "[CoinTasks] credit reward");
   return amount;
+}
+
+export const MAX_DAILY_AD_REWARDS = 5;
+export const AD_REWARD_COINS = 30;
+
+/** Count ad-reward claims for a calendar day (daily_coin_rewards, regex — avoids SQL LIKE `_` wildcards). */
+async function countAdRewardsFromDailyTable(userId: string, date: string): Promise<number> {
+  const rows = await db
+    .select({ id: dailyCoinRewardsTable.id })
+    .from(dailyCoinRewardsTable)
+    .where(
+      and(
+        eq(dailyCoinRewardsTable.userId, userId),
+        eq(dailyCoinRewardsTable.rewardDate, date),
+        sql`${dailyCoinRewardsTable.rewardCode} ~ '^ad_reward_'`,
+      ),
+    );
+  return rows.length;
+}
+
+/** Fallback when daily_coin_rewards is unavailable — count earn rows tagged ad_reward. */
+async function countAdRewardsFromTransactions(userId: string, date: string): Promise<number> {
+  const dayStart = new Date(`${date}T00:00:00.000Z`);
+  const dayEnd = new Date(`${date}T23:59:59.999Z`);
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(coinTransactionsTable)
+    .where(
+      and(
+        eq(coinTransactionsTable.userId, userId),
+        eq(coinTransactionsTable.source, "ad_reward"),
+        gte(coinTransactionsTable.createdAt, dayStart),
+        lte(coinTransactionsTable.createdAt, dayEnd),
+      ),
+    );
+  return Number(row?.n ?? 0);
+}
+
+/** How many rewarded-ad claims the user has used today (local calendar date). */
+export async function getDailyAdRewardStatus(
+  userId: string,
+  date: string,
+): Promise<{ adsToday: number; adsRemaining: number; maxDailyAdRewards: number }> {
+  let adsToday = 0;
+  try {
+    adsToday = await countAdRewardsFromDailyTable(userId, date);
+  } catch (err) {
+    logger.warn({ err, userId, date }, "[Coins] daily_coin_rewards count failed — using transactions");
+    adsToday = await countAdRewardsFromTransactions(userId, date);
+  }
+
+  return {
+    adsToday,
+    adsRemaining: Math.max(0, MAX_DAILY_AD_REWARDS - adsToday),
+    maxDailyAdRewards: MAX_DAILY_AD_REWARDS,
+  };
+}
+
+/** Award coins for watching a rewarded ad — atomic + idempotent per claim/day slot. */
+export async function awardAdReward(
+  userId: string,
+  date: string,
+  opts?: { claimId?: string; network?: string; placement?: string },
+): Promise<{
+  awarded: number;
+  newBalance: number;
+  adsToday: number;
+  adsRemaining: number;
+  duplicate?: boolean;
+}> {
+  const status = await getDailyAdRewardStatus(userId, date);
+  if (status.adsToday >= MAX_DAILY_AD_REWARDS) {
+    const err = new Error("Daily ad reward limit reached") as Error & { code?: string };
+    err.code = "AD_REWARD_LIMIT";
+    throw err;
+  }
+
+  const slot = status.adsToday + 1;
+  const rewardCode = `ad_reward_${date}_${slot}`;
+  const claimId = opts?.claimId?.trim() || `${userId}:${date}:${rewardCode}`;
+
+  const claimAccepted = await recordAdRewardClaim({
+    userId,
+    claimId,
+    date,
+    network: opts?.network,
+    placement: opts?.placement,
+  });
+
+  if (!claimAccepted) {
+    const balance = await getCoinBalance(userId);
+    const afterStatus = await getDailyAdRewardStatus(userId, date);
+    return {
+      awarded: 0,
+      newBalance: balance.currentBalance,
+      adsToday: afterStatus.adsToday,
+      adsRemaining: afterStatus.adsRemaining,
+      duplicate: true,
+    };
+  }
+
+  const awarded = await awardCoins({
+    userId,
+    amount: AD_REWARD_COINS,
+    source: "ad_reward",
+    sourceId: claimId,
+    rewardCode,
+    reasonCode: "ad_reward",
+    idempotencyKey: `ad:${userId}:${claimId}`,
+    description: "Watched an ad for free coins",
+    date,
+    metadata: {
+      claimId,
+      network: opts?.network ?? null,
+      placement: opts?.placement ?? null,
+    },
+  });
+
+  const balance = await getCoinBalance(userId);
+  const afterStatus = await getDailyAdRewardStatus(userId, date);
+
+  return {
+    awarded,
+    newBalance: balance.currentBalance,
+    adsToday: afterStatus.adsToday,
+    adsRemaining: afterStatus.adsRemaining,
+  };
 }
 
 // ── Spend coins (for theme purchases etc.) ────────────────────────────────────

@@ -13,7 +13,14 @@ import {
 import { eq, and, desc, sql, gte, lte } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { requireActiveAccount } from "../middleware/requireActiveAccount";
-import { getCoinBalance, awardCoins, evaluateStepMilestones, recordAdRewardClaim } from "../lib/coinsService";
+import {
+  getCoinBalance,
+  awardCoins,
+  evaluateStepMilestones,
+  getDailyAdRewardStatus,
+  awardAdReward,
+  MAX_DAILY_AD_REWARDS,
+} from "../lib/coinsService";
 import { z } from "zod";
 
 const EARNING_RULES = [
@@ -60,12 +67,16 @@ router.get("/coins/balance", requireAuth, async (req, res) => {
       );
 
     const earnedToday = Number(todayRows[0]?.total ?? 0);
+    const adStatus = await getDailyAdRewardStatus(userId, localDate);
 
     return res.json({
       currentBalance: balance.currentBalance,
       lifetimeEarned: balance.lifetimeEarned,
       lifetimeSpent: balance.lifetimeSpent,
       earnedToday,
+      adsToday: adStatus.adsToday,
+      adsRemaining: adStatus.adsRemaining,
+      maxDailyAdRewards: adStatus.maxDailyAdRewards,
     });
   } catch (err) {
     req.log.error({ err }, "coins/balance error");
@@ -437,10 +448,6 @@ router.post("/coins/tasks/refresh", requireAuth, async (req, res) => {
 
 // ── POST /api/coins/ad-reward ─────────────────────────────────────────────────
 // Called after the user watches a full rewarded ad in the Shop screen.
-// Awards 30 coins, capped at 5 times per user per calendar day.
-const AD_REWARD_COINS = 30;
-const MAX_DAILY_AD_REWARDS = 5;
-
 const adRewardSchema = z.object({
   localDate: z.string().optional(),
   claim_id: z.string().min(8).max(200).optional(),
@@ -460,79 +467,35 @@ router.post("/coins/ad-reward", requireAuth, requireActiveAccount, async (req, r
     const rawLD = typeof parsed.data.localDate === "string" ? parsed.data.localDate : "";
     const today = /^\d{4}-\d{2}-\d{2}$/.test(rawLD) ? rawLD : new Date().toISOString().split("T")[0]!;
 
-    // Count how many rewarded-ad coins have been granted today
-    const countRows = await db
-      .select({ n: sql<number>`count(*)::int` })
-      .from(dailyCoinRewardsTable)
-      .where(
-        and(
-          eq(dailyCoinRewardsTable.userId, userId),
-          eq(dailyCoinRewardsTable.rewardDate, today),
-          sql`${dailyCoinRewardsTable.rewardCode} LIKE 'ad_reward_%'`,
-        ),
-      );
-
-    const todayCount = Number(countRows[0]?.n ?? 0);
-
-    if (todayCount >= MAX_DAILY_AD_REWARDS) {
-      return res.status(429).json({
-        error: "You've reached today's ad reward limit. Come back tomorrow!",
-        code: "AD_REWARD_LIMIT",
-        ads_today: todayCount,
-        limit: MAX_DAILY_AD_REWARDS,
-      });
-    }
-
-    const slot = todayCount + 1;
-    const rewardCode = `ad_reward_${slot}`;
-    const claimId = parsed.data.claim_id?.trim() || `${userId}:${today}:${rewardCode}`;
-    const claimAccepted = await recordAdRewardClaim({
-      userId,
-      claimId,
-      date: today,
+    const result = await awardAdReward(userId, today, {
+      claimId: parsed.data.claim_id,
       network: parsed.data.network,
       placement: parsed.data.placement,
     });
 
-    if (!claimAccepted) {
-      const balance = await getCoinBalance(userId);
-      return res.json({
-        success: true,
-        duplicate: true,
-        coins_awarded: 0,
-        new_balance: balance.currentBalance,
-        ads_today: todayCount,
-        ads_remaining: MAX_DAILY_AD_REWARDS - todayCount,
-      });
-    }
-
-    const awarded = await awardCoins({
-      userId,
-      amount: AD_REWARD_COINS,
-      source: "ad_reward",
-      sourceId: claimId,
-      rewardCode,
-      reasonCode: "ad_reward",
-      idempotencyKey: `ad:${userId}:${claimId}`,
-      description: "Watched an ad for free coins",
-      date: today,
-      metadata: {
-        claimId,
-        network: parsed.data.network ?? null,
-        placement: parsed.data.placement ?? null,
-      },
-    });
-
-    const balance = await getCoinBalance(userId);
-
     return res.json({
       success: true,
-      coins_awarded: awarded,
-      new_balance: balance.currentBalance,
-      ads_today: slot,
-      ads_remaining: MAX_DAILY_AD_REWARDS - slot,
+      duplicate: result.duplicate ?? false,
+      coins_awarded: result.awarded,
+      new_balance: result.newBalance,
+      ads_today: result.adsToday,
+      ads_remaining: result.adsRemaining,
+      limit: MAX_DAILY_AD_REWARDS,
     });
   } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === "AD_REWARD_LIMIT") {
+      const rawLD = typeof req.body?.localDate === "string" ? req.body.localDate : "";
+      const today = /^\d{4}-\d{2}-\d{2}$/.test(rawLD) ? rawLD : new Date().toISOString().split("T")[0]!;
+      const status = await getDailyAdRewardStatus(userId, today);
+      return res.status(429).json({
+        error: "You've reached today's ad reward limit. Come back tomorrow!",
+        code: "AD_REWARD_LIMIT",
+        ads_today: status.adsToday,
+        ads_remaining: status.adsRemaining,
+        limit: MAX_DAILY_AD_REWARDS,
+      });
+    }
     req.log.error({ err }, "coins/ad-reward error");
     return res.status(500).json({ error: "Failed to award coins. Please try again." });
   }
