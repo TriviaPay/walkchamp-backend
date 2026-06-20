@@ -1,12 +1,14 @@
 import { db } from "@db";
 import {
+  adRewardClaimsTable,
   coinBalancesTable,
   coinTransactionsTable,
   dailyCoinRewardsTable,
 } from "@db/schema";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { triggerEvent } from "./pusher";
 import { logger } from "./logger";
+import { writeAuditLog } from "./auditLog";
 
 // ── Ensure a balance row exists for the user ──────────────────────────────────
 export async function ensureCoinBalance(userId: string): Promise<void> {
@@ -33,6 +35,128 @@ export async function getCoinBalance(
   };
 }
 
+export async function recomputeCoinProjection(userId: string): Promise<number> {
+  const [totals] = await db
+    .select({
+      currentBalance: sql<number>`coalesce(sum(${coinTransactionsTable.amount}), 0)`,
+      lifetimeEarned: sql<number>`coalesce(sum(case when ${coinTransactionsTable.amount} > 0 then ${coinTransactionsTable.amount} else 0 end), 0)`,
+      lifetimeSpent: sql<number>`coalesce(sum(case when ${coinTransactionsTable.amount} < 0 then abs(${coinTransactionsTable.amount}) else 0 end), 0)`,
+    })
+    .from(coinTransactionsTable)
+    .where(eq(coinTransactionsTable.userId, userId));
+
+  const currentBalance = Number(totals?.currentBalance ?? 0);
+  const lifetimeEarned = Number(totals?.lifetimeEarned ?? 0);
+  const lifetimeSpent = Number(totals?.lifetimeSpent ?? 0);
+
+  await db
+    .insert(coinBalancesTable)
+    .values({
+      userId,
+      currentBalance,
+      lifetimeEarned,
+      lifetimeSpent,
+    })
+    .onConflictDoUpdate({
+      target: coinBalancesTable.userId,
+      set: {
+        currentBalance,
+        lifetimeEarned,
+        lifetimeSpent,
+        updatedAt: new Date(),
+      },
+    });
+
+  return currentBalance;
+}
+
+type CoinLedgerEntry = {
+  userId: string;
+  amount: number;
+  transactionType: "earn" | "spend" | "refund" | "adjustment";
+  source: string;
+  sourceId?: string | null;
+  rewardCode?: string | null;
+  reasonCode: string;
+  idempotencyKey: string;
+  description: string;
+  metadata?: Record<string, unknown> | null;
+};
+
+export async function recordCoinLedgerEntry(
+  tx: any,
+  entry: CoinLedgerEntry,
+): Promise<{ applied: boolean; newBalance: number }> {
+  const [existing] = await tx
+    .select({
+      id: coinTransactionsTable.id,
+      balanceAfter: coinTransactionsTable.balanceAfter,
+    })
+    .from(coinTransactionsTable)
+    .where(and(
+      eq(coinTransactionsTable.userId, entry.userId),
+      eq(coinTransactionsTable.idempotencyKey, entry.idempotencyKey),
+    ))
+    .limit(1);
+
+  if (existing) {
+    return {
+      applied: false,
+      newBalance: existing.balanceAfter ?? 0,
+    };
+  }
+
+  await tx
+    .insert(coinBalancesTable)
+    .values({ userId: entry.userId, currentBalance: 0, lifetimeEarned: 0, lifetimeSpent: 0 })
+    .onConflictDoNothing();
+
+  const [balanceRow] = await tx
+    .select({
+      currentBalance: coinBalancesTable.currentBalance,
+      lifetimeEarned: coinBalancesTable.lifetimeEarned,
+      lifetimeSpent: coinBalancesTable.lifetimeSpent,
+    })
+    .from(coinBalancesTable)
+    .where(eq(coinBalancesTable.userId, entry.userId))
+    .limit(1);
+
+  const currentBalance = balanceRow?.currentBalance ?? 0;
+  if (entry.amount < 0 && currentBalance + entry.amount < 0) {
+    throw new Error("NEGATIVE_COIN_BALANCE");
+  }
+
+  const newBalance = currentBalance + entry.amount;
+  const earnedDelta = entry.amount > 0 ? entry.amount : 0;
+  const spentDelta = entry.amount < 0 ? Math.abs(entry.amount) : 0;
+
+  await tx.insert(coinTransactionsTable).values({
+    userId: entry.userId,
+    amount: entry.amount,
+    transactionType: entry.transactionType,
+    source: entry.source,
+    sourceId: entry.sourceId ?? null,
+    rewardCode: entry.rewardCode ?? null,
+    reasonCode: entry.reasonCode,
+    idempotencyKey: entry.idempotencyKey,
+    description: entry.description,
+    balanceAfter: newBalance,
+    metadata: entry.metadata ?? null,
+  });
+
+  await tx
+    .update(coinBalancesTable)
+    .set({
+      currentBalance: newBalance,
+      lifetimeEarned: sql`${coinBalancesTable.lifetimeEarned} + ${earnedDelta}`,
+      lifetimeSpent: sql`${coinBalancesTable.lifetimeSpent} + ${spentDelta}`,
+      updatedAt: new Date(),
+    })
+    .where(eq(coinBalancesTable.userId, entry.userId));
+
+  return { applied: true, newBalance };
+}
+
 // ── Award coins — idempotent by (userId, rewardDate, rewardCode) ──────────────
 // Returns coins actually awarded (0 if already awarded / duplicate).
 export async function awardCoins(opts: {
@@ -43,6 +167,9 @@ export async function awardCoins(opts: {
   rewardCode: string;
   description: string;
   date: string; // YYYY-MM-DD
+  reasonCode?: string;
+  idempotencyKey?: string;
+  metadata?: Record<string, unknown>;
 }): Promise<number> {
   const { userId, amount, source, sourceId, rewardCode, description, date } = opts;
 
@@ -59,30 +186,20 @@ export async function awardCoins(opts: {
   // Actually credit the coins
   let newBalance = amount;
   await db.transaction(async (tx) => {
-    const [updated] = await tx
-      .insert(coinBalancesTable)
-      .values({ userId, currentBalance: amount, lifetimeEarned: amount, lifetimeSpent: 0 })
-      .onConflictDoUpdate({
-        target: [coinBalancesTable.userId],
-        set: {
-          currentBalance: sql`${coinBalancesTable.currentBalance} + ${amount}`,
-          lifetimeEarned: sql`${coinBalancesTable.lifetimeEarned} + ${amount}`,
-          updatedAt: new Date(),
-        },
-      })
-      .returning({ currentBalance: coinBalancesTable.currentBalance });
-
-    newBalance = updated?.currentBalance ?? amount;
-
-    await tx.insert(coinTransactionsTable).values({
+    const result = await recordCoinLedgerEntry(tx, {
       userId,
       amount,
       transactionType: "earn",
       source,
       sourceId: sourceId ?? null,
       rewardCode,
+      reasonCode: opts.reasonCode ?? rewardCode.toLowerCase(),
+      idempotencyKey: opts.idempotencyKey ?? `daily:${userId}:${date}:${rewardCode}`,
       description,
+      metadata: opts.metadata ?? null,
     });
+
+    newBalance = result.newBalance;
   });
 
   // Notify the user in real-time so all screens refresh their balance immediately
@@ -106,6 +223,9 @@ export async function spendCoins(opts: {
   source: string;
   sourceId?: string;
   description: string;
+  reasonCode?: string;
+  idempotencyKey?: string;
+  metadata?: Record<string, unknown>;
 }): Promise<{ success: boolean; newBalance: number; coinsNeeded?: number }> {
   const { userId, amount, source, sourceId, description } = opts;
 
@@ -123,32 +243,19 @@ export async function spendCoins(opts: {
       return { success: false, newBalance: current, coinsNeeded: amount - current };
     }
 
-    await tx
-      .update(coinBalancesTable)
-      .set({
-        currentBalance: sql`${coinBalancesTable.currentBalance} - ${amount}`,
-        lifetimeSpent: sql`${coinBalancesTable.lifetimeSpent} + ${amount}`,
-        updatedAt: new Date(),
-      })
-      .where(eq(coinBalancesTable.userId, userId));
-
-    await tx.insert(coinTransactionsTable).values({
+    const ledger = await recordCoinLedgerEntry(tx, {
       userId,
       amount: -amount,
       transactionType: "spend",
       source,
       sourceId: sourceId ?? null,
       rewardCode: null,
+      reasonCode: opts.reasonCode ?? source,
+      idempotencyKey: opts.idempotencyKey ?? `spend:${userId}:${source}:${sourceId ?? amount}:${amount}`,
       description,
+      metadata: opts.metadata ?? null,
     });
-
-    const [updated] = await tx
-      .select({ currentBalance: coinBalancesTable.currentBalance })
-      .from(coinBalancesTable)
-      .where(eq(coinBalancesTable.userId, userId))
-      .limit(1);
-
-    return { success: true, newBalance: updated?.currentBalance ?? current - amount };
+    return { success: true, newBalance: ledger.newBalance };
   });
 
   // Notify the user in real-time so all screens refresh their balance immediately
@@ -165,6 +272,49 @@ export async function spendCoins(opts: {
   }
 
   return result;
+}
+
+export async function recordAdRewardClaim(opts: {
+  userId: string;
+  claimId: string;
+  date: string;
+  network?: string;
+  placement?: string;
+}): Promise<boolean> {
+  const inserted = await db
+    .insert(adRewardClaimsTable)
+    .values({
+      userId: opts.userId,
+      claimId: opts.claimId,
+      rewardDate: opts.date,
+      network: opts.network ?? null,
+      placement: opts.placement ?? null,
+    })
+    .onConflictDoNothing()
+    .returning({ id: adRewardClaimsTable.id });
+
+  return inserted.length > 0;
+}
+
+export async function auditManualCoinChange(opts: {
+  actorUserId?: string | null;
+  targetUserId: string;
+  amount: number;
+  reason: string;
+  sourceId?: string | null;
+}) {
+  await writeAuditLog({
+    actorUserId: opts.actorUserId ?? null,
+    actorType: "admin",
+    action: "coin.manual_adjustment",
+    entityType: "user",
+    entityId: opts.targetUserId,
+    reason: opts.reason,
+    metadata: {
+      amount: opts.amount,
+      sourceId: opts.sourceId ?? null,
+    },
+  });
 }
 
 // ── Evaluate and award step milestone coins ───────────────────────────────────

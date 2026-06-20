@@ -1,10 +1,19 @@
 import { Router } from "express";
 import { db } from "@db";
-import { userPresenceTable, profilesTable, raceRoomsTable, raceParticipantsTable } from "@db/schema";
-import { eq, gte, ne, inArray, sql } from "drizzle-orm";
+import {
+  userPresenceTable,
+  raceRoomsTable,
+  raceParticipantsTable,
+  friendsTable,
+  walkingGroupMembersTable,
+  spectateSessionsTable,
+} from "@db/schema";
+import { and, eq, gte, inArray, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { triggerEvent } from "../lib/pusher";
 import { z } from "zod";
+import { requireActiveAccount } from "../middleware/requireActiveAccount";
+import { isFeatureEnabled } from "../lib/featureFlags";
 
 const router = Router();
 
@@ -54,13 +63,129 @@ async function computeCounts() {
 }
 
 // ── GET /api/presence/online-ids ──────────────────────────────────────────────
-// Returns the array of user IDs with a heartbeat in the last 90 seconds.
-// Used by global chat to show per-user online/offline dots.
+// Legacy broad presence endpoint. Disabled by default in coins-only v1.
 router.get("/presence/online-ids", requireAuth, async (_req, res) => {
+  const enabled = await isFeatureEnabled("legacy_presence_online_ids", false);
+  if (!enabled) {
+    return res.status(410).json({
+      error: "This endpoint has been retired. Use scoped presence endpoints instead.",
+      code: "PRESENCE_ENDPOINT_RETIRED",
+    });
+  }
+
   const rows = await db
     .select({ userId: userPresenceTable.userId })
     .from(userPresenceTable)
     .where(gte(userPresenceTable.lastSeenAt, onlineAfter()));
+  return res.json({ userIds: rows.map((r) => r.userId) });
+});
+
+router.get("/presence/friends/online", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const friends = await db
+    .select({ userId: friendsTable.friendId })
+    .from(friendsTable)
+    .where(eq(friendsTable.userId, userId));
+
+  if (friends.length === 0) {
+    return res.json({ userIds: [] });
+  }
+
+  const rows = await db
+    .select({ userId: userPresenceTable.userId })
+    .from(userPresenceTable)
+    .where(and(
+      inArray(userPresenceTable.userId, friends.map((row) => row.userId)),
+      gte(userPresenceTable.lastSeenAt, onlineAfter()),
+      ne(userPresenceTable.status, "offline"),
+    ));
+
+  return res.json({ userIds: rows.map((r) => r.userId) });
+});
+
+router.get("/presence/groups/:groupId/online", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const groupId = String(req.params.groupId);
+
+  const [membership] = await db
+    .select({ id: walkingGroupMembersTable.id })
+    .from(walkingGroupMembersTable)
+    .where(and(
+      eq(walkingGroupMembersTable.groupId, groupId),
+      eq(walkingGroupMembersTable.userId, userId),
+      eq(walkingGroupMembersTable.status, "active"),
+    ))
+    .limit(1);
+
+  if (!membership) {
+    return res.status(403).json({ error: "Group membership required" });
+  }
+
+  const memberRows = await db
+    .select({ userId: walkingGroupMembersTable.userId })
+    .from(walkingGroupMembersTable)
+    .where(and(
+      eq(walkingGroupMembersTable.groupId, groupId),
+      eq(walkingGroupMembersTable.status, "active"),
+    ));
+
+  const rows = memberRows.length === 0
+    ? []
+    : await db
+        .select({ userId: userPresenceTable.userId })
+        .from(userPresenceTable)
+        .where(and(
+          inArray(userPresenceTable.userId, memberRows.map((row) => row.userId)),
+          gte(userPresenceTable.lastSeenAt, onlineAfter()),
+          ne(userPresenceTable.status, "offline"),
+        ));
+
+  return res.json({ userIds: rows.map((r) => r.userId) });
+});
+
+router.get("/presence/races/:raceId/online", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const raceId = String(req.params.raceId);
+
+  const [participantAccess, spectatorAccess] = await Promise.all([
+    db
+      .select({ id: raceParticipantsTable.id })
+      .from(raceParticipantsTable)
+      .where(and(
+        eq(raceParticipantsTable.raceRoomId, raceId),
+        eq(raceParticipantsTable.userId, userId),
+      ))
+      .limit(1),
+    db
+      .select({ id: spectateSessionsTable.id })
+      .from(spectateSessionsTable)
+      .where(and(
+        eq(spectateSessionsTable.raceRoomId, raceId),
+        eq(spectateSessionsTable.userId, userId),
+      ))
+      .limit(1),
+  ]);
+
+  if (!participantAccess[0] && !spectatorAccess[0]) {
+    return res.status(403).json({ error: "Race access required" });
+  }
+
+  const participants = await db
+    .selectDistinct({ userId: raceParticipantsTable.userId })
+    .from(raceParticipantsTable)
+    .where(eq(raceParticipantsTable.raceRoomId, raceId));
+
+  const rows = participants.length === 0
+    ? []
+    : await db
+        .select({ userId: userPresenceTable.userId })
+        .from(userPresenceTable)
+        .where(and(
+          inArray(userPresenceTable.userId, participants.map((row) => row.userId)),
+          gte(userPresenceTable.lastSeenAt, onlineAfter()),
+          ne(userPresenceTable.status, "offline"),
+        ));
+
   return res.json({ userIds: rows.map((r) => r.userId) });
 });
 
@@ -89,7 +214,7 @@ const heartbeatSchema = z.object({
   status: z.enum(["online", "walking", "racing", "spectating", "away"]).default("online"),
 });
 
-router.post("/presence/heartbeat", requireAuth, async (req, res) => {
+router.post("/presence/heartbeat", requireAuth, requireActiveAccount, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const parsed = heartbeatSchema.safeParse(req.body);
   const status = parsed.success ? parsed.data.status : "online";

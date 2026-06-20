@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type RequestHandler } from "express";
 import multer from "multer";
 import { db } from "@db";
 import { profilesTable, walletsTable, achievementDefinitionsTable, userTitlesTable, friendsTable, friendRequestsTable } from "@db/schema";
@@ -8,9 +8,13 @@ import { coinBalancesTable } from "@db/schema";
 import { raceParticipantsTable, raceRoomsTable } from "@db/schema";
 import { eq, and, or, desc, ne, gt, notInArray, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { ociPutObject, ociGetObject, ociDeleteObject, ociObjectUrl } from "../lib/ociStorage";
+import { ociPutObject, ociGetObject, ociDeleteObject, ociObjectUrl, ociObjectKeyFromUrl, isOciConfigured, isOciConfigError } from "../lib/ociStorage";
 import { triggerEvent } from "../lib/pusher";
 import { z } from "zod";
+import { buildGeneratedObjectKey, validateRasterUpload } from "../lib/uploadPolicy";
+import { sanitizePlainText } from "../lib/text";
+import { config } from "../lib/config";
+import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -22,6 +26,17 @@ const upload = multer({
 });
 
 const router = Router();
+const uploadLimiter: RequestHandler = config.features.rateLimitingEnabled
+  ? createRedisRateLimit({
+      bucket: "profile-avatar-upload",
+      windowMs: 15 * 60 * 1000,
+      max: 20,
+      failureMode: "closed",
+      message: "Too many upload attempts — please try again later.",
+      code: "UPLOAD_RATE_LIMITED",
+      key: rateLimitByActorOrIp,
+    })
+  : (_req, _res, next) => next();
 
 // ── Level system ──────────────────────────────────────────────────────────────
 const LEVEL_THRESHOLDS = [
@@ -362,12 +377,12 @@ router.put("/profile/me", requireAuth, async (req, res) => {
   }
 
   const patch: Record<string, unknown> = { updatedAt: new Date() };
-  if (updates.fullName    !== undefined) patch.fullName    = updates.fullName.trim();
+  if (updates.fullName    !== undefined) patch.fullName    = sanitizePlainText(updates.fullName);
   if (updates.username    !== undefined) patch.username    = updates.username;
-  if (updates.country     !== undefined) patch.country     = updates.country;
-  if (updates.countryCode !== undefined) patch.countryCode = updates.countryCode;
-  if (updates.countryFlag !== undefined) patch.countryFlag = updates.countryFlag;
-  if (updates.bio         !== undefined) patch.bio         = updates.bio;
+  if (updates.country     !== undefined) patch.country     = sanitizePlainText(updates.country);
+  if (updates.countryCode !== undefined) patch.countryCode = sanitizePlainText(updates.countryCode);
+  if (updates.countryFlag !== undefined) patch.countryFlag = sanitizePlainText(updates.countryFlag);
+  if (updates.bio         !== undefined) patch.bio         = sanitizePlainText(updates.bio);
   if (updates.avatarColor !== undefined) patch.avatarColor = updates.avatarColor;
 
   const [updated] = await db
@@ -394,24 +409,33 @@ router.put("/profile/me", requireAuth, async (req, res) => {
 });
 
 // ── POST /api/profile/me/avatar ───────────────────────────────────────────────
-router.post("/profile/me/avatar", requireAuth, upload.single("avatar"), async (req, res) => {
+router.post("/profile/me/avatar", requireAuth, uploadLimiter, upload.single("avatar"), async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const file   = req.file;
   if (!file) return res.status(400).json({ error: "No image provided" });
-
-  const objKey = `avatars/${userId}`;
+  if (!isOciConfigured()) return res.status(503).json({ error: "Avatar storage is not configured" });
 
   try {
-    // Delete the existing avatar before uploading the new one so no stale object remains
-    await ociDeleteObject(objKey).catch(() => {});
-    await ociPutObject(objKey, file.buffer, file.mimetype);
+    const contentType = validateRasterUpload(file);
+    const [profile] = await db
+      .select({ avatarUrl: profilesTable.avatarUrl })
+      .from(profilesTable)
+      .where(eq(profilesTable.id, userId))
+      .limit(1);
+    const oldKey = ociObjectKeyFromUrl(profile?.avatarUrl);
+    const objKey = buildGeneratedObjectKey("avatars", userId, contentType);
+
+    if (oldKey) {
+      await ociDeleteObject(oldKey).catch(() => {});
+    }
+    await ociPutObject(objKey, file.buffer, contentType);
 
     // Full OCI object URL stored in the DB
     const avatarUrl = ociObjectUrl(objKey);
     // Proxy URL for client display — works regardless of bucket visibility
     const displayUrl = `/api/profile/avatar/${userId}`;
 
-    req.log.info({ userId, avatarUrl, bucket: process.env.OCI_BUCKET_NAME }, "avatar uploaded to OCI");
+    req.log.info({ userId, avatarUrl, bucket: config.objectStorage.bucket }, "avatar uploaded to OCI");
 
     const now = new Date();
     await db
@@ -424,6 +448,9 @@ router.post("/profile/me/avatar", requireAuth, upload.single("avatar"), async (r
 
     return res.json({ success: true, avatarUrl, displayUrl, avatarVersion });
   } catch (err) {
+    if (isOciConfigError(err)) {
+      return res.status(503).json({ error: "Avatar storage is not configured" });
+    }
     req.log.error(err, "OCI avatar upload failed");
     return res.status(500).json({ error: "Upload failed" });
   }
@@ -433,9 +460,17 @@ router.post("/profile/me/avatar", requireAuth, upload.single("avatar"), async (r
 // Public endpoint — streams the avatar image from OCI object storage
 router.get("/profile/avatar/:userId", async (req, res) => {
   const userId = String(req.params.userId);
-  const objKey = `avatars/${userId}`;
+  if (!isOciConfigured()) return res.status(503).end();
 
   try {
+    const [profile] = await db
+      .select({ avatarUrl: profilesTable.avatarUrl })
+      .from(profilesTable)
+      .where(eq(profilesTable.id, userId))
+      .limit(1);
+    const objKey = ociObjectKeyFromUrl(profile?.avatarUrl);
+    if (!objKey) return res.status(404).end();
+
     const obj = await ociGetObject(objKey);
     if (!obj) return res.status(404).end();
 
@@ -449,6 +484,9 @@ router.get("/profile/avatar/:userId", async (req, res) => {
         .on("finish", resolve);
     });
   } catch (err) {
+    if (isOciConfigError(err)) {
+      return res.status(503).end();
+    }
     req.log.error(err, "avatar fetch failed");
     return res.status(500).end();
   }
@@ -457,8 +495,16 @@ router.get("/profile/avatar/:userId", async (req, res) => {
 // ── DELETE /api/profile/me/avatar ─────────────────────────────────────────────
 router.delete("/profile/me/avatar", requireAuth, async (req, res) => {
   const userId   = (req as AuthenticatedRequest).descopeUserId;
-  // Fire-and-forget — don't block the response if OCI delete fails
-  ociDeleteObject(`avatars/${userId}`).catch(() => {});
+  if (!isOciConfigured()) return res.status(503).json({ error: "Avatar storage is not configured" });
+  const [profile] = await db
+    .select({ avatarUrl: profilesTable.avatarUrl })
+    .from(profilesTable)
+    .where(eq(profilesTable.id, userId))
+    .limit(1);
+  const oldKey = ociObjectKeyFromUrl(profile?.avatarUrl);
+  if (oldKey) {
+    ociDeleteObject(oldKey).catch(() => {});
+  }
 
   const now = new Date();
   await db

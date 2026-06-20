@@ -3,26 +3,76 @@ import { raceRoomsTable, raceParticipantsTable, scheduledRoomRegistrationsTable 
 import { eq, and, lte, sql, ne } from "drizzle-orm";
 import { triggerEvent } from "./pusher";
 import { logger } from "./logger";
-import { randomUUID } from "crypto";
+import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "./raceIntegrity";
 
 async function startScheduledRoom(roomId: string): Promise<void> {
   try {
-    const regs = await db
-      .select({ userId: scheduledRoomRegistrationsTable.userId })
-      .from(scheduledRoomRegistrationsTable)
-      .where(
-        and(
-          eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
-          eq(scheduledRoomRegistrationsTable.status, "registered")
-        )
-      );
+    let regs: Array<{ userId: string }> = [];
+    let finalStatus: "open" | "full" | "cancelled" = "cancelled";
+    let playerCount = 0;
 
-    if (regs.length < 2) {
-      await db
+    const now = new Date();
+    await db.transaction(async (tx) => {
+      const room = await lockRaceRoom(tx, roomId);
+      if (!room || room.status !== "scheduled") return;
+
+      regs = await tx
+        .select({ userId: scheduledRoomRegistrationsTable.userId })
+        .from(scheduledRoomRegistrationsTable)
+        .where(
+          and(
+            eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
+            eq(scheduledRoomRegistrationsTable.status, "registered"),
+          ),
+        );
+
+      if (regs.length < 2) {
+        await tx
+          .update(raceRoomsTable)
+          .set({ status: "cancelled", updatedAt: now })
+          .where(eq(raceRoomsTable.id, roomId));
+        finalStatus = "cancelled";
+        return;
+      }
+
+      await tx
+        .update(scheduledRoomRegistrationsTable)
+        .set({ status: "activated", activatedAt: now })
+        .where(
+          and(
+            eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
+            eq(scheduledRoomRegistrationsTable.status, "registered"),
+          ),
+        );
+
+      let activatedPlayers = 0;
+      for (const reg of regs) {
+        const participantResult = await joinOrReviveParticipant(tx, {
+          raceRoomId: roomId,
+          userId: reg.userId,
+          currentSteps: 0,
+          raceBaselineSteps: 0,
+        });
+        if (participantResult.changed) {
+          activatedPlayers += 1;
+        }
+      }
+
+      playerCount = activatedPlayers;
+      finalStatus = deriveOpenRoomStatus(activatedPlayers, room.maxPlayers);
+
+      await tx
         .update(raceRoomsTable)
-        .set({ status: "cancelled", updatedAt: new Date() })
+        .set({
+          status: finalStatus,
+          startedAt: now,
+          currentPlayers: activatedPlayers,
+          updatedAt: now,
+        })
         .where(eq(raceRoomsTable.id, roomId));
+    });
 
+    if (finalStatus === "cancelled") {
       logger.info({ roomId, registrations: regs.length }, "[ScheduleRoomJob] roomCancelledInsufficientPlayers");
 
       triggerEvent("public-rooms-available", "room:cancelled", { room_id: roomId }).catch(() => {});
@@ -36,44 +86,7 @@ async function startScheduledRoom(roomId: string): Promise<void> {
       return;
     }
 
-    const now = new Date();
-
-    await db.transaction(async (tx) => {
-      await tx
-        .update(raceRoomsTable)
-        .set({ status: "open", startedAt: now, updatedAt: now })
-        .where(eq(raceRoomsTable.id, roomId));
-
-      await tx
-        .update(scheduledRoomRegistrationsTable)
-        .set({ status: "activated", activatedAt: now })
-        .where(
-          and(
-            eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
-            eq(scheduledRoomRegistrationsTable.status, "registered")
-          )
-        );
-
-      for (const reg of regs) {
-        await tx
-          .insert(raceParticipantsTable)
-          .values({
-            id: randomUUID(),
-            raceRoomId: roomId,
-            userId: reg.userId,
-            status: "joined",
-            joinedAt: now,
-          })
-          .onConflictDoNothing();
-      }
-
-      await tx
-        .update(raceRoomsTable)
-        .set({ currentPlayers: regs.length })
-        .where(eq(raceRoomsTable.id, roomId));
-    });
-
-    logger.info({ roomId, players: regs.length }, "[ScheduleRoomJob] roomStarted");
+    logger.info({ roomId, players: playerCount }, "[ScheduleRoomJob] roomStarted");
 
     triggerEvent("public-rooms-available", "room:created", { room_id: roomId }).catch(() => {});
     triggerEvent("public-presence", "race:started", { raceId: roomId }).catch(() => {});

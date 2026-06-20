@@ -1,0 +1,63 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+
+groups:
+  - walkchamp
+  - deploy
+
+users:
+  - name: deploy
+    primary_group: deploy
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    lock_passwd: true
+  - name: walkchamp
+    primary_group: walkchamp
+    shell: /usr/sbin/nologin
+    lock_passwd: true
+
+packages:
+  - curl
+  - git
+  - logrotate
+  - ufw
+
+write_files:
+  - path: /etc/sysctl.d/99-walkchamp.conf
+    permissions: "0644"
+    content: |
+      fs.inotify.max_user_watches=524288
+  - path: /etc/ssh/sshd_config.d/99-walkchamp.conf
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      PermitRootLogin no
+      PubkeyAuthentication yes
+  - path: /etc/logrotate.d/walkchamp
+    permissions: "0644"
+    content: |
+      /var/log/walkchamp/*.log {
+        daily
+        rotate 14
+        missingok
+        compress
+        delaycompress
+        notifempty
+        create 0640 walkchamp walkchamp
+        copytruncate
+      }
+
+runcmd:
+  - mkdir -p /srv/walkchamp/releases /srv/walkchamp/shared /var/log/walkchamp /etc/walkchamp
+  - chown -R walkchamp:walkchamp /srv/walkchamp /var/log/walkchamp /etc/walkchamp
+  - chmod 0750 /etc/walkchamp
+  - curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+  - apt-get install -y nodejs
+  - corepack enable
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow OpenSSH
+  - ufw --force enable
+  - systemctl restart ssh

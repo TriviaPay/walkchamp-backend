@@ -4,7 +4,6 @@ export const pushNotificationStatusEnum = pgEnum("push_notification_status", [
   "sent",
   "skipped_disabled",
   "skipped_no_device",
-  "skipped_duplicate",
   "failed",
 ]);
 
@@ -86,25 +85,6 @@ export const userNotificationPreferencesTable = pgTable(
   },
   (t) => [
     index("user_notif_prefs_user_idx").on(t.userId),
-  ],
-);
-
-// ── Push notification event log (idempotency / dedup) ─────────────────────────
-export const notificationEventsTable = pgTable(
-  "notification_events",
-  {
-    id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
-    eventType: text("event_type").notNull(),
-    entityId: text("entity_id").notNull(),
-    recipientUserId: text("recipient_user_id").notNull(),
-    onesignalNotificationId: text("onesignal_notification_id"),
-    sentAt: timestamp("sent_at", { withTimezone: true }),
-    metadata: jsonb("metadata").$type<Record<string, unknown>>(),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  },
-  (t) => [
-    uniqueIndex("notification_events_dedup_idx").on(t.eventType, t.entityId, t.recipientUserId),
-    index("notification_events_recipient_idx").on(t.recipientUserId),
   ],
 );
 

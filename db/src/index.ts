@@ -1,18 +1,19 @@
 import { drizzle } from "drizzle-orm/node-postgres";
 import pg from "pg";
 import * as schema from "./schema";
+import { config } from "../../src/lib/config";
 
 const { Pool } = pg;
 
-const connectionString = process.env.NEON_DATABASE_URL ?? process.env.DATABASE_URL;
-
-if (!connectionString) {
-  throw new Error(
-    "NEON_DATABASE_URL (or DATABASE_URL) must be set. Copy your Neon connection string from Replit secrets into Vercel → Settings → Environment Variables.",
-  );
-}
-
-export const pool = new Pool({ connectionString });
+export const pool = new Pool({
+  connectionString: config.database.runtimeUrl,
+  max: config.database.poolMax,
+  connectionTimeoutMillis: config.database.connectionTimeoutMillis,
+  idleTimeoutMillis: config.database.idleTimeoutMillis,
+  statement_timeout: config.database.statementTimeoutMillis,
+  idle_in_transaction_session_timeout: config.database.idleInTransactionSessionTimeoutMillis,
+  application_name: `walkchamp-${config.processRole}`,
+});
 export const db = drizzle(pool, { schema });
 
 export * from "./schema";

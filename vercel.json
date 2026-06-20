@@ -3,42 +3,5 @@
   "version": 2,
   "installCommand": "pnpm install --frozen-lockfile",
   "buildCommand": "pnpm run vercel-build",
-  "framework": null,
-  "outputDirectory": "public",
-  "env": {
-    "NODE_ENV": "production",
-    "NEON_DATABASE_URL": "postgresql://neondb_owner:npg_n4xSPYVl0qCQ@ep-frosty-snow-apc6mszl-pooler.c-7.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
-    "APP_BASE_URL": "https://walkchamp-backend-sooty.vercel.app",
-    "ALLOWED_ORIGINS": "https://walkchamp.app,http://localhost:8081",
-    "DESCOPE_PROJECT_ID": "P3E9mQAxf0N6l75csydDy6kGeOPR",
-    "DESCOPE_MANAGEMENT_KEY": "K3E9nLEHCwFWRoUYllMtVTN56JqTp3BTxglmGrhqwGmiioxbILamdYh0r6LWrmod8qgffBO",
-    "SESSION_SECRET": "walkchamp-prod-session-secret-change-me",
-    "PUSHER_APP_ID": "2158722",
-    "PUSHER_KEY": "93ca011c5a4b0c5ebb96",
-    "PUSHER_SECRET": "440ab26617ce869a4773",
-    "PUSHER_CLUSTER": "mt1",
-    "ONESIGNAL_APP_ID": "d2a5b069-1715-4942-b76f-a2b1c9c2f2f1",
-    "ONESIGNAL_REST_API_KEY": "vdhus3ex6upcvlrlzmvhra3ad",
-    "RAZORPAY_KEY_ID": "rzp_test_T2jKlttzxL1WzR",
-    "RAZORPAY_KEY_SECRET": "Pq3KAOjs10CUSqpUL37PeUHR",
-    "LIVEKIT_URL": "wss://walkchamp-q44ovkkr.livekit.cloud",
-    "LIVEKIT_API_KEY": "APINFjmppgCpfBw",
-    "LIVEKIT_API_SECRET": "XDkrdDfQzIpHtIifEOKYM6hdloe9T8gLDk9BXWGgezAD",
-    "OCI_NAMESPACE": "axadzcltpbiu",
-    "OCI_REGION": "us-chicago-1",
-    "OCI_BUCKET_NAME": "walkchamp",
-    "OCI_ACCESS_KEY_ID": "bd50db79f0280086f748d8318e96d20ce29ca563",
-    "OCI_SECRET_ACCESS_KEY": "ZBrQ6rwVYhK3o3ubh4TNt4DpkYy5jGfyVF8f/JG6hRM="
-  },
-  "functions": {
-    "api/index.ts": {
-      "maxDuration": 60
-    }
-  },
-  "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": "/api"
-    }
-  ]
+  "framework": null
 }
