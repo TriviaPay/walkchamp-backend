@@ -208,9 +208,14 @@ router.post("/friends/request", requireAuth, async (req, res) => {
   sendNotification(
     targetId,
     "friend_request",
-    "New friend request",
+    "Friend request received",
     `@${senderProfile?.username ?? "Someone"} sent you a friend request`,
-    { requestId: request.id },
+    {
+      requestId: request.id,
+      senderUserId: userId,
+      senderUsername: senderProfile?.username ?? "Someone",
+      deepLink: "walkchamp://chat/requests",
+    },
   ).catch(() => {});
 
   const senderSummary = {
@@ -294,7 +299,25 @@ router.post("/friends/accept", requireAuth, async (req, res) => {
     "friend_request_accepted",
     "Friend request accepted",
     `@${receiverProfile?.username ?? "Someone"} accepted your friend request`,
-    { friendId: userId },
+    {
+      requestId: request.id,
+      friendId: userId,
+      friendUsername: receiverProfile?.username ?? "Someone",
+      deepLink: "walkchamp://chat/friends",
+    },
+  ).catch(() => {});
+
+  sendNotification(
+    userId,
+    "friend_request_accepted",
+    "You're now friends",
+    `You and @${senderProfile?.username ?? "Someone"} are now friends`,
+    {
+      requestId: request.id,
+      friendId: request.senderId,
+      friendUsername: senderProfile?.username ?? "Someone",
+      deepLink: "walkchamp://chat/friends",
+    },
   ).catch(() => {});
 
   const acceptPayload = {

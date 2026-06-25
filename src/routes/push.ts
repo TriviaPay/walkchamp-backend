@@ -147,6 +147,9 @@ export async function sendPushToUser(
       }),
     });
     onesignalResponse = (await resp.json()) as Record<string, unknown>;
+    if (!resp.ok || onesignalResponse?.errors) {
+      status = "failed";
+    }
   } catch {
     status = "failed";
   }
