@@ -1,6 +1,7 @@
 region           = "us-ashburn-1"
 tenancy_ocid     = "ocid1.tenancy.oc1..example"
 compartment_ocid = "ocid1.compartment.oc1..example"
+availability_domain_name = "EYNM:US-CHICAGO-1-AD-1"
 name_prefix      = "walkchamp-prod"
 free_tier_mode   = true
 

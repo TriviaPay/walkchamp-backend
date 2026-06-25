@@ -72,6 +72,9 @@ runcmd:
 %{ if repo_deploy_key_b64 != "" ~}
   - runuser -u deploy -- ssh-keyscan -H ${repo_ssh_host} >> /home/deploy/.ssh/known_hosts
 %{ endif ~}
+  # Swap keeps low-RAM shapes (e.g. VM.Standard.E2.1.Micro, 1 GB) from OOM-killing
+  # the pnpm install / build step. Harmless on larger A1 shapes.
+  - bash -c 'if [ ! -f /swapfile ]; then fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048; chmod 600 /swapfile; mkswap /swapfile; swapon /swapfile; grep -q "^/swapfile" /etc/fstab || echo "/swapfile none swap sw 0 0" >> /etc/fstab; fi'
   - curl -fsSL https://deb.nodesource.com/setup_${node_major_version}.x | bash -
   - apt-get install -y nodejs
   - corepack enable

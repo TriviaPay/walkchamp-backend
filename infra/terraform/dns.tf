@@ -6,7 +6,7 @@ resource "oci_dns_rrset" "api_a" {
 
   items {
     domain = trimsuffix(var.api_domain, ".")
-    rdata  = oci_load_balancer_load_balancer.public.ip_addresses[0].ip_address
+    rdata  = oci_load_balancer_load_balancer.public.ip_addresses[0]
     rtype  = "A"
     ttl    = var.dns_ttl
   }

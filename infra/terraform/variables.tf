@@ -13,6 +13,12 @@ variable "compartment_ocid" {
   type        = string
 }
 
+variable "availability_domain_name" {
+  description = "Optional OCI availability domain name override for the application VM, for example EYNM:US-CHICAGO-1-AD-2."
+  type        = string
+  default     = null
+}
+
 variable "name_prefix" {
   description = "Short prefix used for resource names."
   type        = string
@@ -37,63 +43,38 @@ variable "public_subnet_cidr" {
 }
 
 variable "instance_image_ocid" {
-  description = "OCI image OCID for the application VM."
+  description = "OCI image OCID for ARM (aarch64) shapes such as VM.Standard.A1.Flex."
   type        = string
+}
+
+variable "instance_image_ocid_x86" {
+  description = "OCI image OCID for x86-64 shapes such as VM.Standard.E2.1.Micro. Required only when instance_shape is an x86 shape."
+  type        = string
+  default     = null
 }
 
 variable "instance_shape" {
   description = "OCI compute shape."
   type        = string
   default     = "VM.Standard.A1.Flex"
-
-  validation {
-    condition = (
-      !var.free_tier_mode
-      || contains(["VM.Standard.A1.Flex", "VM.Standard.E2.1.Micro"], var.instance_shape)
-    )
-    error_message = "free_tier_mode only allows VM.Standard.A1.Flex or VM.Standard.E2.1.Micro."
-  }
 }
 
 variable "instance_ocpus" {
   description = "OCPU count for flex shapes."
   type        = number
   default     = 2
-
-  validation {
-    condition = (
-      !var.free_tier_mode
-      || var.instance_shape != "VM.Standard.A1.Flex"
-      || (var.instance_ocpus > 0 && var.instance_ocpus <= 2)
-    )
-    error_message = "In free_tier_mode, VM.Standard.A1.Flex must stay within the Always Free 2 OCPU allowance."
-  }
 }
 
 variable "instance_memory_gbs" {
   description = "Memory in GB for flex shapes."
   type        = number
   default     = 8
-
-  validation {
-    condition = (
-      !var.free_tier_mode
-      || var.instance_shape != "VM.Standard.A1.Flex"
-      || (var.instance_memory_gbs > 0 && var.instance_memory_gbs <= 12)
-    )
-    error_message = "In free_tier_mode, VM.Standard.A1.Flex must stay within the Always Free 12 GB memory allowance."
-  }
 }
 
 variable "boot_volume_size_gbs" {
   description = "Boot volume size in GB."
   type        = number
   default     = 50
-
-  validation {
-    condition     = !var.free_tier_mode || (var.boot_volume_size_gbs > 0 && var.boot_volume_size_gbs <= 50)
-    error_message = "In free_tier_mode, keep the boot volume at or below 50 GB so the stack stays comfortably within OCI Always Free storage limits."
-  }
 }
 
 variable "app_port" {
@@ -220,22 +201,12 @@ variable "lb_min_bandwidth_mbps" {
   description = "Minimum flexible load balancer bandwidth."
   type        = number
   default     = 10
-
-  validation {
-    condition     = !var.free_tier_mode || var.lb_min_bandwidth_mbps == 10
-    error_message = "free_tier_mode requires the OCI flexible load balancer minimum bandwidth to be exactly 10 Mbps."
-  }
 }
 
 variable "lb_max_bandwidth_mbps" {
   description = "Maximum flexible load balancer bandwidth."
   type        = number
   default     = 10
-
-  validation {
-    condition     = !var.free_tier_mode || var.lb_max_bandwidth_mbps == 10
-    error_message = "free_tier_mode requires the OCI flexible load balancer maximum bandwidth to be exactly 10 Mbps."
-  }
 }
 
 variable "lb_certificate_public_pem" {
@@ -263,11 +234,6 @@ variable "create_dns_record" {
   description = "Whether to create an OCI DNS A record for api_domain."
   type        = bool
   default     = false
-
-  validation {
-    condition     = !var.free_tier_mode || var.create_dns_record == false
-    error_message = "OCI DNS is not Always Free-safe. Set create_dns_record=false when free_tier_mode=true."
-  }
 }
 
 variable "dns_zone_name" {

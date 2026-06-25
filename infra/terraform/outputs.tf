@@ -19,7 +19,7 @@ output "instance_private_ip" {
 }
 
 output "load_balancer_ip" {
-  value = oci_load_balancer_load_balancer.public.ip_addresses[0].ip_address
+  value = oci_load_balancer_load_balancer.public.ip_addresses[0]
 }
 
 output "listener_port" {

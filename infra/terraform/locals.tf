@@ -1,8 +1,23 @@
 locals {
-  compact_prefix = lower(substr(regexreplace(var.name_prefix, "[^a-zA-Z0-9]", ""), 0, 12))
+  compact_prefix = lower(substr(replace(var.name_prefix, "/[^a-zA-Z0-9]/", ""), 0, 12))
 
-  availability_domain = data.oci_identity_availability_domains.this.availability_domains[0].name
+  availability_domain = var.availability_domain_name != null ? var.availability_domain_name : data.oci_identity_availability_domains.this.availability_domains[0].name
   bucket_name         = var.bucket_name != null ? var.bucket_name : "${var.name_prefix}-assets"
+
+  # Shape-aware selection so the same stack can target either the ARM A1 free
+  # shape or the x86 E2.1.Micro free shape just by changing var.instance_shape.
+  instance_is_arm  = can(regex("\\.A1\\.", var.instance_shape))
+  instance_is_flex = endswith(var.instance_shape, ".Flex")
+  instance_image = (
+    local.instance_is_arm
+    ? var.instance_image_ocid
+    : coalesce(var.instance_image_ocid_x86, var.instance_image_ocid)
+  )
+
+  # Distinct hostname per architecture so an A1 instance can be created
+  # (create_before_destroy) while the x86 micro still exists, without a VCN DNS
+  # hostname_label collision during the swap.
+  instance_hostname_suffix = local.instance_is_arm ? "a1" : "x86"
 
   enable_https = (
     var.lb_certificate_public_pem != null

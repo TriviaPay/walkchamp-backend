@@ -39,6 +39,7 @@ Copy [terraform.tfvars.example](/Users/rithiktheddu/Documents/TriviaPay/walkcham
 Important:
 
 - `instance_image_ocid` must point to a valid Ubuntu image in your OCI region.
+- `availability_domain_name` can be set explicitly if OCI returns a host-capacity error in the default AD.
 - `application_env` must include the app secrets and external provider config from `.env.example`.
 - `oci_s3_access_key_id` and `oci_s3_secret_access_key` are still required because the current backend uses OCI's S3-compatible API.
 - `repo_clone_url` must be reachable from the VM on first boot.
@@ -95,7 +96,7 @@ terraform plan -out tfplan
 terraform apply tfplan
 ```
 
-Use Terraform `>= 1.6`. The local machine I used for authoring has `1.5.0`, which is too old to fully validate current OCI providers.
+Use Terraform `>= 1.5`. Terraform `1.5.0` works with the current configuration, but using a newer 1.x release is still preferable.
 
 ## Post-apply checks
 
