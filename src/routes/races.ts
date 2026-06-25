@@ -39,6 +39,7 @@ import {
   lockScheduledRegistration,
   registerOrReviveScheduledRegistration,
 } from "../lib/raceIntegrity";
+import { firePromotionalRoomHosted, notifyPrivateRoomInvitation } from "../lib/pushNotificationService";
 
 const router = Router();
 
@@ -1847,6 +1848,15 @@ router.post("/races/host", requireAuth, async (req, res) => {
       }).catch(() => {});
     }
   }
+  void firePromotionalRoomHosted({
+    roomId: result.room.id,
+    entryType,
+    isPrivate,
+    hostUserId: userId,
+    coinEntryAmount,
+    entryAmountCents: amountCents,
+    isScheduledFuture,
+  });
   return res.status(201).json({
     raceId: result.room.id,
     race: result.room,
@@ -4356,6 +4366,18 @@ router.post("/races/:id/invites", requireAuth, async (req, res) => {
     inviteCode: room.isPrivate ? room.inviteCode : null,
     expiresAt: expiresAt.toISOString(),
   }).catch(() => {});
+
+  if (room.isPrivate && room.inviteCode) {
+    void notifyPrivateRoomInvitation({
+      roomId: raceId,
+      roomCode: room.inviteCode,
+      challengeType: challengeLabel,
+      inviterUserId: currentUserId,
+      inviterUsername: hostProfile?.username ?? "Someone",
+      invitedUserId: inviteeId,
+      roomInviteId: invite.id,
+    });
+  }
 
   // Auto-expire after 20s
   setTimeout(() => {

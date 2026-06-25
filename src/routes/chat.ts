@@ -16,6 +16,7 @@ import { triggerEvent } from "../lib/pusher";
 import { z } from "zod";
 import { sanitizePlainText } from "../lib/text";
 import { config } from "../lib/config";
+import { notifyChatMessageReceived } from "../lib/pushNotificationService";
 
 const router = Router();
 
@@ -433,6 +434,15 @@ router.post("/chat/private/:friendId", requireAuth, async (req, res) => {
 
   await triggerEvent(`private-chat-${conv.id}`, "chat:new_message", payload);
   await triggerEvent(`private-user-${friendId}`, "chat:new_message", { ...payload, isPrivate: true });
+
+  void notifyChatMessageReceived({
+    conversationId: conv.id,
+    messageId: msg.id,
+    senderUserId: userId,
+    senderUsername: senderProfile?.username ?? "Someone",
+    receiverUserId: friendId,
+    messagePreview: text,
+  });
 
   return res.status(201).json({ message: payload });
 });

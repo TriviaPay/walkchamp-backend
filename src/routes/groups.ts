@@ -16,6 +16,13 @@ import { z } from "zod";
 import { triggerEvent } from "../lib/pusher";
 import { evaluateAndNotify } from "./achievementHooks";
 import { sendPushToUser } from "./push";
+import {
+  getUsername,
+  notifyWalkingGroupInviteReceived,
+  notifyWalkingGroupJoinRequestReceived,
+  notifyWalkingGroupRequestAccepted,
+  notifyWalkingGroupRequestRejected,
+} from "../lib/pushNotificationService";
 import { ociPutObject, ociGetObject, ociDeleteObject, ociObjectUrl, ociObjectKeyFromUrl, isOciConfigured, isOciConfigError } from "../lib/ociStorage";
 import { buildGeneratedObjectKey, validateRasterUpload } from "../lib/uploadPolicy";
 import { sanitizePlainText } from "../lib/text";
@@ -744,6 +751,12 @@ router.post("/groups/:groupId/invite", requireAuth, async (req, res) => {
     })
     .returning();
 
+  const [inviterProfile] = await db
+    .select({ username: profilesTable.username })
+    .from(profilesTable)
+    .where(eq(profilesTable.id, userId))
+    .limit(1);
+
   req.log.info({ groupId, targetUserId: targetProfile.id }, "[Groups] invite sent");
   await triggerEvent(`private-user-${targetProfile.id}`, "group.invite.sent", {
     inviteId: invite.id,
@@ -751,12 +764,14 @@ router.post("/groups/:groupId/invite", requireAuth, async (req, res) => {
     groupName: group.groupName,
     groupType: group.groupType,
   });
-  await sendPushToUser(
-    targetProfile.id,
-    "Group Invite",
-    `You've been invited to join "${group.groupName}"`,
-    { type: "group_invite", groupId, inviteId: invite.id },
-  );
+  void notifyWalkingGroupInviteReceived({
+    invitedUserId: targetProfile.id,
+    inviterUserId: userId,
+    inviterUsername: inviterProfile?.username ?? targetProfile.username ?? "Someone",
+    walkingGroupId: groupId,
+    walkingGroupName: group.groupName,
+    walkingGroupInviteId: invite.id,
+  });
 
   return res.status(201).json({ success: true, invite });
 });
@@ -1317,7 +1332,14 @@ router.post("/groups/:groupId/join-request", requireAuth, async (req, res) => {
 
   req.log.info({ groupId, userId }, "[Groups] join request created");
 
-  sendPushToUser(group.adminUserId, "New Group Join Request", "Someone wants to join your group").catch(() => {});
+  const requesterUsername = await getUsername(userId);
+  void notifyWalkingGroupJoinRequestReceived({
+    walkingGroupId: groupId,
+    walkingGroupName: group.groupName,
+    walkingGroupJoinRequestId: request.id,
+    requesterUserId: userId,
+    requesterUsername,
+  });
   triggerEvent(`private-user-${group.adminUserId}`, "group.join_request", {
     groupId,
     requestId: request.id,
@@ -1381,8 +1403,20 @@ router.post("/groups/join-requests/:requestId/accept", requireAuth, async (req, 
 
   req.log.info({ requestId, groupId: jr.groupId, newMemberId: jr.userId }, "[Groups] join request accepted");
 
+  const [group] = await db
+    .select({ groupName: walkingGroupsTable.groupName })
+    .from(walkingGroupsTable)
+    .where(eq(walkingGroupsTable.id, jr.groupId))
+    .limit(1);
+
   triggerEvent(`private-user-${jr.userId}`, "group.join_request_accepted", { groupId: jr.groupId }).catch(() => {});
-  sendPushToUser(jr.userId, "Join Request Accepted", "Your request to join the group was accepted!").catch(() => {});
+  void notifyWalkingGroupRequestAccepted({
+    walkingGroupId: jr.groupId,
+    walkingGroupName: group?.groupName ?? "the group",
+    walkingGroupJoinRequestId: requestId,
+    acceptedUserId: jr.userId,
+    acceptedByAdminUserId: userId,
+  });
   evaluateAndNotify(jr.userId).catch(() => {});
 
   return res.json({ success: true });
@@ -1422,7 +1456,19 @@ router.post("/groups/join-requests/:requestId/reject", requireAuth, async (req, 
 
   req.log.info({ requestId, groupId: jr.groupId }, "[Groups] join request rejected");
 
+  const [group] = await db
+    .select({ groupName: walkingGroupsTable.groupName })
+    .from(walkingGroupsTable)
+    .where(eq(walkingGroupsTable.id, jr.groupId))
+    .limit(1);
+
   triggerEvent(`private-user-${jr.userId}`, "group.join_request_rejected", { groupId: jr.groupId }).catch(() => {});
+  void notifyWalkingGroupRequestRejected({
+    walkingGroupId: jr.groupId,
+    walkingGroupName: group?.groupName ?? "the group",
+    walkingGroupJoinRequestId: requestId,
+    requesterUserId: jr.userId,
+  });
 
   return res.json({ success: true });
 });

@@ -15,6 +15,7 @@ import { spendCoins, getCoinBalance, recordCoinLedgerEntry } from "../lib/coinsS
 import { grantVariableCoinReward } from "../lib/coinRewardService";
 import { logger } from "../lib/logger";
 import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration } from "../lib/raceIntegrity";
+import { notifyPromotionalSponsoredEvent } from "../lib/pushNotificationService";
 
 const router = Router();
 
@@ -141,7 +142,7 @@ async function autoFillSchedule(): Promise<void> {
 
     if (existing.length > 0) continue;
 
-    await db.insert(raceRoomsTable).values({
+    const [inserted] = await db.insert(raceRoomsTable).values({
       creatorId: recent.creatorId,
       title: ev.title,
       type: "sponsored",
@@ -156,7 +157,16 @@ async function autoFillSchedule(): Promise<void> {
       inviteCode,
       isPrivate: false,
       trackLayout: pickTrackLayout(ev.day, ev.date),
-    });
+    }).returning({ id: raceRoomsTable.id });
+
+    if (inserted) {
+      void notifyPromotionalSponsoredEvent({
+        eventId: inserted.id,
+        eventName: ev.title,
+        coinsEntry: ENTRY_COINS,
+        excludeUserId: recent.creatorId,
+      });
+    }
 
     created++;
     logger.info({ inviteCode, startAt }, "[SponsoredEventsJob] autoFill: created event");
@@ -627,7 +637,7 @@ router.post("/sponsored-events/generate-weekend", requireAuth, requireAdminKey, 
         continue;
       }
 
-      await db.insert(raceRoomsTable).values({
+      const [inserted] = await db.insert(raceRoomsTable).values({
         creatorId: userId,
         title: ev.title,
         type: "sponsored",
@@ -642,7 +652,16 @@ router.post("/sponsored-events/generate-weekend", requireAuth, requireAdminKey, 
         inviteCode,
         isPrivate: false,
         trackLayout: pickTrackLayout(ev.day, ev.date),
-      });
+      }).returning({ id: raceRoomsTable.id });
+
+      if (inserted) {
+        void notifyPromotionalSponsoredEvent({
+          eventId: inserted.id,
+          eventName: ev.title,
+          coinsEntry: ENTRY_COINS,
+          excludeUserId: userId,
+        });
+      }
 
       created.push(inviteCode);
       req.log.info({ inviteCode, startAt }, "[SponsoredEventsJob] generated weekend events");

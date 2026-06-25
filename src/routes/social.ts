@@ -15,6 +15,7 @@ import { sendNotification } from "./notifications";
 import { triggerEvent } from "../lib/pusher";
 import { z } from "zod";
 import { grantCoinReward } from "../lib/coinRewardService";
+import { notifyFriendRequestRejected } from "../lib/pushNotificationService";
 
 const router = Router();
 
@@ -351,16 +352,36 @@ router.post("/friends/reject", requireAuth, async (req, res) => {
   const parsed = z.object({ requestId: z.string().min(1) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "requestId required" });
 
-  await db
-    .update(friendRequestsTable)
-    .set({ status: "rejected", updatedAt: new Date() })
+  const [request] = await db
+    .select()
+    .from(friendRequestsTable)
     .where(
       and(
         eq(friendRequestsTable.id, parsed.data.requestId),
         eq(friendRequestsTable.recipientId, userId),
         eq(friendRequestsTable.status, "pending"),
       ),
-    );
+    )
+    .limit(1);
+
+  if (!request) return res.status(404).json({ error: "Request not found" });
+
+  await db
+    .update(friendRequestsTable)
+    .set({ status: "rejected", updatedAt: new Date() })
+    .where(eq(friendRequestsTable.id, parsed.data.requestId));
+
+  const [receiverProfile] = await db
+    .select({ username: profilesTable.username })
+    .from(profilesTable)
+    .where(eq(profilesTable.id, userId))
+    .limit(1);
+
+  void notifyFriendRequestRejected({
+    senderUserId: request.senderId,
+    receiverUsername: receiverProfile?.username ?? "Someone",
+    requestId: request.id,
+  });
 
   return res.json({ ok: true });
 });

@@ -88,15 +88,50 @@ router.post("/push/send", requireAdminKey, async (req, res) => {
 });
 
 // ── Core push sending helper (called from other routes) ───────────────────────
-// Signature: (userId, title, body, data?)
-// Targeting uses OneSignal external_id (set via OneSignal.login(userId)) —
-// more reliable than storing subscription IDs, and works even if device
-// registration hasn't completed yet.
+export type PushCategory = "chat" | "invite" | "race" | "reward";
+
+export interface PushSendOptions {
+  url?: string;
+  category?: PushCategory;
+  dedupeKey?: string;
+}
+
+async function isPushAllowedForUser(userId: string, category?: PushCategory): Promise<boolean> {
+  const [prefs] = await db
+    .select({
+      pushNotificationsEnabled: userNotificationPreferencesTable.pushNotificationsEnabled,
+      raceUpdatesEnabled: userNotificationPreferencesTable.raceUpdatesEnabled,
+      inviteUpdatesEnabled: userNotificationPreferencesTable.inviteUpdatesEnabled,
+      rewardUpdatesEnabled: userNotificationPreferencesTable.rewardUpdatesEnabled,
+      chatUpdatesEnabled: userNotificationPreferencesTable.chatUpdatesEnabled,
+    })
+    .from(userNotificationPreferencesTable)
+    .where(eq(userNotificationPreferencesTable.userId, userId))
+    .limit(1);
+
+  if (prefs && !prefs.pushNotificationsEnabled) return false;
+  if (!category || !prefs) return true;
+
+  switch (category) {
+    case "chat":
+      return prefs.chatUpdatesEnabled;
+    case "invite":
+      return prefs.inviteUpdatesEnabled;
+    case "race":
+      return prefs.raceUpdatesEnabled;
+    case "reward":
+      return prefs.rewardUpdatesEnabled;
+    default:
+      return true;
+  }
+}
+
 export async function sendPushToUser(
   userId: string,
   title: string,
   body: string,
   data?: Record<string, unknown>,
+  options?: PushSendOptions,
 ): Promise<string> {
   const oneSignalKey = process.env.ONESIGNAL_REST_API_KEY;
   const oneSignalAppId = process.env.ONESIGNAL_APP_ID;
@@ -105,20 +140,13 @@ export async function sendPushToUser(
 
   const notificationType = String(data?.type ?? "notification");
 
-  // Check user notification preference — default to enabled if no row yet
-  const [prefs] = await db
-    .select({ pushNotificationsEnabled: userNotificationPreferencesTable.pushNotificationsEnabled })
-    .from(userNotificationPreferencesTable)
-    .where(eq(userNotificationPreferencesTable.userId, userId))
-    .limit(1);
-
-  if (prefs && !prefs.pushNotificationsEnabled) {
+  if (!(await isPushAllowedForUser(userId, options?.category))) {
     await db.insert(pushNotificationLogsTable).values({
       userId,
       notificationType,
       title,
       body,
-      data,
+      data: { ...(data ?? {}), dedupeKey: options?.dedupeKey },
       status: "skipped_disabled",
     });
     return "skipped_disabled";
@@ -143,7 +171,8 @@ export async function sendPushToUser(
         target_channel: "push",
         headings: { en: title },
         contents: { en: body },
-        data: data ?? {},
+        data: { ...(data ?? {}), dedupeKey: options?.dedupeKey },
+        ...(options?.url ? { url: options.url } : {}),
       }),
     });
     onesignalResponse = (await resp.json()) as Record<string, unknown>;
@@ -159,12 +188,81 @@ export async function sendPushToUser(
     notificationType,
     title,
     body,
-    data,
+    data: { ...(data ?? {}), dedupeKey: options?.dedupeKey },
     onesignalResponse,
     status,
   });
 
   return status;
+}
+
+/** Batch send to multiple users via OneSignal external_id aliases (max 2000 per call). */
+export async function sendPushToUsers(
+  userIds: string[],
+  title: string,
+  body: string,
+  data?: Record<string, unknown>,
+  options?: PushSendOptions,
+): Promise<void> {
+  const oneSignalKey = process.env.ONESIGNAL_REST_API_KEY;
+  const oneSignalAppId = process.env.ONESIGNAL_APP_ID;
+  if (!oneSignalKey || !oneSignalAppId) return;
+
+  const notificationType = String(data?.type ?? "notification");
+  const unique = [...new Set(userIds.filter(Boolean))];
+  if (unique.length === 0) return;
+
+  const eligible: string[] = [];
+  for (const uid of unique) {
+    if (await isPushAllowedForUser(uid, options?.category)) eligible.push(uid);
+  }
+  if (eligible.length === 0) return;
+
+  const payloadData = { ...(data ?? {}), dedupeKey: options?.dedupeKey };
+  const BATCH = 2000;
+
+  for (let i = 0; i < eligible.length; i += BATCH) {
+    const batch = eligible.slice(i, i + BATCH);
+    let status: "sent" | "failed" = "sent";
+    let onesignalResponse: Record<string, unknown> | undefined;
+
+    try {
+      const resp = await fetch("https://onesignal.com/api/v1/notifications", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${oneSignalKey}`,
+        },
+        body: JSON.stringify({
+          app_id: oneSignalAppId,
+          include_aliases: { external_id: batch },
+          target_channel: "push",
+          headings: { en: title },
+          contents: { en: body },
+          data: payloadData,
+          ...(options?.url ? { url: options.url } : {}),
+        }),
+      });
+      onesignalResponse = (await resp.json()) as Record<string, unknown>;
+      if (!resp.ok || onesignalResponse?.errors) status = "failed";
+    } catch {
+      status = "failed";
+    }
+
+    await Promise.all(
+      batch.map((userId) =>
+        db.insert(pushNotificationLogsTable).values({
+          userId,
+          notificationType,
+          title,
+          body,
+          data: payloadData,
+          onesignalResponse,
+          status,
+        }),
+      ),
+    );
+  }
 }
 
 export default router;

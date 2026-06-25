@@ -15,6 +15,7 @@ import { logger } from "../lib/logger";
 import { getCoinBalance } from "../lib/coinsService";
 import { requireFeatureEnabled } from "../middleware/requireFeatureEnabled";
 import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "../lib/raceIntegrity";
+import { firePromotionalRoomHosted } from "../lib/pushNotificationService";
 
 const router = Router();
 
@@ -140,6 +141,16 @@ router.post("/coins-battle/host", requireAuth, async (req, res) => {
     coinEntryAmount,
     hostUserId: userId,
   }).catch(() => {});
+
+  if (!isPrivate) {
+    void firePromotionalRoomHosted({
+      roomId: room.id,
+      entryType: "coins_battle",
+      isPrivate,
+      hostUserId: userId,
+      coinEntryAmount,
+    });
+  }
 
   return res.status(201).json({
     success: true,
