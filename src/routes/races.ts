@@ -39,6 +39,13 @@ import {
   lockScheduledRegistration,
   registerOrReviveScheduledRegistration,
 } from "../lib/raceIntegrity";
+import {
+  buildLiveRaceProgressContext,
+  formatProgressSyncResponse,
+  getLiveRaceStandings,
+} from "../lib/raceLeaderboardService";
+import { triggerLiveActivityUpdate } from "../lib/liveActivityUpdateService";
+import { liveActivityTokensTable } from "@db/schema";
 import { firePromotionalRoomHosted, notifyPrivateRoomInvitation } from "../lib/pushNotificationService";
 
 const router = Router();
@@ -3465,6 +3472,23 @@ router.get("/races/:id", requireAuth, async (req, res) => {
 });
 
 // ── POST /api/races/:id/progress ─────────────────────────────────────────────
+async function respondWithLiveProgress(
+  res: import("express").Response,
+  raceId: string,
+  userId: string,
+  raceSteps: number,
+  extra: Record<string, unknown> = {},
+) {
+  const ctx = await buildLiveRaceProgressContext(raceId, userId, raceSteps);
+  if (!ctx) {
+    return res.json({ success: true, steps: raceSteps, race_status: "unknown", ...extra });
+  }
+  if (ctx.raceStatus === "in_progress" && !extra.skipped) {
+    void triggerLiveActivityUpdate(ctx);
+  }
+  return res.json(formatProgressSyncResponse(ctx, extra));
+}
+
 // Participant reports their current race step count. Steps only ever increase.
 // Optional fields (non-breaking):
 //   sequenceId      — monotonic client counter; duplicate/stale syncs are silently
@@ -3595,16 +3619,13 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
       { raceId, userId, clientSeq, lastSeq: participantData.lastStepSequenceId },
       "[StepSync] skipped — duplicate sequenceId",
     );
-    return res.json({
-      steps: participantData.currentSteps,
+    return respondWithLiveProgress(res, raceId, userId, participantData.currentSteps, {
       skipped: "duplicate_sequence",
-      progress: participantData.currentSteps / Math.max((room?.targetSteps ?? 1), 1),
-      race_status: room?.status ?? "in_progress",
     });
   }
 
   if (room && room.status !== "in_progress") {
-    return res.json({ steps: participantData.currentSteps, race_status: room.status });
+    return respondWithLiveProgress(res, raceId, userId, participantData.currentSteps);
   }
 
   const nowMs = Date.now();
@@ -3708,12 +3729,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
 
   // Skip no-change writes — saves a DB round-trip
   if (newSteps === participantData.currentSteps && clientSeq === null && !baselineNeedsRegistration) {
-    return res.json({
-      steps: newSteps,
-      skipped: "no_change",
-      progress: newSteps / Math.max(targetSteps, 1),
-      race_status: room?.status ?? "in_progress",
-    });
+    return respondWithLiveProgress(res, raceId, userId, newSteps, { skipped: "no_change" });
   }
 
   // Sync-time columns to persist on every accepted write
@@ -3824,13 +3840,18 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
           "[RaceFinish] participant reached goal",
         );
 
+        const standings = await getLiveRaceStandings(raceId);
+        const userRank = standings.find((s) => s.userId === userId)?.rank ?? 0;
+
         // Broadcast progress + goal completion in parallel
         await Promise.all([
           triggerEvent(`public-live-race-${raceId}`, "race:progress_updated", {
             participantId: participantData.id,
             userId,
             steps: newSteps,
-            rank: 0,
+            progress: newSteps / Math.max(targetSteps, 1),
+            rank: userRank,
+            leaderboard: standings.slice(0, 20),
           }),
           triggerEvent(`public-live-race-${raceId}`, "participant_finished_goal", {
             raceId,
@@ -3869,24 +3890,90 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
         .set({ currentSteps: newSteps, ...syncCols })
         .where(eq(raceParticipantsTable.id, participantData.id));
 
+      const standings = await getLiveRaceStandings(raceId);
+      const userRank = standings.find((s) => s.userId === userId)?.rank ?? 0;
+
       await triggerEvent(`public-live-race-${raceId}`, "race:progress_updated", {
         participantId: participantData.id,
         userId,
         steps: newSteps,
         progress: newSteps / Math.max(targetSteps, 1),
-        rank: 0,
+        rank: userRank,
+        leaderboard: standings.slice(0, 20),
       });
     }
   }
 
+  return respondWithLiveProgress(res, raceId, userId, newSteps);
+});
+
+// ── GET /api/races/:id/leaderboard ───────────────────────────────────────────
+router.get("/races/:id/leaderboard", requireAuth, async (req, res) => {
+  const raceId = String(req.params.id);
+  const [room] = await db
+    .select({ status: raceRoomsTable.status, targetSteps: raceRoomsTable.targetSteps, challengeEndAt: raceRoomsTable.challengeEndAt })
+    .from(raceRoomsTable)
+    .where(eq(raceRoomsTable.id, raceId))
+    .limit(1);
+  if (!room) return res.status(404).json({ error: "Race not found" });
+
+  const leaderboard = await getLiveRaceStandings(raceId);
+  const timeLeftSeconds = room.challengeEndAt
+    ? Math.max(0, Math.floor((room.challengeEndAt.getTime() - Date.now()) / 1000))
+    : 0;
+
   return res.json({
     success: true,
-    steps: newSteps,
-    accepted_race_steps: newSteps,
-    progress: newSteps / Math.max(targetSteps, 1),
-    race_status: room?.status ?? "in_progress",
-    server_time: new Date().toISOString(),
+    raceId,
+    raceStatus: room.status,
+    goalSteps: room.targetSteps,
+    timeLeftSeconds,
+    leaderboard,
+    updatedAt: new Date().toISOString(),
   });
+});
+
+// ── POST /api/races/:id/live-activity/register ────────────────────────────────
+router.post("/races/:id/live-activity/register", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const raceId = String(req.params.id);
+  const parsed = z
+    .object({
+      activityId: z.string().min(1),
+      pushToken: z.string().min(1),
+      platform: z.enum(["ios", "android"]).default("ios"),
+    })
+    .safeParse(req.body);
+
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid request", details: parsed.error.issues });
+  }
+
+  const { activityId, pushToken, platform } = parsed.data;
+
+  const [participant] = await db
+    .select({ id: raceParticipantsTable.id })
+    .from(raceParticipantsTable)
+    .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId)))
+    .limit(1);
+  if (!participant) return res.status(404).json({ error: "Participant not found" });
+
+  await db
+    .insert(liveActivityTokensTable)
+    .values({ raceId, userId, activityId, pushToken, platform, status: "active" })
+    .onConflictDoUpdate({
+      target: [liveActivityTokensTable.raceId, liveActivityTokensTable.userId],
+      set: {
+        activityId,
+        pushToken,
+        platform,
+        status: "active",
+        updatedAt: new Date(),
+      },
+    });
+
+  req.log.info({ raceId, userId, activityId }, "[LiveActivity] token registered");
+  return res.json({ success: true });
 });
 
 // ── POST /api/races/:id/reconcile-steps ──────────────────────────────────────

@@ -21,3 +21,4 @@ export * from "./friendActivity";
 export * from "./cashChallengeConsents";
 export * from "./featureFlags";
 export * from "./auditLogs";
+export * from "./liveActivity";
