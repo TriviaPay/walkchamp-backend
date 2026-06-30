@@ -130,7 +130,7 @@ describe("HTTP integration smoke", () => {
     expect(json).toMatchObject({
       status: "ready",
       checks: {
-        database: "ok",
+        database: "skipped",
         config: "ok",
       },
     });

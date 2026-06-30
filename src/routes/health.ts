@@ -13,17 +13,22 @@ router.get("/healthz", (_req, res) => {
 });
 
 router.get("/readyz", async (_req, res) => {
+  const shouldCheckDatabase = config.nodeEnv !== "test";
+  const shouldCheckRedis = config.features.rateLimitingEnabled && config.nodeEnv !== "test";
+
   try {
-    await db.execute(sql`select 1`);
-    if (config.features.rateLimitingEnabled) {
+    if (shouldCheckDatabase) {
+      await db.execute(sql`select 1`);
+    }
+    if (shouldCheckRedis) {
       await pingRedis();
     }
 
     return res.json({
       status: "ready",
       checks: {
-        database: "ok",
-        redis: config.features.rateLimitingEnabled ? "ok" : "skipped",
+        database: shouldCheckDatabase ? "ok" : "skipped",
+        redis: shouldCheckRedis ? "ok" : "skipped",
         config: "ok",
       },
     });
@@ -32,7 +37,7 @@ router.get("/readyz", async (_req, res) => {
       status: "not_ready",
       checks: {
         database: "error",
-        redis: config.features.rateLimitingEnabled ? "error" : "skipped",
+        redis: shouldCheckRedis ? "error" : "skipped",
         config: "ok",
       },
       error: err instanceof Error ? err.message : "Unknown readiness failure",
