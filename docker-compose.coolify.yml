@@ -1,0 +1,121 @@
+x-app-env: &app-env
+  NODE_ENV: production
+  PORT: "8080"
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  APP_BASE_URL: ${APP_BASE_URL:?APP_BASE_URL is required}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required}
+  TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+  ENABLE_RATE_LIMITING: ${ENABLE_RATE_LIMITING:-true}
+  REDIS_URL: redis://redis:6379
+  DATABASE_RUNTIME_URL: ${DATABASE_RUNTIME_URL:?DATABASE_RUNTIME_URL is required}
+  DATABASE_ADMIN_URL: ${DATABASE_ADMIN_URL:?DATABASE_ADMIN_URL is required}
+  DESCOPE_PROJECT_ID: ${DESCOPE_PROJECT_ID:?DESCOPE_PROJECT_ID is required}
+  DESCOPE_MANAGEMENT_KEY: ${DESCOPE_MANAGEMENT_KEY:?DESCOPE_MANAGEMENT_KEY is required}
+  SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+  PUSHER_APP_ID: ${PUSHER_APP_ID:?PUSHER_APP_ID is required}
+  PUSHER_KEY: ${PUSHER_KEY:?PUSHER_KEY is required}
+  PUSHER_SECRET: ${PUSHER_SECRET:?PUSHER_SECRET is required}
+  PUSHER_CLUSTER: ${PUSHER_CLUSTER:?PUSHER_CLUSTER is required}
+  ONESIGNAL_APP_ID: ${ONESIGNAL_APP_ID:?ONESIGNAL_APP_ID is required}
+  ONESIGNAL_REST_API_KEY: ${ONESIGNAL_REST_API_KEY:?ONESIGNAL_REST_API_KEY is required}
+  STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:?STRIPE_SECRET_KEY is required}
+  STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:?STRIPE_WEBHOOK_SECRET is required}
+  RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:?RAZORPAY_KEY_ID is required}
+  RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:?RAZORPAY_KEY_SECRET is required}
+  RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:?RAZORPAY_WEBHOOK_SECRET is required}
+  CASH_FEATURES_ENABLED: ${CASH_FEATURES_ENABLED:-false}
+  FEATURE_CASH_FEATURES: ${FEATURE_CASH_FEATURES:-false}
+  LIVEKIT_URL: ${LIVEKIT_URL:?LIVEKIT_URL is required}
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?LIVEKIT_API_KEY is required}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?LIVEKIT_API_SECRET is required}
+  OBJECT_STORAGE_ENDPOINT: ${OBJECT_STORAGE_ENDPOINT:?OBJECT_STORAGE_ENDPOINT is required}
+  OBJECT_STORAGE_REGION: ${OBJECT_STORAGE_REGION:-auto}
+  OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:?OBJECT_STORAGE_BUCKET is required}
+  OBJECT_STORAGE_ACCESS_KEY_ID: ${OBJECT_STORAGE_ACCESS_KEY_ID:?OBJECT_STORAGE_ACCESS_KEY_ID is required}
+  OBJECT_STORAGE_SECRET_ACCESS_KEY: ${OBJECT_STORAGE_SECRET_ACCESS_KEY:?OBJECT_STORAGE_SECRET_ACCESS_KEY is required}
+  OBJECT_STORAGE_PUBLIC_BASE_URL: ${OBJECT_STORAGE_PUBLIC_BASE_URL:?OBJECT_STORAGE_PUBLIC_BASE_URL is required}
+  APPLE_EXPECTED_AUDIENCES: ${APPLE_EXPECTED_AUDIENCES:-com.globalwalkerleague.app}
+  SENTRY_DSN: ${SENTRY_DSN:-}
+  SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+  ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY is required}
+  ADMIN_SERVICE_KEY: ${ADMIN_SERVICE_KEY:?ADMIN_SERVICE_KEY is required}
+  ADMIN_USER_IDS: ${ADMIN_USER_IDS:?ADMIN_USER_IDS is required}
+  ALLOW_TEST_ROUTES: "false"
+  ALLOW_DEMO_SEEDS: "false"
+  MOCK_PROVIDERS_ENABLED: "false"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      APP_PROCESS_ROLE: api
+      RUN_BACKGROUND_JOBS: "false"
+    command: ["node", "--enable-source-maps", "./dist/index.mjs"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *app-env
+      APP_PROCESS_ROLE: worker
+      RUN_BACKGROUND_JOBS: "true"
+      WORKER_HEARTBEAT_FILE: /tmp/worker-heartbeat
+      WORKER_HEARTBEAT_INTERVAL_SECONDS: "30"
+      WORKER_HEALTHCHECK_MAX_AGE_SECONDS: "90"
+    command: ["/usr/local/bin/worker-entrypoint"]
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/local/bin/worker-healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "900"
+      - "1"
+      - --save
+      - "300"
+      - "10"
+      - --save
+      - "60"
+      - "10000"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  redis-data:

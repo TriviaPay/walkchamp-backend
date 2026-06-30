@@ -1,76 +1,93 @@
-# Walk Champ — Backend
+# Walk Champ Backend
 
-Standalone Express API server.
+Express API plus worker for step ingestion, race state, wallets, chat, groups, and media.
 
-## Setup
+## Current production target
+
+- `OVH VPS-2`
+- `Coolify`
+- `api` container
+- `worker` container
+- local `redis`
+- `Neon` Postgres
+- `Cloudflare DNS`
+- `Cloudflare R2`
+
+There is no active OCI, Render, or Vercel production path in the runtime or deploy docs. Legacy platform assets live under `archive/`.
+
+## Local development
 
 ```bash
 pnpm install
 cp .env.example .env
 pnpm db:migrate
+pnpm dev
 ```
 
-This bootstraps a fresh empty PostgreSQL database from the committed Drizzle migrations in `db/migrations/`.
-
-## Scripts
+Useful commands:
 
 ```bash
-pnpm dev          # Build and start API
-pnpm build        # Production bundle
-pnpm start        # Run production bundle
-pnpm typecheck    # TypeScript check
-pnpm test         # Unit tests
-pnpm db:generate  # Generate a reviewed SQL migration into db/migrations
-pnpm db:migrate   # Apply committed SQL migrations to PostgreSQL
-```
-
-## Database Workflow
-
-Use this project as PostgreSQL-only. The schema uses PostgreSQL types and features, so changing database engines is a porting task, not a config swap.
-
-For any empty PostgreSQL-compatible database:
-
-```bash
-pnpm install
-cp .env.example .env
-# set DATABASE_URL or NEON_DATABASE_URL
-pnpm db:migrate
-```
-
-For an existing PostgreSQL database that already has the old Walk Champ schema but is not yet tracked by Drizzle:
-
-```bash
+pnpm build
+pnpm test
+pnpm typecheck
 pnpm db:adopt-existing
-pnpm db:migrate
+pnpm storage:rewrite-urls
 ```
 
-`db:adopt-existing` marks the current database as being at migration `0000_baseline` so that only newer migrations are applied.
+## Production deployment
 
-For schema changes:
+Primary deployment files:
+
+- `Dockerfile`
+- `docker-compose.coolify.yml`
+- `deploy/coolify/run-migrations.sh`
+- `deploy/coolify/worker-entrypoint.sh`
+- `deploy/coolify/worker-healthcheck.sh`
+
+Primary runbooks:
+
+- `docs/architecture/ovh-production-minimal.md`
+- `docs/runbooks/deployment-and-recovery.md`
+- `docs/runbooks/object-storage-cutover.md`
+- `docs/runbooks/secrets-and-host-baseline.md`
+- `docs/runbooks/staging-and-release-gate.md`
+
+Run migrations before promoting a release:
 
 ```bash
-pnpm db:generate
-# review the generated SQL in db/migrations/
-pnpm db:migrate
+docker compose -f docker-compose.coolify.yml run --rm api /usr/local/bin/run-migrations
 ```
 
-## Layout
+## Object storage
 
-| Path | Purpose |
-|------|---------|
-| `src/` | API routes, services, middleware |
-| `db/` | Drizzle schema + database config |
-| `api-zod/` | Zod validation schemas |
-| `scripts/` | DB seeds and maintenance |
-| `.github/workflows/` | CI template (copy to repo root `.github` for GitHub Actions) |
+Runtime object storage is provider-neutral S3-compatible storage configured through:
 
-## Health check
+- `OBJECT_STORAGE_ENDPOINT`
+- `OBJECT_STORAGE_REGION`
+- `OBJECT_STORAGE_BUCKET`
+- `OBJECT_STORAGE_ACCESS_KEY_ID`
+- `OBJECT_STORAGE_SECRET_ACCESS_KEY`
+- `OBJECT_STORAGE_PUBLIC_BASE_URL`
 
-`GET /api/healthz`
+Day-1 cutover keeps compatibility routes under:
 
-## Deploy on Vercel
+- `/api/profile/avatar/:userId`
+- `/api/groups/:groupId/image`
+- `/api/track-themes/:code/image`
 
-- Production branch: `main`
-- Build command: `pnpm run vercel-build`
-- Install command: `pnpm install --frozen-lockfile`
-- Set all variables from `.env.example` in the Vercel project settings
+Old OCI asset URLs can be rewritten after copy verification with:
+
+```bash
+pnpm storage:rewrite-urls
+pnpm storage:rewrite-urls --apply
+```
+
+## Backups
+
+Repo-provided backup helpers:
+
+- `ops/backup/pgdump-to-r2.sh`
+- `ops/backup/redis-volume-backup.sh`
+- `ops/backup/redis-restore-drill.sh`
+
+These are operator scripts. They assume `aws`, `zstd`, and for restore drills `docker` are installed where they run.

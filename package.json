@@ -21,6 +21,7 @@
     "db:generate": "drizzle-kit generate --config ./db/drizzle.config.ts",
     "db:migrate": "drizzle-kit migrate --config ./db/drizzle.config.ts",
     "db:adopt-existing": "tsx ./scripts/src/adoptExistingDb.ts",
+    "storage:rewrite-urls": "tsx ./scripts/src/rewriteObjectStorageUrls.ts",
     "seed:achievements": "tsx ./scripts/src/seedAchievements.ts",
     "create:today-events": "tsx ./scripts/src/createTodayEvents.ts",
     "check:sponsored-races": "tsx ./scripts/src/checkSponsoredRaces.ts",

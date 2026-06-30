@@ -23,7 +23,14 @@ import {
   notifyWalkingGroupRequestAccepted,
   notifyWalkingGroupRequestRejected,
 } from "../lib/pushNotificationService";
-import { ociPutObject, ociGetObject, ociDeleteObject, ociObjectUrl, ociObjectKeyFromUrl, isOciConfigured, isOciConfigError } from "../lib/ociStorage";
+  deleteStoredObject,
+  isObjectStorageConfigError,
+  isObjectStorageConfigured,
+  objectKeyFromUrl,
+  objectUrl,
+  putStoredObject,
+} from "../lib/objectStorage";
+import { proxyStoredObjectResponse } from "../lib/objectMediaProxy";
 import { buildGeneratedObjectKey, validateRasterUpload } from "../lib/uploadPolicy";
 import { sanitizePlainText } from "../lib/text";
 import { config } from "../lib/config";
@@ -1135,7 +1142,7 @@ router.post("/groups/:groupId/image", requireAuth, groupImageUploadLimiter, uplo
   const groupId = String(req.params.groupId);
   const file = req.file;
   if (!file) return res.status(400).json({ error: "No image provided" });
-  if (!isOciConfigured()) return res.status(503).json({ error: "Group image storage is not configured" });
+  if (!isObjectStorageConfigured()) return res.status(503).json({ error: "Group image storage is not configured" });
 
   const [group] = await db.select().from(walkingGroupsTable).where(eq(walkingGroupsTable.id, groupId)).limit(1);
   if (!group || group.status !== "active") return res.status(404).json({ error: "Group not found" });
@@ -1143,13 +1150,15 @@ router.post("/groups/:groupId/image", requireAuth, groupImageUploadLimiter, uplo
 
   try {
     const contentType = validateRasterUpload(file);
-    const oldKey = ociObjectKeyFromUrl(group.groupImageUrl);
+    const oldKey = objectKeyFromUrl(group.groupImageUrl);
     const objKey = buildGeneratedObjectKey("group-images", groupId, contentType);
     if (oldKey) {
-      await ociDeleteObject(oldKey).catch(() => {});
+      await deleteStoredObject(oldKey).catch(() => {});
     }
-    await ociPutObject(objKey, file.buffer, contentType);
-    const imageUrl = ociObjectUrl(objKey);
+    await putStoredObject(objKey, file.buffer, contentType, {
+      cacheControl: "public, max-age=31536000, immutable",
+    });
+    const imageUrl = objectUrl(objKey);
     const displayUrl = `/api/groups/${groupId}/image`;
 
     await db
@@ -1162,7 +1171,7 @@ router.post("/groups/:groupId/image", requireAuth, groupImageUploadLimiter, uplo
 
     return res.json({ success: true, imageUrl, displayUrl });
   } catch (err) {
-    if (isOciConfigError(err)) {
+    if (isObjectStorageConfigError(err)) {
       return res.status(503).json({ error: "Group image storage is not configured" });
     }
     req.log.error(err, "[Groups] group image upload failed");
@@ -1173,31 +1182,27 @@ router.post("/groups/:groupId/image", requireAuth, groupImageUploadLimiter, uplo
 // ── GET /api/groups/:groupId/image ────────────────────────────────────────────
 router.get("/groups/:groupId/image", async (req, res) => {
   const groupId = String(req.params.groupId);
-  if (!isOciConfigured()) return res.status(503).end();
+  if (!isObjectStorageConfigured()) return res.status(503).end();
   try {
     const [group] = await db
       .select({ groupImageUrl: walkingGroupsTable.groupImageUrl })
       .from(walkingGroupsTable)
       .where(eq(walkingGroupsTable.id, groupId))
       .limit(1);
-    const objKey = ociObjectKeyFromUrl(group?.groupImageUrl);
+    const objKey = objectKeyFromUrl(group?.groupImageUrl);
     if (!objKey) return res.status(404).end();
-    const obj = await ociGetObject(objKey);
-    if (!obj) return res.status(404).end();
-    res.setHeader("Content-Type", obj.contentType);
-    // When a ?v= version token is present the URL is content-addressed — serve
-    // with a long max-age so React Native's image cache treats it as immutable.
-    // Without a token (e.g. direct browser preview) fall back to no-cache.
-    if (req.query.v) {
-      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    } else {
-      res.setHeader("Cache-Control", "no-cache, must-revalidate");
-    }
-    return new Promise<void>((resolve, reject) => {
-      obj.body.on("error", reject).pipe(res).on("finish", resolve);
+
+    await proxyStoredObjectResponse(req, res, {
+      routeName: "group-image",
+      objectKey: objKey,
+      maxBytes: config.runtime.uploadBodyLimitBytes,
+      cacheControl: req.query.v
+        ? "public, max-age=31536000, immutable"
+        : "no-cache, must-revalidate",
     });
+    return;
   } catch (err) {
-    if (isOciConfigError(err)) {
+    if (isObjectStorageConfigError(err)) {
       return res.status(503).end();
     }
     return res.status(404).end();
@@ -1494,9 +1499,9 @@ router.delete("/groups/:groupId", requireAuth, async (req, res) => {
 
   req.log.info({ groupId, userId }, "[Groups] group deleted");
   triggerEvent(`public-group-${groupId}`, "group.deleted", { groupId }).catch(() => {});
-  const oldKey = ociObjectKeyFromUrl(group.groupImageUrl);
+  const oldKey = objectKeyFromUrl(group.groupImageUrl);
   if (oldKey) {
-    ociDeleteObject(oldKey).catch(() => {});
+    deleteStoredObject(oldKey).catch(() => {});
   }
 
   return res.json({ success: true });

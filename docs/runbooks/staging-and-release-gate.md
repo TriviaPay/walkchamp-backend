@@ -1,33 +1,44 @@
 # Staging And Release Gate
 
-Production is blocked unless staging exists first.
+Production stays blocked unless the release is validated outside the live stack first.
 
-## Required Staging Shape
+## Low-cost staging shape
 
-- Smaller OCI VM with the same service split as production.
-- Separate staging Neon branch or database.
-- Separate Redis instance or logical DB.
-- Separate staging OCI Object Storage bucket or prefix.
-- Sandbox Stripe and Razorpay keys.
-- Staging Descope project or config.
-- Staging Sentry environment.
-- Staging API domain.
+The base production budget does not assume a second always-on VPS.
 
-## Release Gate
+Acceptable validation shapes are:
 
-Every production release must pass this sequence in staging first:
+- a short-lived second OVH VPS running the same Coolify stack
+- a temporary Coolify project on spare capacity
+- local Docker Compose plus separate staging Neon branch and staging R2 bucket for non-network-edge checks
 
-1. Deploy the release artifact to staging.
-2. Validate config startup checks.
-3. Run the DB migration.
-4. Start the worker and API services.
-5. Verify `/api/healthz` and `/api/readyz`.
-6. Verify Redis-backed auth or payment rate limiting.
-7. Verify Descope session validation.
-8. Verify sandbox payment flow and webhook replay.
-9. Verify upload, read, and delete against staging object storage.
-10. Verify worker queue execution.
-11. Verify Sentry ingestion.
-12. Rehearse rollback.
+## Required staging parity
 
-Do not promote to production if any staging gate fails.
+- same image as production
+- same service split: `api`, `worker`, `redis`
+- separate Neon branch or database
+- separate R2 bucket or isolated staging prefix
+- separate Cloudflare hostname if internet-exposed
+- sandbox Stripe and Razorpay credentials
+- non-production Descope, Pusher, OneSignal, and LiveKit settings where applicable
+
+## Release gate
+
+Every production release must pass this sequence first:
+
+1. Deploy the image to the validation environment.
+2. Run the migration command.
+3. Verify `/api/healthz` and `/api/readyz`.
+4. Verify Redis-backed rate limiting.
+5. Verify auth token validation.
+6. Verify worker startup and recurring-job ownership.
+7. Verify R2 upload, read, delete, and metadata behavior.
+8. Verify media compatibility routes:
+   - `GET`
+   - `HEAD`
+   - `404`
+   - rejected `Range`
+9. Verify one sandbox payment flow and webhook replay if payments are enabled.
+10. Rehearse rollback.
+
+Do not promote if any gate fails.

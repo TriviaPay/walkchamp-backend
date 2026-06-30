@@ -41,11 +41,12 @@ const envSchema = z
     RAZORPAY_KEY_ID: z.string().optional(),
     RAZORPAY_KEY_SECRET: z.string().optional(),
     RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
-    OCI_NAMESPACE: z.string().optional(),
-    OCI_REGION: z.string().optional(),
-    OCI_BUCKET_NAME: z.string().optional(),
-    OCI_ACCESS_KEY_ID: z.string().optional(),
-    OCI_SECRET_ACCESS_KEY: z.string().optional(),
+    OBJECT_STORAGE_ENDPOINT: z.string().optional(),
+    OBJECT_STORAGE_REGION: z.string().optional(),
+    OBJECT_STORAGE_BUCKET: z.string().optional(),
+    OBJECT_STORAGE_ACCESS_KEY_ID: z.string().optional(),
+    OBJECT_STORAGE_SECRET_ACCESS_KEY: z.string().optional(),
+    OBJECT_STORAGE_PUBLIC_BASE_URL: z.string().optional(),
     PUSHER_APP_ID: z.string().optional(),
     PUSHER_KEY: z.string().optional(),
     PUSHER_SECRET: z.string().optional(),
@@ -134,6 +135,28 @@ if (isProduction) {
   if (["debug", "trace"].includes(rawEnv.LOG_LEVEL.toLowerCase())) {
     configErrors.push("LOG_LEVEL must not be debug or trace in production");
   }
+
+  if (!rawEnv.OBJECT_STORAGE_ENDPOINT?.trim()) {
+    configErrors.push("OBJECT_STORAGE_ENDPOINT is required in production");
+  }
+
+  if (!rawEnv.OBJECT_STORAGE_BUCKET?.trim()) {
+    configErrors.push("OBJECT_STORAGE_BUCKET is required in production");
+  }
+
+  if (!rawEnv.OBJECT_STORAGE_ACCESS_KEY_ID?.trim()) {
+    configErrors.push("OBJECT_STORAGE_ACCESS_KEY_ID is required in production");
+  }
+
+  if (!rawEnv.OBJECT_STORAGE_SECRET_ACCESS_KEY?.trim()) {
+    configErrors.push("OBJECT_STORAGE_SECRET_ACCESS_KEY is required in production");
+  }
+
+  if (!rawEnv.OBJECT_STORAGE_PUBLIC_BASE_URL?.trim()) {
+    configErrors.push("OBJECT_STORAGE_PUBLIC_BASE_URL is required in production");
+  } else if (!rawEnv.OBJECT_STORAGE_PUBLIC_BASE_URL.startsWith("https://")) {
+    configErrors.push("OBJECT_STORAGE_PUBLIC_BASE_URL must use https:// in production");
+  }
 }
 
 if (configErrors.length > 0) {
@@ -154,9 +177,12 @@ export const config = {
     requestTimeoutMs: 15_000,
     responseTimeoutMs: 20_000,
     uploadTimeoutMs: 30_000,
+    mediaProxyTimeoutMs: 12_000,
+    mediaProxyUpstreamTimeoutMs: 8_000,
     jsonBodyLimit: "2mb",
     urlencodedBodyLimit: "1mb",
     uploadBodyLimitBytes: 5 * 1024 * 1024,
+    themeImageBodyLimitBytes: 10 * 1024 * 1024,
     maxPaginationLimit: 100,
     maxSearchQueryLength: 64,
     maxCollectionSize: 50,
@@ -186,11 +212,12 @@ export const config = {
     razorpayWebhookSecret: rawEnv.RAZORPAY_WEBHOOK_SECRET?.trim() ?? null,
   },
   objectStorage: {
-    namespace: rawEnv.OCI_NAMESPACE?.trim() ?? null,
-    region: rawEnv.OCI_REGION?.trim() || "us-ashburn-1",
-    bucket: rawEnv.OCI_BUCKET_NAME?.trim() ?? null,
-    accessKeyId: rawEnv.OCI_ACCESS_KEY_ID?.trim() ?? null,
-    secretAccessKey: rawEnv.OCI_SECRET_ACCESS_KEY?.trim() ?? null,
+    endpoint: rawEnv.OBJECT_STORAGE_ENDPOINT?.trim() ?? null,
+    region: rawEnv.OBJECT_STORAGE_REGION?.trim() || "auto",
+    bucket: rawEnv.OBJECT_STORAGE_BUCKET?.trim() ?? null,
+    accessKeyId: rawEnv.OBJECT_STORAGE_ACCESS_KEY_ID?.trim() ?? null,
+    secretAccessKey: rawEnv.OBJECT_STORAGE_SECRET_ACCESS_KEY?.trim() ?? null,
+    publicBaseUrl: rawEnv.OBJECT_STORAGE_PUBLIC_BASE_URL?.trim().replace(/\/$/, "") ?? null,
   },
   providers: {
     pusherConfigured: Boolean(

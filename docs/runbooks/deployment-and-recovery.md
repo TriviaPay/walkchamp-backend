@@ -1,67 +1,94 @@
 # Deployment And Recovery Runbook
 
-## Release Layout
+## Active deployment model
 
-- Releases live under `/srv/walkchamp/releases/<timestamp>`.
-- `/srv/walkchamp/current` points to the active release.
-- Runtime env files live outside releases under `/etc/walkchamp`.
-- Logs live under `/var/log/walkchamp`.
-- Keep the last `5` releases unless disk pressure requires fewer.
+- One OVH VPS runs Coolify.
+- Coolify deploys `docker-compose.coolify.yml`.
+- Services are `api`, `worker`, and `redis`.
+- Neon remains the source of truth for Postgres.
+- Cloudflare R2 is the only active object storage backend.
 
-## Deployment Order
+## Standard deploy order
 
-1. Upload or unpack the release to `/srv/walkchamp/releases/<timestamp>`.
-2. Install production dependencies and build artifacts.
-3. Validate env/config with the new release.
-4. Stop or quiesce the worker if migrations affect job-mutated tables.
-5. Run migrations using the admin DB role.
-6. Restart `walkchamp-worker`.
-7. Restart `walkchamp-api`.
-8. Run smoke checks:
+1. Confirm cutover and release gates in `docs/runbooks/object-storage-cutover.md` and `docs/runbooks/staging-and-release-gate.md`.
+2. Confirm a pre-deploy Neon restore point or equivalent restore window.
+3. Confirm the pre-cutover git tag, current image digest, and env snapshot are recorded.
+4. Build and deploy the new image in Coolify.
+5. Run migrations:
+
+```bash
+docker compose -f docker-compose.coolify.yml run --rm api /usr/local/bin/run-migrations
+```
+
+6. Start or redeploy the stack.
+7. Verify:
    - `/api/healthz`
    - `/api/readyz`
-   - auth-protected request
-   - worker heartbeat or queue execution
-9. Inspect logs and Sentry.
-10. Mark the release healthy.
+   - one authenticated request
+   - one worker-owned recurring job or queue-backed action
+   - avatar, group image, and theme image fetches
+8. Inspect logs for:
+   - media proxy failures
+   - Redis connection errors
+   - Neon connection errors
+   - provider auth errors
+9. Mark the release healthy only after the checks pass.
 
-## Migration Rules
+## Cutover gate
 
-- Use expand/contract migrations only.
-- Do not pair destructive schema removal with the first release that depends on the new schema.
-- Large backfills must be resumable and must not run inside API startup.
-- DB restore is disaster recovery, not a routine rollback strategy.
+Do not ship the OVH-only release until all are true:
 
-## Rollback Branches
+- R2 bucket is active.
+- R2 custom domain is active.
+- OCI-to-R2 copy finished for `avatars/`, `group-images/`, and `race-themes/`.
+- Object counts match by prefix.
+- Missing-key report is empty or explicitly accepted.
+- Sample objects were verified for size, content type, and public readability.
+- A DB restore point exists.
+- Real client checks passed for avatar, group-image, and theme loading.
 
-### App-only rollback
+## Rollback
 
-- Use when the schema is compatible.
-- Repoint `/srv/walkchamp/current` to the previous release.
-- Restart worker, then API.
+OCI is not a runtime fallback.
 
-### App rollback on compatible schema
+Rollback artifacts remain mandatory:
 
-- Same as app-only rollback, but confirm the old release is compatible with the live schema before restart.
+- pre-cutover git tag
+- previous container image digest
+- env snapshot
+- Neon restore point
+- media-copy verification output
 
-### Disaster recovery
+### App rollback
 
-- Use Neon restore only when the live database state must be reverted.
-- Restore to a separate recovery branch first when possible.
-- Expect connection interruption during restore activity.
+Use when the schema remains compatible:
 
-## Neon Continuity
+1. Redeploy the previous image digest in Coolify.
+2. Re-apply the previous env snapshot if config changed.
+3. Restart `worker`, then `api`.
+4. Re-run smoke checks.
 
-- Confirm the actual Neon restore window for the production plan before go-live.
-- Run restore drills against a staging or recovery branch.
-- Decide whether long-retention `pg_dump` backups are required beyond Neon PITR.
-- Keep backup or recovery credentials separate from runtime credentials.
+### Database rollback
 
-## Disk And Log Policy
+Priority order:
 
-- Install `logrotate` and rotate `/var/log/walkchamp/*.log`.
-- Alert on disk usage above `80%`; escalate above `90%`.
-- Emergency cleanup:
-  - remove old releases beyond retention count
-  - rotate and compress stale logs
-  - clear abandoned temp files under `/tmp`
+1. Neon restore or branch restore when suitable.
+2. Verified `pg_dump` from R2 only when Neon-native recovery is unavailable or unsuitable.
+
+### Redis recovery
+
+1. Restore the latest verified Redis volume archive into a disposable container first.
+2. Validate that the archive boots and responds.
+3. Only then restore to the live Redis data directory.
+
+## Post-cutover hardening
+
+DNS-only is temporary.
+
+After the cutover stabilizes:
+
+1. Move `api.<domain>` to proxied Cloudflare mode.
+2. Revalidate `X-Forwarded-*` behavior.
+3. Revisit `TRUST_PROXY_HOPS`.
+4. Restrict origin ingress to Cloudflare IPs where practical.
+5. Re-test health checks and long-lived connections.

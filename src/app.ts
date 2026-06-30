@@ -126,8 +126,17 @@ app.use(
 // ── Timeouts ──────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   const isUploadRoute = /^\/api\/(?:profile\/me\/avatar|groups\/[^/]+\/image)$/.test(req.path);
-  const requestTimeoutMs = isUploadRoute ? config.runtime.uploadTimeoutMs : config.runtime.requestTimeoutMs;
-  const responseTimeoutMs = isUploadRoute ? config.runtime.uploadTimeoutMs : config.runtime.responseTimeoutMs;
+  const isMediaProxyRoute = /^\/api\/(?:profile\/avatar\/[^/]+|groups\/[^/]+\/image|track-themes\/[^/]+\/image)$/.test(req.path);
+  const requestTimeoutMs = isUploadRoute
+    ? config.runtime.uploadTimeoutMs
+    : isMediaProxyRoute
+      ? config.runtime.mediaProxyTimeoutMs
+      : config.runtime.requestTimeoutMs;
+  const responseTimeoutMs = isUploadRoute
+    ? config.runtime.uploadTimeoutMs
+    : isMediaProxyRoute
+      ? config.runtime.mediaProxyTimeoutMs
+      : config.runtime.responseTimeoutMs;
 
   let timedOut = false;
   const onTimeout = () => {
