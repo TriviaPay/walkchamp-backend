@@ -23,6 +23,7 @@ import {
   notifyWalkingGroupRequestAccepted,
   notifyWalkingGroupRequestRejected,
 } from "../lib/pushNotificationService";
+import {
   deleteStoredObject,
   isObjectStorageConfigError,
   isObjectStorageConfigured,
