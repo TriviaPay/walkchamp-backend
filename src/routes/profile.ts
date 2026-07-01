@@ -1,11 +1,11 @@
 import { Router, type RequestHandler } from "express";
 import multer from "multer";
-import { db } from "@db";
-import { profilesTable, walletsTable, achievementDefinitionsTable, userTitlesTable, friendsTable, friendRequestsTable } from "@db/schema";
-import { raceResultsTable } from "@db/schema";
-import { stepDailyTotalsTable, userStepSourcesTable } from "@db/schema";
-import { coinBalancesTable } from "@db/schema";
-import { raceParticipantsTable, raceRoomsTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { profilesTable, walletsTable, achievementDefinitionsTable, userTitlesTable, friendsTable, friendRequestsTable } from "../../db/src/schema/index.js";
+import { raceResultsTable } from "../../db/src/schema/index.js";
+import { stepDailyTotalsTable, userStepSourcesTable } from "../../db/src/schema/index.js";
+import { coinBalancesTable } from "../../db/src/schema/index.js";
+import { raceParticipantsTable, raceRoomsTable } from "../../db/src/schema/index.js";
 import { eq, and, or, desc, ne, gt, notInArray, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import {

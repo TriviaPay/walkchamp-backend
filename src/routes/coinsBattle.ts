@@ -1,12 +1,12 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   raceRoomsTable,
   raceParticipantsTable,
   profilesTable,
   coinBalancesTable,
   coinTransactionsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, ne, inArray } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";

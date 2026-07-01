@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   globalChatMessagesTable,
   profilesTable,
@@ -9,7 +9,7 @@ import {
   friendRequestsTable,
   chatReactionsTable,
   userPresenceTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, desc, or, sql, inArray, lt } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { triggerEvent } from "../lib/pusher.js";

@@ -1,6 +1,6 @@
 import { Router, type RequestHandler } from "express";
 import multer from "multer";
-import { db, pool } from "@db";
+import { db, pool } from "../../db/src/index.js";
 import {
   walkingGroupsTable,
   walkingGroupMembersTable,
@@ -9,7 +9,7 @@ import {
   walkingGroupJoinRequestsTable,
   profilesTable,
   stepDailyTotalsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, sql, desc, inArray, ne } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";

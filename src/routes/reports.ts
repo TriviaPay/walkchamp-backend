@@ -1,10 +1,10 @@
 import { Router, type RequestHandler } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   chatMessageReportsTable,
   globalChatMessagesTable,
   privateChatMessagesTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { and, eq, countDistinct } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";

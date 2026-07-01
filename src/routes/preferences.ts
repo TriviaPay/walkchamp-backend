@@ -1,6 +1,6 @@
 import { Router } from "express";
-import { db } from "@db";
-import { userPreferencesTable, profilesTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { userPreferencesTable, profilesTable } from "../../db/src/schema/index.js";
 import { eq } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";

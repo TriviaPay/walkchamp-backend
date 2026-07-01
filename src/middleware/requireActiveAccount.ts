@@ -1,5 +1,5 @@
-import { db } from "@db";
-import { profilesTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { profilesTable } from "../../db/src/schema/index.js";
 import { eq } from "drizzle-orm";
 import { type NextFunction, type Request, type Response } from "express";
 import { type AuthenticatedRequest } from "./requireAuth.js";

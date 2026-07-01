@@ -1,6 +1,6 @@
 import { Router } from "express";
-import { db } from "@db";
-import { profilesTable, walletsTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { profilesTable, walletsTable } from "../../db/src/schema/index.js";
 import { eq } from "drizzle-orm";
 import { getDescopeClient } from "../lib/descope.js";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";

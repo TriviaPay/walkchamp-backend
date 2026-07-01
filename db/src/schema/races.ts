@@ -1,7 +1,7 @@
 import { pgTable, text, integer, bigint, timestamp, pgEnum, uuid, boolean, jsonb } from "drizzle-orm/pg-core";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod/v4";
-import { profilesTable } from "./profiles";
+import { profilesTable } from "./profiles.js";
 
 export const raceTypeEnum = pgEnum("race_type", [
   "quick",

@@ -1,10 +1,10 @@
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   adRewardClaimsTable,
   coinBalancesTable,
   coinTransactionsTable,
   dailyCoinRewardsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { and, eq, sql, gte, lte } from "drizzle-orm";
 import { triggerEvent } from "./pusher.js";
 import { logger } from "./logger.js";

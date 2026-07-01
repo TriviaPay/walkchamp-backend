@@ -1,5 +1,5 @@
-import { db } from "@db";
-import { coinRewardGrantsTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { coinRewardGrantsTable } from "../../db/src/schema/index.js";
 import { and, eq } from "drizzle-orm";
 import { logger } from "./logger.js";
 import { triggerEvent } from "./pusher.js";

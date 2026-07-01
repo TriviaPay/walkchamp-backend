@@ -1,5 +1,5 @@
-import { db } from "@db";
-import { profilesTable, raceParticipantsTable, raceRoomsTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { profilesTable, raceParticipantsTable, raceRoomsTable } from "../../db/src/schema/index.js";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 
 export interface LiveRaceStanding {

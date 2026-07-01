@@ -3,12 +3,12 @@
  * Computes all user achievement metrics from real NeonDB data and updates
  * user_achievements + user_titles. Idempotent — safe to call multiple times.
  */
-import { pool, db } from "@db";
+import { pool, db } from "../../db/src/index.js";
 import {
   achievementDefinitionsTable,
   userAchievementsTable,
   userTitlesTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, sql, inArray } from "drizzle-orm";
 
 // ── Types ─────────────────────────────────────────────────────────────────────

@@ -1,13 +1,13 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   raceRoomsTable,
   scheduledRoomRegistrationsTable,
   raceParticipantsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { sendPushToUser } from "./push.js";
 import { requireAdminKey } from "../middleware/requireAdminKey.js";
-import { profilesTable } from "@db/schema";
+import { profilesTable } from "../../db/src/schema/index.js";
 import { eq, and, sql, inArray, lte, or, gte, asc, ne, desc } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { triggerEvent } from "../lib/pusher.js";

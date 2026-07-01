@@ -1,10 +1,10 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   raceTrackThemesTable,
   userTrackThemesTable,
   coinBalancesTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, asc } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { getCoinBalance, spendCoins } from "../lib/coinsService.js";

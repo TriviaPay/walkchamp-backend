@@ -3,7 +3,7 @@
  * All sends go through sendPushToUser / sendPushToUsers in routes/push.ts.
  */
 
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   blockedUsersTable,
   notificationDevicesTable,
@@ -13,7 +13,7 @@ import {
   walkingGroupMembersTable,
   walkingGroupsTable,
   profilesTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
 import { sendPushToUser, sendPushToUsers, type PushCategory } from "../routes/push.js";
 

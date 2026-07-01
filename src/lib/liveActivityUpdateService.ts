@@ -1,5 +1,5 @@
-import { db } from "@db";
-import { liveActivityTokensTable, pushNotificationLogsTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { liveActivityTokensTable, pushNotificationLogsTable } from "../../db/src/schema/index.js";
 import { and, eq } from "drizzle-orm";
 import type { LiveRaceProgressContext } from "./raceLeaderboardService.js";
 

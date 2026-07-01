@@ -1,7 +1,7 @@
 import { pgTable, text, integer, timestamp, pgEnum, uuid, jsonb, boolean, uniqueIndex } from "drizzle-orm/pg-core";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod/v4";
-import { profilesTable } from "./profiles";
+import { profilesTable } from "./profiles.js";
 
 export const paymentStatusEnum = pgEnum("payment_status", [
   "pending",

@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   coinBalancesTable,
   coinTransactionsTable,
@@ -9,7 +9,7 @@ import {
   raceParticipantsTable,
   walkingGroupDailyStepsTable,
   profilesTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, desc, sql, gte, lte } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { requireActiveAccount } from "../middleware/requireActiveAccount.js";

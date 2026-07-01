@@ -1,5 +1,5 @@
 import { pgTable, text, integer, boolean, timestamp, jsonb, uniqueIndex, index } from "drizzle-orm/pg-core";
-import { profilesTable } from "./profiles";
+import { profilesTable } from "./profiles.js";
 
 // ── Achievement definitions (global catalogue) ────────────────────────────────
 export const achievementDefinitionsTable = pgTable(

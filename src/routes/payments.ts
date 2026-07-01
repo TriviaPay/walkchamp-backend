@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   paymentsTable,
   paymentEventsTable,
@@ -10,7 +10,7 @@ import {
   walletTransactionsTable,
   promoCodesTable,
   promoRedemptionsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";

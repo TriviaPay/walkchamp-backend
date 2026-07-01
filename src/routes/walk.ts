@@ -1,9 +1,9 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   stepDailyTotalsTable, stepSessionsTable, profilesTable, userPresenceTable, userPreferencesTable,
   walkingGroupMembersTable, walkingGroupDailyStepsTable, walkingGroupsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, sql, desc, gte, lte, asc, count, inArray } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";

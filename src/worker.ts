@@ -1,8 +1,8 @@
 import { logger } from "./lib/logger.js";
 import { runIdempotentJob } from "./lib/queue.js";
 import { recomputeCoinProjection } from "./lib/coinsService.js";
-import { db } from "@db";
-import { coinBalancesTable } from "@db/schema";
+import { db } from "../db/src/index.js";
+import { coinBalancesTable } from "../db/src/schema/index.js";
 import { config } from "./lib/config.js";
 import { startWorkerOwnedRecurringJobs } from "./lib/backgroundJobs.js";
 

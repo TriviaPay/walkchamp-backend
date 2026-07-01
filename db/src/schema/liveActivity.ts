@@ -1,6 +1,6 @@
 import { pgTable, text, timestamp, uuid, index, uniqueIndex } from "drizzle-orm/pg-core";
-import { profilesTable } from "./profiles";
-import { raceRoomsTable } from "./races";
+import { profilesTable } from "./profiles.js";
+import { raceRoomsTable } from "./races.js";
 
 export const liveActivityTokensTable = pgTable(
   "live_activity_tokens",

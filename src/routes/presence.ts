@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   userPresenceTable,
   raceRoomsTable,
@@ -7,7 +7,7 @@ import {
   friendsTable,
   walkingGroupMembersTable,
   spectateSessionsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { and, eq, gte, inArray, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { triggerEvent } from "../lib/pusher.js";

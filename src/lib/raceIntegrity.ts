@@ -1,4 +1,4 @@
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   depositTransactionsTable,
   paymentsTable,
@@ -7,7 +7,7 @@ import {
   raceRoomsTable,
   scheduledRoomRegistrationsTable,
   walletsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { and, eq } from "drizzle-orm";
 
 export type DbTx = Parameters<Parameters<typeof db.transaction>[0]>[0];

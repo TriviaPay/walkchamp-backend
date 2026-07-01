@@ -1,5 +1,5 @@
-import { db } from "@db";
-import { raceRoomsTable, raceParticipantsTable, scheduledRoomRegistrationsTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { raceRoomsTable, raceParticipantsTable, scheduledRoomRegistrationsTable } from "../../db/src/schema/index.js";
 import { eq, and, lte, sql, ne } from "drizzle-orm";
 import { triggerEvent } from "./pusher.js";
 import { logger } from "./logger.js";

@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   raceRoomsTable,
   raceParticipantsTable,
@@ -20,7 +20,7 @@ import {
   scheduledRoomRegistrationsTable,
   coinBalancesTable,
   cashChallengeConsentsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, desc, asc, sql, ne, inArray, or, notExists } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
@@ -45,7 +45,7 @@ import {
   getLiveRaceStandings,
 } from "../lib/raceLeaderboardService.js";
 import { triggerLiveActivityUpdate } from "../lib/liveActivityUpdateService.js";
-import { liveActivityTokensTable } from "@db/schema";
+import { liveActivityTokensTable } from "../../db/src/schema/index.js";
 import { firePromotionalRoomHosted, notifyPrivateRoomInvitation } from "../lib/pushNotificationService.js";
 
 const router = Router();

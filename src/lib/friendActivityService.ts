@@ -3,14 +3,14 @@
  * Used by the walk step sync endpoint (daily goal) and the friendActivity route (manual share).
  */
 
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   friendsTable,
   blockedUsersTable,
   friendActivityEventsTable,
   profilesTable,
   userPreferencesTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, inArray, or } from "drizzle-orm";
 import { sendNotification } from "../routes/notifications.js";
 import { logger } from "./logger.js";

@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { AccessToken } from "livekit-server-sdk";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   userEntitlementsTable,
   userPurchasesTable,
@@ -9,7 +9,7 @@ import {
   voiceSessionsTable,
   coinBalancesTable,
   coinTransactionsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, inArray, desc, sql, gte, lte } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";

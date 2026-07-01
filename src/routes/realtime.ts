@@ -1,6 +1,6 @@
 import { Router } from "express";
-import { db } from "@db";
-import { conversationsTable, raceParticipantsTable, scheduledRoomRegistrationsTable, spectateSessionsTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { conversationsTable, raceParticipantsTable, scheduledRoomRegistrationsTable, spectateSessionsTable } from "../../db/src/schema/index.js";
 import { and, eq, or } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { getPusher, isPusherConfigured } from "../lib/pusher.js";

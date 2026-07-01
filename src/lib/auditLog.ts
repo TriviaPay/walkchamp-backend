@@ -1,5 +1,5 @@
-import { db } from "@db";
-import { auditLogsTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { auditLogsTable } from "../../db/src/schema/index.js";
 import { logger } from "./logger.js";
 
 export async function writeAuditLog(entry: {

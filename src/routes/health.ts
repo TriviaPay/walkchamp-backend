@@ -1,7 +1,7 @@
 import { Router, type IRouter } from "express";
-import { HealthCheckResponse } from "@api-zod";
+import { HealthCheckResponse } from "../../api-zod/src/index.js";
 import { sql } from "drizzle-orm";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import { config } from "../lib/config.js";
 import { pingRedis } from "../lib/redis.js";
 

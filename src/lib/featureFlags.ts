@@ -1,5 +1,5 @@
-import { db } from "@db";
-import { featureFlagsTable } from "@db/schema";
+import { db } from "../../db/src/index.js";
+import { featureFlagsTable } from "../../db/src/schema/index.js";
 import { eq } from "drizzle-orm";
 import { logger } from "./logger.js";
 

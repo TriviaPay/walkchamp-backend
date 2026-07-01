@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   profilesTable,
   stepDailyTotalsTable,
@@ -12,7 +12,7 @@ import {
   walkingGroupsTable,
   walkingGroupMembersTable,
   walkingGroupDailyStepsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { desc, eq, and, gte, lte, gt, ne, sql, inArray, notInArray } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 

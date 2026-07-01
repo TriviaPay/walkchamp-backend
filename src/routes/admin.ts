@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { db } from "@db";
+import { db } from "../../db/src/index.js";
 import {
   profilesTable,
   raceRoomsTable,
@@ -8,7 +8,7 @@ import {
   walletTransactionsTable,
   withdrawalsTable,
   notificationsTable,
-} from "@db/schema";
+} from "../../db/src/schema/index.js";
 import { eq, and, desc, ilike, or, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger.js";
 import { z } from "zod";
