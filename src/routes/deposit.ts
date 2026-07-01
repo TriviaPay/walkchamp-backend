@@ -27,7 +27,8 @@ import {
 import { eq, and, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { z } from "zod";
-import { Stripe } from "stripe";
+import StripeConstructor from "stripe";
+import type Stripe from "stripe";
 import Razorpay from "razorpay";
 import { createHmac } from "crypto";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
@@ -61,14 +62,16 @@ function appDoneUrl(status: "success" | "processing" | "failed" | "cancelled", t
 }
 
 // ── Stripe client ─────────────────────────────────────────────────────────────
-type StripeClient = InstanceType<typeof Stripe>;
+type StripeClient = InstanceType<typeof StripeConstructor>;
+type StripeCheckoutSession = Stripe.Checkout.Session;
+type StripeEvent = Stripe.Event;
 
 let _stripe: StripeClient | null = null;
 function getStripe(): StripeClient {
   if (_stripe) return _stripe;
   const key = config.payments.stripeSecretKey;
   if (!key) throw new Error("STRIPE_SECRET_KEY is not configured.");
-  _stripe = new Stripe(key, { apiVersion: "2026-05-27.dahlia" });
+  _stripe = new StripeConstructor(key, { apiVersion: "2026-05-27.dahlia" });
   return _stripe;
 }
 
@@ -216,8 +219,8 @@ async function markDepositReturnObserved(
 function getStripeReturnDisplayStatus(opts: {
   cancelStatus?: string;
   depositStatus?: string;
-  sessionPaymentStatus?: Stripe.Checkout.Session["payment_status"] | null;
-  sessionStatus?: Stripe.Checkout.Session["status"] | null;
+  sessionPaymentStatus?: StripeCheckoutSession["payment_status"] | null;
+  sessionStatus?: StripeCheckoutSession["status"] | null;
 }): "success" | "processing" | "cancelled" | "failed" {
   if (opts.cancelStatus === "cancelled") return "cancelled";
   if (opts.depositStatus === "succeeded") return "success";
@@ -295,7 +298,7 @@ router.post("/wallet/deposit/stripe/create-payment-intent", requireAuth, async (
     return res.status(500).json({ error: "Failed to create payment record." });
   }
 
-  let session: Stripe.Checkout.Session;
+  let session: StripeCheckoutSession;
   try {
     session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -1009,7 +1012,7 @@ router.post("/webhooks/stripe", async (req, res) => {
 
   if (!sig) return res.status(400).json({ error: "Missing stripe-signature header" });
 
-  let event: Stripe.Event;
+  let event: StripeEvent;
   try {
     event = getStripe().webhooks.constructEvent(req.body as Buffer, sig, webhookSecret);
   } catch {
@@ -1056,7 +1059,7 @@ router.post("/webhooks/stripe", async (req, res) => {
 
   try {
     if (event.type === "checkout.session.completed") {
-      const session = event.data.object as Stripe.Checkout.Session;
+      const session = event.data.object as StripeCheckoutSession;
       const depositTxId = session.metadata?.depositTransactionId;
 
       if (depositTxId && session.payment_status === "paid") {

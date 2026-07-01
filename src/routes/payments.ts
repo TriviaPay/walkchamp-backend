@@ -14,7 +14,8 @@ import {
 import { eq, and, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { z } from "zod";
-import { Stripe } from "stripe";
+import StripeConstructor from "stripe";
+import type Stripe from "stripe";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
 import {
   deriveOpenRoomStatus,
@@ -32,14 +33,16 @@ const router = Router();
 router.use("/payments", requireCashFeaturesEnabled);
 
 // ── Stripe client (lazy init so missing key just disables payments) ───────────
-type StripeClient = InstanceType<typeof Stripe>;
+type StripeClient = InstanceType<typeof StripeConstructor>;
+type StripeEvent = Stripe.Event;
+type StripePaymentIntent = Stripe.PaymentIntent;
 
 let _stripe: StripeClient | null = null;
 function getStripe(): StripeClient {
   if (_stripe) return _stripe;
   const key = config.payments.stripeSecretKey;
   if (!key) throw new Error("STRIPE_SECRET_KEY is not configured.");
-  _stripe = new Stripe(key, { apiVersion: "2026-05-27.dahlia" });
+  _stripe = new StripeConstructor(key, { apiVersion: "2026-05-27.dahlia" });
   return _stripe;
 }
 
@@ -341,7 +344,7 @@ router.post(
       return res.status(500).json({ error: "Webhook secret not configured" });
     }
 
-    let event: Stripe.Event;
+    let event: StripeEvent;
     try {
       const stripe = getStripe();
       event = stripe.webhooks.constructEvent(req.body as Buffer, sig, webhookSecret);
@@ -392,7 +395,7 @@ router.post(
 
     try {
       if (event.type === "payment_intent.succeeded") {
-        const pi = event.data.object as Stripe.PaymentIntent;
+        const pi = event.data.object as StripePaymentIntent;
         const meta = pi.metadata;
 
         const [payment] = await db
@@ -492,7 +495,7 @@ router.post(
       }
 
       if (event.type === "payment_intent.payment_failed") {
-        const pi = event.data.object as Stripe.PaymentIntent;
+        const pi = event.data.object as StripePaymentIntent;
         await db
           .update(paymentsTable)
           .set({ status: "failed", updatedAt: new Date() })
