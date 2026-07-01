@@ -1,8 +1,10 @@
-import IORedis, { type Redis as RedisClient } from "ioredis";
+import { Redis } from "ioredis";
 import { config } from "./config";
 import { logger } from "./logger";
 
-let redisClient: RedisClient | null = null;
+type RedisClient = InstanceType<typeof Redis>;
+
+let redisClient: RedisClient | undefined;
 
 export function hasRedisConfigured(): boolean {
   return Boolean(config.redis.url);
@@ -14,15 +16,17 @@ export function getRedis(): RedisClient {
   }
 
   if (!redisClient) {
-    redisClient = new IORedis(config.redis.url, {
+    const client = new Redis(config.redis.url, {
       enableReadyCheck: true,
       lazyConnect: true,
       maxRetriesPerRequest: 1,
     });
 
-    redisClient.on("error", (err: unknown) => {
+    client.on("error", (err: unknown) => {
       logger.warn({ err }, "Redis client error");
     });
+
+    redisClient = client;
   }
 
   return redisClient;
