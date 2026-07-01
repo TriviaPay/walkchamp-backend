@@ -174,7 +174,10 @@ export async function sendPushToUser(
         data: { ...(data ?? {}), dedupeKey: options?.dedupeKey },
         ...(options?.url ? { url: options.url } : {}),
       }),
-    });
+    }) as {
+      ok: boolean;
+      json(): Promise<unknown>;
+    };
     onesignalResponse = (await resp.json()) as Record<string, unknown>;
     if (!resp.ok || onesignalResponse?.errors) {
       status = "failed";
@@ -242,7 +245,10 @@ export async function sendPushToUsers(
           data: payloadData,
           ...(options?.url ? { url: options.url } : {}),
         }),
-      });
+      }) as {
+        ok: boolean;
+        json(): Promise<unknown>;
+      };
       onesignalResponse = (await resp.json()) as Record<string, unknown>;
       if (!resp.ok || onesignalResponse?.errors) status = "failed";
     } catch {
