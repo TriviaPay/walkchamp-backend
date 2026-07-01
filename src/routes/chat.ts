@@ -529,7 +529,7 @@ router.delete("/chat/private/react", requireAuth, async (req, res) => {
 
 // ── GET /api/races/:id/comments ───────────────────────────────────────────────
 router.get("/races/:id/comments", requireAuth, async (req, res) => {
-  const { liveRaceCommentsTable } = await import("@db/schema");
+  const { liveRaceCommentsTable } = await import("../../db/src/schema/index.js");
   const raceId = String(req.params.id);
   const limit = Math.min(Number(req.query.limit) || 50, config.runtime.maxPaginationLimit);
 
@@ -554,7 +554,7 @@ router.get("/races/:id/comments", requireAuth, async (req, res) => {
 
 // ── POST /api/races/:id/comments ──────────────────────────────────────────────
 router.post("/races/:id/comments", requireAuth, async (req, res) => {
-  const { liveRaceCommentsTable } = await import("@db/schema");
+  const { liveRaceCommentsTable } = await import("../../db/src/schema/index.js");
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const raceId = String(req.params.id);
 
