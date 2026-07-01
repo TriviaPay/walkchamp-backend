@@ -497,7 +497,10 @@ async function verifyAppleIdentityToken(token: string, expectedAudiences: Set<st
     throw new Error("Apple token nonce mismatch");
   }
 
-  const keysRes = await fetch("https://appleid.apple.com/auth/keys");
+  const keysRes = await fetch("https://appleid.apple.com/auth/keys") as {
+    ok: boolean;
+    json(): Promise<unknown>;
+  };
   if (!keysRes.ok) throw new Error("Failed to fetch Apple public keys");
   const { keys } = (await keysRes.json()) as { keys: Array<Record<string, string>> };
 
