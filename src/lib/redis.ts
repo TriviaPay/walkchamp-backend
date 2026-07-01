@@ -1,26 +1,26 @@
-import Redis from "ioredis";
+import IORedis, { type Redis as RedisClient } from "ioredis";
 import { config } from "./config";
 import { logger } from "./logger";
 
-let redisClient: Redis | null = null;
+let redisClient: RedisClient | null = null;
 
 export function hasRedisConfigured(): boolean {
   return Boolean(config.redis.url);
 }
 
-export function getRedis(): Redis {
+export function getRedis(): RedisClient {
   if (!config.redis.url) {
     throw new Error("REDIS_URL is not configured.");
   }
 
   if (!redisClient) {
-    redisClient = new Redis(config.redis.url, {
+    redisClient = new IORedis(config.redis.url, {
       enableReadyCheck: true,
       lazyConnect: true,
       maxRetriesPerRequest: 1,
     });
 
-    redisClient.on("error", (err) => {
+    redisClient.on("error", (err: unknown) => {
       logger.warn({ err }, "Redis client error");
     });
   }
