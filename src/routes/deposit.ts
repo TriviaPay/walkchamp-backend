@@ -28,7 +28,6 @@ import { eq, and, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { z } from "zod";
 import StripeConstructor from "stripe";
-import type Stripe from "stripe";
 import Razorpay from "razorpay";
 import { createHmac } from "crypto";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
@@ -63,8 +62,8 @@ function appDoneUrl(status: "success" | "processing" | "failed" | "cancelled", t
 
 // ── Stripe client ─────────────────────────────────────────────────────────────
 type StripeClient = InstanceType<typeof StripeConstructor>;
-type StripeCheckoutSession = Stripe.Checkout.Session;
-type StripeEvent = Stripe.Event;
+type StripeCheckoutSession = Awaited<ReturnType<StripeClient["checkout"]["sessions"]["create"]>>;
+type StripeEvent = ReturnType<StripeClient["webhooks"]["constructEvent"]>;
 
 let _stripe: StripeClient | null = null;
 function getStripe(): StripeClient {

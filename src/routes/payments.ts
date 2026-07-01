@@ -15,7 +15,6 @@ import { eq, and, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { z } from "zod";
 import StripeConstructor from "stripe";
-import type Stripe from "stripe";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
 import {
   deriveOpenRoomStatus,
@@ -34,8 +33,8 @@ router.use("/payments", requireCashFeaturesEnabled);
 
 // ── Stripe client (lazy init so missing key just disables payments) ───────────
 type StripeClient = InstanceType<typeof StripeConstructor>;
-type StripeEvent = Stripe.Event;
-type StripePaymentIntent = Stripe.PaymentIntent;
+type StripeEvent = ReturnType<StripeClient["webhooks"]["constructEvent"]>;
+type StripePaymentIntent = Awaited<ReturnType<StripeClient["paymentIntents"]["retrieve"]>>;
 
 let _stripe: StripeClient | null = null;
 function getStripe(): StripeClient {
