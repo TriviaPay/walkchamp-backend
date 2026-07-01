@@ -11,8 +11,8 @@ import {
   profilesTable,
 } from "@db/schema";
 import { eq, and, desc, sql, gte, lte } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { requireActiveAccount } from "../middleware/requireActiveAccount";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
 import {
   getCoinBalance,
   awardCoins,
@@ -20,7 +20,7 @@ import {
   getDailyAdRewardStatus,
   awardAdReward,
   MAX_DAILY_AD_REWARDS,
-} from "../lib/coinsService";
+} from "../lib/coinsService.js";
 import { z } from "zod";
 
 const EARNING_RULES = [

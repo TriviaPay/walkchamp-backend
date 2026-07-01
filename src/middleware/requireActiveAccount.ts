@@ -2,7 +2,7 @@ import { db } from "@db";
 import { profilesTable } from "@db/schema";
 import { eq } from "drizzle-orm";
 import { type NextFunction, type Request, type Response } from "express";
-import { type AuthenticatedRequest } from "./requireAuth";
+import { type AuthenticatedRequest } from "./requireAuth.js";
 
 const BLOCKED_STATUSES = new Set(["suspended", "banned", "deleted"]);
 

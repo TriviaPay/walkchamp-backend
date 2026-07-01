@@ -1,6 +1,6 @@
 import { type NextFunction, type Request, type Response } from "express";
-import { type AuthenticatedRequest } from "./requireAuth";
-import { logger } from "../lib/logger";
+import { type AuthenticatedRequest } from "./requireAuth.js";
+import { logger } from "../lib/logger.js";
 
 function getAdminUserIds(): Set<string> {
   const raw = process.env.ADMIN_USER_IDS ?? "";

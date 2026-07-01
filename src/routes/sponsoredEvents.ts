@@ -5,17 +5,17 @@ import {
   scheduledRoomRegistrationsTable,
   raceParticipantsTable,
 } from "@db/schema";
-import { sendPushToUser } from "./push";
-import { requireAdminKey } from "../middleware/requireAdminKey";
+import { sendPushToUser } from "./push.js";
+import { requireAdminKey } from "../middleware/requireAdminKey.js";
 import { profilesTable } from "@db/schema";
 import { eq, and, sql, inArray, lte, or, gte, asc, ne, desc } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { triggerEvent } from "../lib/pusher";
-import { spendCoins, getCoinBalance, recordCoinLedgerEntry } from "../lib/coinsService";
-import { grantVariableCoinReward } from "../lib/coinRewardService";
-import { logger } from "../lib/logger";
-import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration } from "../lib/raceIntegrity";
-import { notifyPromotionalSponsoredEvent } from "../lib/pushNotificationService";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { triggerEvent } from "../lib/pusher.js";
+import { spendCoins, getCoinBalance, recordCoinLedgerEntry } from "../lib/coinsService.js";
+import { grantVariableCoinReward } from "../lib/coinRewardService.js";
+import { logger } from "../lib/logger.js";
+import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration } from "../lib/raceIntegrity.js";
+import { notifyPromotionalSponsoredEvent } from "../lib/pushNotificationService.js";
 
 const router = Router();
 

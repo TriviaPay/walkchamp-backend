@@ -12,8 +12,8 @@ import {
   userPreferencesTable,
 } from "@db/schema";
 import { eq, and, inArray, or } from "drizzle-orm";
-import { sendNotification } from "../routes/notifications";
-import { logger } from "./logger";
+import { sendNotification } from "../routes/notifications.js";
+import { logger } from "./logger.js";
 
 // ── Friend eligibility ────────────────────────────────────────────────────────
 

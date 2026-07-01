@@ -1,6 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
-import type { AuthenticatedRequest } from "../middleware/requireAuth";
-import { getRedis } from "./redis";
+import type { AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { getRedis } from "./redis.js";
 
 type FailureMode = "open" | "closed";
 

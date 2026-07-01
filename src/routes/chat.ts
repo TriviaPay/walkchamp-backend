@@ -11,12 +11,12 @@ import {
   userPresenceTable,
 } from "@db/schema";
 import { eq, and, desc, or, sql, inArray, lt } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { triggerEvent } from "../lib/pusher";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { triggerEvent } from "../lib/pusher.js";
 import { z } from "zod";
-import { sanitizePlainText } from "../lib/text";
-import { config } from "../lib/config";
-import { notifyChatMessageReceived } from "../lib/pushNotificationService";
+import { sanitizePlainText } from "../lib/text.js";
+import { config } from "../lib/config.js";
+import { notifyChatMessageReceived } from "../lib/pushNotificationService.js";
 
 const router = Router();
 

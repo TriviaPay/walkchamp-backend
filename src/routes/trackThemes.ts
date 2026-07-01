@@ -6,15 +6,15 @@ import {
   coinBalancesTable,
 } from "@db/schema";
 import { eq, and, asc } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { getCoinBalance, spendCoins } from "../lib/coinsService";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { getCoinBalance, spendCoins } from "../lib/coinsService.js";
 import {
   isObjectStorageConfigError,
   isObjectStorageConfigured,
   storedObjectExists,
-} from "../lib/objectStorage";
-import { proxyStoredObjectResponse } from "../lib/objectMediaProxy";
-import { config } from "../lib/config";
+} from "../lib/objectStorage.js";
+import { proxyStoredObjectResponse } from "../lib/objectMediaProxy.js";
+import { config } from "../lib/config.js";
 
 const router = Router();
 const THEME_OBJECT_EXTENSIONS = ["", ".png", ".jpg", ".jpeg", ".webp", ".gif"];

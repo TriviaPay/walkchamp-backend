@@ -7,7 +7,7 @@ import { stepDailyTotalsTable, userStepSourcesTable } from "@db/schema";
 import { coinBalancesTable } from "@db/schema";
 import { raceParticipantsTable, raceRoomsTable } from "@db/schema";
 import { eq, and, or, desc, ne, gt, notInArray, sql } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import {
   deleteStoredObject,
   isObjectStorageConfigError,
@@ -15,14 +15,14 @@ import {
   objectKeyFromUrl,
   objectUrl,
   putStoredObject,
-} from "../lib/objectStorage";
-import { proxyStoredObjectResponse } from "../lib/objectMediaProxy";
-import { triggerEvent } from "../lib/pusher";
+} from "../lib/objectStorage.js";
+import { proxyStoredObjectResponse } from "../lib/objectMediaProxy.js";
+import { triggerEvent } from "../lib/pusher.js";
 import { z } from "zod";
-import { buildGeneratedObjectKey, validateRasterUpload } from "../lib/uploadPolicy";
-import { sanitizePlainText } from "../lib/text";
-import { config } from "../lib/config";
-import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit";
+import { buildGeneratedObjectKey, validateRasterUpload } from "../lib/uploadPolicy.js";
+import { sanitizePlainText } from "../lib/text.js";
+import { config } from "../lib/config.js";
+import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),

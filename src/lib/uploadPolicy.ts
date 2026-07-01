@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { config } from "./config";
+import { config } from "./config.js";
 
 const SIGNATURES = {
   jpeg: Buffer.from([0xff, 0xd8, 0xff]),

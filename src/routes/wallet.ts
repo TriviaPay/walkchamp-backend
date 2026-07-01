@@ -7,9 +7,9 @@ import {
   profilesTable,
 } from "@db/schema";
 import { eq, desc, sql, lt, and } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
+import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
 
 const router = Router();
 

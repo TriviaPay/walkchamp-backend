@@ -14,7 +14,7 @@ import {
   walkingGroupDailyStepsTable,
 } from "@db/schema";
 import { desc, eq, and, gte, lte, gt, ne, sql, inArray, notInArray } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 
 const router = Router();
 

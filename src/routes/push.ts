@@ -6,8 +6,8 @@ import {
   pushNotificationLogsTable,
 } from "@db/schema";
 import { eq } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { requireAdminKey } from "../middleware/requireAdminKey";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { requireAdminKey } from "../middleware/requireAdminKey.js";
 import { z } from "zod";
 
 const router = Router();

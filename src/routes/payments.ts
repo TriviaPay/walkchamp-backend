@@ -12,10 +12,10 @@ import {
   promoRedemptionsTable,
 } from "@db/schema";
 import { eq, and, ne, sql } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
 import StripeConstructor from "stripe";
-import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
+import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
 import {
   deriveOpenRoomStatus,
   joinOrReviveParticipant,
@@ -24,8 +24,8 @@ import {
   lockRaceRoom,
   lockWalletByUserId,
   type DbTx,
-} from "../lib/raceIntegrity";
-import { config } from "../lib/config";
+} from "../lib/raceIntegrity.js";
+import { config } from "../lib/config.js";
 
 const router = Router();
 

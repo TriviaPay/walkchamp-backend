@@ -6,9 +6,9 @@ import {
   dailyCoinRewardsTable,
 } from "@db/schema";
 import { and, eq, sql, gte, lte } from "drizzle-orm";
-import { triggerEvent } from "./pusher";
-import { logger } from "./logger";
-import { writeAuditLog } from "./auditLog";
+import { triggerEvent } from "./pusher.js";
+import { logger } from "./logger.js";
+import { writeAuditLog } from "./auditLog.js";
 
 // ── Ensure a balance row exists for the user ──────────────────────────────────
 export async function ensureCoinBalance(userId: string): Promise<void> {

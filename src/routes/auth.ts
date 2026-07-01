@@ -2,8 +2,8 @@ import { Router } from "express";
 import { db } from "@db";
 import { profilesTable, walletsTable } from "@db/schema";
 import { eq } from "drizzle-orm";
-import { getDescopeClient } from "../lib/descope";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { getDescopeClient } from "../lib/descope.js";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
 
 const router = Router();

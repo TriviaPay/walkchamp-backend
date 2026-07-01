@@ -25,14 +25,14 @@ import {
   profilesTable,
 } from "@db/schema";
 import { eq, and, ne, sql } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
 import StripeConstructor from "stripe";
 import Razorpay from "razorpay";
 import { createHmac } from "crypto";
-import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
-import { lockDepositTransactionById, lockWalletByUserId, type DbTx } from "../lib/raceIntegrity";
-import { config } from "../lib/config";
+import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
+import { lockDepositTransactionById, lockWalletByUserId, type DbTx } from "../lib/raceIntegrity.js";
+import { config } from "../lib/config.js";
 
 const router = Router();
 

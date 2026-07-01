@@ -6,9 +6,9 @@ import {
   raceRoomsTable,
 } from "@db/schema";
 import { and, eq } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { grantCoinReward } from "../lib/coinRewardService";
+import { grantCoinReward } from "../lib/coinRewardService.js";
 
 const router = Router();
 

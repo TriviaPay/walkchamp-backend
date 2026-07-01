@@ -5,11 +5,11 @@ import {
   walkingGroupMembersTable, walkingGroupDailyStepsTable, walkingGroupsTable,
 } from "@db/schema";
 import { eq, and, sql, desc, gte, lte, asc, count, inArray } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { evaluateStepMilestones } from "../lib/coinsService";
-import { evaluateAndNotify } from "./achievementHooks";
-import { notifyFriendsOnDailyGoal } from "../lib/friendActivityService";
+import { evaluateStepMilestones } from "../lib/coinsService.js";
+import { evaluateAndNotify } from "./achievementHooks.js";
+import { notifyFriendsOnDailyGoal } from "../lib/friendActivityService.js";
 
 const router = Router();
 

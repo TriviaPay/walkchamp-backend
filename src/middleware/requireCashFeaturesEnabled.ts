@@ -1,6 +1,6 @@
 import { type NextFunction, type Request, type Response } from "express";
-import { areCashFeaturesEnabled } from "../lib/featureFlags";
-import { logger } from "../lib/logger";
+import { areCashFeaturesEnabled } from "../lib/featureFlags.js";
+import { logger } from "../lib/logger.js";
 
 export async function requireCashFeaturesEnabled(
   req: Request,

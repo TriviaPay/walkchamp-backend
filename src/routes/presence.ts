@@ -9,11 +9,11 @@ import {
   spectateSessionsTable,
 } from "@db/schema";
 import { and, eq, gte, inArray, ne, sql } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { triggerEvent } from "../lib/pusher";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { triggerEvent } from "../lib/pusher.js";
 import { z } from "zod";
-import { requireActiveAccount } from "../middleware/requireActiveAccount";
-import { isFeatureEnabled } from "../lib/featureFlags";
+import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
+import { isFeatureEnabled } from "../lib/featureFlags.js";
 
 const router = Router();
 

@@ -10,12 +10,12 @@ import {
   notificationsTable,
 } from "@db/schema";
 import { eq, and, desc, ilike, or, sql, inArray } from "drizzle-orm";
-import { logger } from "../lib/logger";
+import { logger } from "../lib/logger.js";
 import { z } from "zod";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { requireAdminRole } from "../middleware/requireAdminRole";
-import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
-import { writeAuditLog } from "../lib/auditLog";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { requireAdminRole } from "../middleware/requireAdminRole.js";
+import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
+import { writeAuditLog } from "../lib/auditLog.js";
 
 const router = Router();
 

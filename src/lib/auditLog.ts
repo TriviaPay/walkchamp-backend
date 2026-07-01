@@ -1,6 +1,6 @@
 import { db } from "@db";
 import { auditLogsTable } from "@db/schema";
-import { logger } from "./logger";
+import { logger } from "./logger.js";
 
 export async function writeAuditLog(entry: {
   actorUserId?: string | null;

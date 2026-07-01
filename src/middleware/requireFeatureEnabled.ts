@@ -1,6 +1,6 @@
 import { type NextFunction, type Request, type Response } from "express";
-import { isFeatureEnabled } from "../lib/featureFlags";
-import { logger } from "../lib/logger";
+import { isFeatureEnabled } from "../lib/featureFlags.js";
+import { logger } from "../lib/logger.js";
 
 export function requireFeatureEnabled(
   key: string,

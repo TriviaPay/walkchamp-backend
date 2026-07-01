@@ -10,12 +10,12 @@ import {
   userPresenceTable,
 } from "@db/schema";
 import { eq, and, or, desc, inArray, sql, gte, ne } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { sendNotification } from "./notifications";
-import { triggerEvent } from "../lib/pusher";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { sendNotification } from "./notifications.js";
+import { triggerEvent } from "../lib/pusher.js";
 import { z } from "zod";
-import { grantCoinReward } from "../lib/coinRewardService";
-import { notifyFriendRequestRejected } from "../lib/pushNotificationService";
+import { grantCoinReward } from "../lib/coinRewardService.js";
+import { notifyFriendRequestRejected } from "../lib/pushNotificationService.js";
 
 const router = Router();
 

@@ -1,7 +1,7 @@
 import { db } from "@db";
 import { featureFlagsTable } from "@db/schema";
 import { eq } from "drizzle-orm";
-import { logger } from "./logger";
+import { logger } from "./logger.js";
 
 const CACHE_TTL_MS = 30_000;
 

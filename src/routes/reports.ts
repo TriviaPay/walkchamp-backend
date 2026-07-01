@@ -6,13 +6,13 @@ import {
   privateChatMessagesTable,
 } from "@db/schema";
 import { and, eq, countDistinct } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { requireActiveAccount } from "../middleware/requireActiveAccount";
-import { writeAuditLog } from "../lib/auditLog";
-import { config } from "../lib/config";
-import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit";
-import { sanitizePlainText } from "../lib/text";
+import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
+import { writeAuditLog } from "../lib/auditLog.js";
+import { config } from "../lib/config.js";
+import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit.js";
+import { sanitizePlainText } from "../lib/text.js";
 
 const router = Router();
 const reportLimiter: RequestHandler = config.features.rateLimitingEnabled

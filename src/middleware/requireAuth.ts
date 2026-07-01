@@ -1,5 +1,5 @@
 import { type Request, type Response, type NextFunction } from "express";
-import { getDescopeClient } from "../lib/descope";
+import { getDescopeClient } from "../lib/descope.js";
 
 export interface AuthenticatedRequest extends Request {
   descopeUserId: string;

@@ -6,9 +6,9 @@ import {
   userNotificationPreferencesTable,
 } from "@db/schema";
 import { eq, and, desc, lt } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { sendPushToUser } from "./push";
+import { sendPushToUser } from "./push.js";
 
 const router = Router();
 

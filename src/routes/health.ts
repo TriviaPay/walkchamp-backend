@@ -2,8 +2,8 @@ import { Router, type IRouter } from "express";
 import { HealthCheckResponse } from "@api-zod";
 import { sql } from "drizzle-orm";
 import { db } from "@db";
-import { config } from "../lib/config";
-import { pingRedis } from "../lib/redis";
+import { config } from "../lib/config.js";
+import { pingRedis } from "../lib/redis.js";
 
 const router: IRouter = Router();
 

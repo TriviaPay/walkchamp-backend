@@ -8,14 +8,14 @@ import {
   coinTransactionsTable,
 } from "@db/schema";
 import { eq, and, ne, inArray } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { triggerEvent } from "../lib/pusher";
-import { logger } from "../lib/logger";
-import { getCoinBalance } from "../lib/coinsService";
-import { requireFeatureEnabled } from "../middleware/requireFeatureEnabled";
-import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "../lib/raceIntegrity";
-import { firePromotionalRoomHosted } from "../lib/pushNotificationService";
+import { triggerEvent } from "../lib/pusher.js";
+import { logger } from "../lib/logger.js";
+import { getCoinBalance } from "../lib/coinsService.js";
+import { requireFeatureEnabled } from "../middleware/requireFeatureEnabled.js";
+import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "../lib/raceIntegrity.js";
+import { firePromotionalRoomHosted } from "../lib/pushNotificationService.js";
 
 const router = Router();
 

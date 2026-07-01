@@ -1,5 +1,5 @@
 import { type NextFunction, type Request, type Response } from "express";
-import { logger } from "../lib/logger";
+import { logger } from "../lib/logger.js";
 
 export function requireAdminKey(req: Request, res: Response, next: NextFunction) {
   const adminKey = process.env.ADMIN_SERVICE_KEY ?? process.env.ADMIN_API_KEY;

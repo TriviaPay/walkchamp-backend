@@ -1,9 +1,9 @@
 import { db } from "@db";
 import { raceRoomsTable, raceParticipantsTable, scheduledRoomRegistrationsTable } from "@db/schema";
 import { eq, and, lte, sql, ne } from "drizzle-orm";
-import { triggerEvent } from "./pusher";
-import { logger } from "./logger";
-import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "./raceIntegrity";
+import { triggerEvent } from "./pusher.js";
+import { logger } from "./logger.js";
+import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "./raceIntegrity.js";
 
 async function startScheduledRoom(roomId: string): Promise<void> {
   try {

@@ -22,31 +22,31 @@ import {
   cashChallengeConsentsTable,
 } from "@db/schema";
 import { eq, and, desc, asc, sql, ne, inArray, or, notExists } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
 import { randomBytes } from "crypto";
-import { triggerEvent } from "../lib/pusher";
-import { logger } from "../lib/logger";
-import { validateThemeOwnership } from "./trackThemes";
-import { grantCoinReward, getRaceWinRewardCode, grantVariableCoinReward } from "../lib/coinRewardService";
-import { evaluateAndNotify } from "./achievementHooks";
-import { requireAdminKey } from "../middleware/requireAdminKey";
-import { recordCoinLedgerEntry } from "../lib/coinsService";
+import { triggerEvent } from "../lib/pusher.js";
+import { logger } from "../lib/logger.js";
+import { validateThemeOwnership } from "./trackThemes.js";
+import { grantCoinReward, getRaceWinRewardCode, grantVariableCoinReward } from "../lib/coinRewardService.js";
+import { evaluateAndNotify } from "./achievementHooks.js";
+import { requireAdminKey } from "../middleware/requireAdminKey.js";
+import { recordCoinLedgerEntry } from "../lib/coinsService.js";
 import {
   deriveOpenRoomStatus,
   joinOrReviveParticipant,
   lockRaceRoom,
   lockScheduledRegistration,
   registerOrReviveScheduledRegistration,
-} from "../lib/raceIntegrity";
+} from "../lib/raceIntegrity.js";
 import {
   buildLiveRaceProgressContext,
   formatProgressSyncResponse,
   getLiveRaceStandings,
-} from "../lib/raceLeaderboardService";
-import { triggerLiveActivityUpdate } from "../lib/liveActivityUpdateService";
+} from "../lib/raceLeaderboardService.js";
+import { triggerLiveActivityUpdate } from "../lib/liveActivityUpdateService.js";
 import { liveActivityTokensTable } from "@db/schema";
-import { firePromotionalRoomHosted, notifyPrivateRoomInvitation } from "../lib/pushNotificationService";
+import { firePromotionalRoomHosted, notifyPrivateRoomInvitation } from "../lib/pushNotificationService.js";
 
 const router = Router();
 

@@ -6,7 +6,7 @@ import {
   S3Client,
 } from "@aws-sdk/client-s3";
 import { Readable } from "node:stream";
-import { config } from "./config";
+import { config } from "./config.js";
 
 type ObjectStorageConfig = {
   accessKeyId: string,

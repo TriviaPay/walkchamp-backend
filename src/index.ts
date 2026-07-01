@@ -1,6 +1,6 @@
-import app from "./app";
-import { logger } from "./lib/logger";
-import { config } from "./lib/config";
+import app from "./app.js";
+import { logger } from "./lib/logger.js";
+import { config } from "./lib/config.js";
 
 app.listen(config.port, (err) => {
   if (err) {

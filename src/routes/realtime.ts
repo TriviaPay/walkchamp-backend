@@ -2,10 +2,10 @@ import { Router } from "express";
 import { db } from "@db";
 import { conversationsTable, raceParticipantsTable, scheduledRoomRegistrationsTable, spectateSessionsTable } from "@db/schema";
 import { and, eq, or } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
-import { getPusher, isPusherConfigured } from "../lib/pusher";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { getPusher, isPusherConfigured } from "../lib/pusher.js";
 import { z } from "zod";
-import { requireActiveAccount } from "../middleware/requireActiveAccount";
+import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
 
 const router = Router();
 

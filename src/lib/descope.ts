@@ -1,5 +1,5 @@
 import DescopeClient from "@descope/node-sdk";
-import { config } from "./config";
+import { config } from "./config.js";
 
 let _client: ReturnType<typeof DescopeClient> | null = null;
 

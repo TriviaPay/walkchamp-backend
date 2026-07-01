@@ -1,5 +1,5 @@
-import { evaluateUserTitles } from "../lib/titleEvaluation";
-import { sendPushToUser } from "./push";
+import { evaluateUserTitles } from "../lib/titleEvaluation.js";
+import { sendPushToUser } from "./push.js";
 
 /**
  * Fire-and-forget achievement evaluation + push notification.

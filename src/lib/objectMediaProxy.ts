@@ -1,13 +1,13 @@
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { Request, Response } from "express";
-import { config } from "./config";
+import { config } from "./config.js";
 import {
   getStoredObject,
   headStoredObject,
   isObjectStorageConfigError,
   type StoredObjectMetadata,
-} from "./objectStorage";
+} from "./objectStorage.js";
 
 type MediaProxyOptions = {
   cacheControl: string | null,

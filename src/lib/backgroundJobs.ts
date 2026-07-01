@@ -1,7 +1,7 @@
-import { logger } from "./logger";
-import { recoverStaleRaces, cleanupOverdueRaces } from "../routes/races";
-import { startScheduler } from "./scheduler";
-import { startSponsoredEventsJob } from "../routes/sponsoredEvents";
+import { logger } from "./logger.js";
+import { recoverStaleRaces, cleanupOverdueRaces } from "../routes/races.js";
+import { startScheduler } from "./scheduler.js";
+import { startSponsoredEventsJob } from "../routes/sponsoredEvents.js";
 
 let started = false;
 

@@ -11,18 +11,18 @@ import {
   stepDailyTotalsTable,
 } from "@db/schema";
 import { eq, and, sql, desc, inArray, ne } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { triggerEvent } from "../lib/pusher";
-import { evaluateAndNotify } from "./achievementHooks";
-import { sendPushToUser } from "./push";
+import { triggerEvent } from "../lib/pusher.js";
+import { evaluateAndNotify } from "./achievementHooks.js";
+import { sendPushToUser } from "./push.js";
 import {
   getUsername,
   notifyWalkingGroupInviteReceived,
   notifyWalkingGroupJoinRequestReceived,
   notifyWalkingGroupRequestAccepted,
   notifyWalkingGroupRequestRejected,
-} from "../lib/pushNotificationService";
+} from "../lib/pushNotificationService.js";
 import {
   deleteStoredObject,
   isObjectStorageConfigError,
@@ -30,12 +30,12 @@ import {
   objectKeyFromUrl,
   objectUrl,
   putStoredObject,
-} from "../lib/objectStorage";
-import { proxyStoredObjectResponse } from "../lib/objectMediaProxy";
-import { buildGeneratedObjectKey, validateRasterUpload } from "../lib/uploadPolicy";
-import { sanitizePlainText } from "../lib/text";
-import { config } from "../lib/config";
-import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit";
+} from "../lib/objectStorage.js";
+import { proxyStoredObjectResponse } from "../lib/objectMediaProxy.js";
+import { buildGeneratedObjectKey, validateRasterUpload } from "../lib/uploadPolicy.js";
+import { sanitizePlainText } from "../lib/text.js";
+import { config } from "../lib/config.js";
+import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),

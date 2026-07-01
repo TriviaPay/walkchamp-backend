@@ -1,7 +1,7 @@
 import { db } from "@db";
 import { liveActivityTokensTable, pushNotificationLogsTable } from "@db/schema";
 import { and, eq } from "drizzle-orm";
-import type { LiveRaceProgressContext } from "./raceLeaderboardService";
+import type { LiveRaceProgressContext } from "./raceLeaderboardService.js";
 
 const lastUpdateAt = new Map<string, number>();
 const MIN_UPDATE_INTERVAL_MS = 30_000;

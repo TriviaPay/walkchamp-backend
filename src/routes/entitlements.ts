@@ -11,11 +11,11 @@ import {
   coinTransactionsTable,
 } from "@db/schema";
 import { eq, and, inArray, desc, sql, gte, lte } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { recordCoinLedgerEntry } from "../lib/coinsService";
-import { writeAuditLog } from "../lib/auditLog";
-import { requireActiveAccount } from "../middleware/requireActiveAccount";
+import { recordCoinLedgerEntry } from "../lib/coinsService.js";
+import { writeAuditLog } from "../lib/auditLog.js";
+import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
 
 const router = Router();
 

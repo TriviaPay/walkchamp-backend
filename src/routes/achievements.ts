@@ -7,9 +7,9 @@ import {
   profilesTable,
 } from "@db/schema";
 import { eq, and, inArray, sql } from "drizzle-orm";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
+import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { evaluateUserTitles } from "../lib/titleEvaluation";
+import { evaluateUserTitles } from "../lib/titleEvaluation.js";
 
 const router = Router();
 

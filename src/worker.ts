@@ -1,10 +1,10 @@
-import { logger } from "./lib/logger";
-import { runIdempotentJob } from "./lib/queue";
-import { recomputeCoinProjection } from "./lib/coinsService";
+import { logger } from "./lib/logger.js";
+import { runIdempotentJob } from "./lib/queue.js";
+import { recomputeCoinProjection } from "./lib/coinsService.js";
 import { db } from "@db";
 import { coinBalancesTable } from "@db/schema";
-import { config } from "./lib/config";
-import { startWorkerOwnedRecurringJobs } from "./lib/backgroundJobs";
+import { config } from "./lib/config.js";
+import { startWorkerOwnedRecurringJobs } from "./lib/backgroundJobs.js";
 
 async function reconcileAllCoinBalances() {
   const users = await db.select({ userId: coinBalancesTable.userId }).from(coinBalancesTable);

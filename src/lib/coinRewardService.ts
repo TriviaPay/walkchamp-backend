@@ -1,10 +1,10 @@
 import { db } from "@db";
 import { coinRewardGrantsTable } from "@db/schema";
 import { and, eq } from "drizzle-orm";
-import { logger } from "./logger";
-import { triggerEvent } from "./pusher";
-import { evaluateUserTitles } from "./titleEvaluation";
-import { recordCoinLedgerEntry } from "./coinsService";
+import { logger } from "./logger.js";
+import { triggerEvent } from "./pusher.js";
+import { evaluateUserTitles } from "./titleEvaluation.js";
+import { recordCoinLedgerEntry } from "./coinsService.js";
 
 // ── Grant a variable-amount coin reward (idempotent by rewardCode + sourceId) ──
 // Use for coins_battle prizes where amounts vary per race.

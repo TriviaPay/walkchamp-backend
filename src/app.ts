@@ -10,15 +10,15 @@ import helmetImport from "helmet";
 import type { HelmetOptions } from "helmet";
 import compression from "compression";
 import { pinoHttp } from "pino-http";
-import router from "./routes";
-import { logger } from "./lib/logger";
-import { config } from "./lib/config";
+import router from "./routes/index.js";
+import { logger } from "./lib/logger.js";
+import { config } from "./lib/config.js";
 import {
   createRedisRateLimit,
   rateLimitByActorOrIp,
   rateLimitByIp,
-} from "./lib/rateLimit";
-import { errorHandler, notFoundHandler } from "./middleware/errorHandler";
+} from "./lib/rateLimit.js";
+import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
 
 // Helmet publishes CJS-style types; cast keeps ESM default import compatible with strict TS.
 const helmet = helmetImport as unknown as (

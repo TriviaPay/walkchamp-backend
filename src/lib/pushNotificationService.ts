@@ -15,7 +15,7 @@ import {
   profilesTable,
 } from "@db/schema";
 import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
-import { sendPushToUser, sendPushToUsers, type PushCategory } from "../routes/push";
+import { sendPushToUser, sendPushToUsers, type PushCategory } from "../routes/push.js";
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
