@@ -1,14 +1,17 @@
 import Pusher from "pusher";
 
-let _client: Pusher | null = null;
+type PusherClient = InstanceType<typeof Pusher>;
 
-export function getPusher(): Pusher {
+let _client: PusherClient | undefined;
+
+export function getPusher(): PusherClient {
   if (_client) return _client;
   const { PUSHER_APP_ID, PUSHER_KEY, PUSHER_SECRET, PUSHER_CLUSTER } = process.env;
   if (!PUSHER_APP_ID || !PUSHER_KEY || !PUSHER_SECRET || !PUSHER_CLUSTER) {
     throw new Error("Pusher env vars not configured (PUSHER_APP_ID, PUSHER_KEY, PUSHER_SECRET, PUSHER_CLUSTER)");
   }
-  _client = new Pusher({ appId: PUSHER_APP_ID, key: PUSHER_KEY, secret: PUSHER_SECRET, cluster: PUSHER_CLUSTER, useTLS: true });
+  const client = new Pusher({ appId: PUSHER_APP_ID, key: PUSHER_KEY, secret: PUSHER_SECRET, cluster: PUSHER_CLUSTER, useTLS: true });
+  _client = client;
   return _client;
 }
 

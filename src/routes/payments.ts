@@ -14,7 +14,7 @@ import {
 import { eq, and, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth";
 import { z } from "zod";
-import Stripe from "stripe";
+import { Stripe } from "stripe";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled";
 import {
   deriveOpenRoomStatus,
@@ -32,8 +32,10 @@ const router = Router();
 router.use("/payments", requireCashFeaturesEnabled);
 
 // ── Stripe client (lazy init so missing key just disables payments) ───────────
-let _stripe: Stripe | null = null;
-function getStripe(): Stripe {
+type StripeClient = InstanceType<typeof Stripe>;
+
+let _stripe: StripeClient | null = null;
+function getStripe(): StripeClient {
   if (_stripe) return _stripe;
   const key = config.payments.stripeSecretKey;
   if (!key) throw new Error("STRIPE_SECRET_KEY is not configured.");
