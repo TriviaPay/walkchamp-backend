@@ -382,6 +382,62 @@ router.post("/auth/verify-token", async (req, res) => {
   }
 });
 
+// ── POST /api/auth/password/signin — password login via Descope ───────────────
+// Compatibility endpoint for clients that route password login through the API.
+// Password verification and session creation remain entirely in Descope.
+const passwordSigninSchema = z.object({
+  loginId: z.string().trim().min(1).optional(),
+  email: z.string().trim().min(1).optional(),
+  password: z.string().min(1),
+}).refine((value) => Boolean(value.loginId || value.email), {
+  message: "loginId required",
+  path: ["loginId"],
+});
+
+router.post("/auth/password/signin", async (req, res) => {
+  const parse = passwordSigninSchema.safeParse(req.body);
+  if (!parse.success) {
+    return res.status(400).json({ error: "invalid_request", details: parse.error.issues });
+  }
+
+  const loginId = (parse.data.loginId ?? parse.data.email ?? "").trim();
+
+  try {
+    const client = getDescopeClient();
+    const signInResult = await client.password.signIn(loginId, parse.data.password);
+    if (!signInResult.ok || !signInResult.data) {
+      req.log.warn({ descopeCode: signInResult.code }, "password/signin: Descope rejected credentials");
+      return res.status(401).json({
+        error: "invalid_credentials",
+        message: signInResult.error?.errorDescription ?? "Invalid login credentials",
+      });
+    }
+
+    const { sessionJwt, refreshJwt, user } = signInResult.data as {
+      sessionJwt: string;
+      refreshJwt?: string;
+      user?: { userId?: string; loginIds?: string[]; name?: string; email?: string; verifiedEmail?: boolean };
+    };
+
+    return res.json({
+      sessionJwt,
+      refreshJwt: refreshJwt ?? null,
+      user: user
+        ? {
+            userId: user.userId,
+            loginIds: user.loginIds ?? [],
+            name: user.name ?? null,
+            email: user.email ?? null,
+            verifiedEmail: user.verifiedEmail ?? false,
+          }
+        : null,
+    });
+  } catch (err) {
+    req.log.error({ err }, "password/signin failed");
+    return res.status(502).json({ error: "descope_unavailable", message: "Unable to sign in right now" });
+  }
+});
+
 // ── POST /api/auth/reset-password/complete ───────────────────────────────────
 // Completes the password reset flow entirely server-side:
 //  1. Verifies the magic-link token from the reset email (needs DESCOPE_PROJECT_ID)

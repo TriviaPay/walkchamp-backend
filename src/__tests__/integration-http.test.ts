@@ -185,18 +185,18 @@ describe("HTTP integration smoke", () => {
     }
   });
 
-  it("does not classify unknown auth routes as disabled cash routes", async () => {
+  it("exposes password sign-in without classifying it as a disabled cash route", async () => {
     const { response, json } = await request("/api/auth/password/signin", {
       method: "POST",
       headers: {
         "content-type": "application/json",
       },
-      body: JSON.stringify({ loginId: "test@example.com", password: "password" }),
+      body: JSON.stringify({ loginId: "test@example.com" }),
     });
 
-    expect(response.status).toBe(404);
+    expect(response.status).toBe(400);
     expect(json).toMatchObject({
-      code: "ROUTE_NOT_FOUND",
+      error: "invalid_request",
     });
   });
 
