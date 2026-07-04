@@ -15,7 +15,7 @@ Acceptable validation shapes are:
 ## Required staging parity
 
 - same image as production
-- same service split: `api`, `worker`, `redis`
+- same service split: `api`, `worker`, `redis-cache`, `redis-queue`
 - separate Neon branch or database
 - separate R2 bucket or isolated staging prefix
 - separate Cloudflare hostname if internet-exposed

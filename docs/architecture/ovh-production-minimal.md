@@ -8,7 +8,7 @@ This repo now targets a low-cost single-node production shape:
 - Coolify on the same host
 - one API container
 - one worker container
-- one local Redis container
+- split local Redis containers (`redis-cache` and `redis-queue`)
 - Neon Postgres
 - Cloudflare DNS
 - Cloudflare R2 with a custom public domain
@@ -19,7 +19,9 @@ This is intentionally not HA. It is a pragmatic single-host setup for moderate t
 
 - `api` handles HTTP, auth, payments, groups, race state APIs, and media compatibility routes.
 - `worker` owns recurring jobs and background processing.
-- `redis` is local-only and never publicly exposed.
+- `redis-cache` and `redis-queue` are local-only and never publicly exposed.
+- `redis-cache` may evict cache/rate-limit/Bloom/lock keys under memory pressure.
+- `redis-queue` must use `noeviction` with AOF enabled so BullMQ queue keys are never removed by Redis eviction.
 - Postgres stays in Neon.
 - Object storage reads and writes go to R2 through a provider-neutral S3-compatible client.
 
@@ -60,8 +62,8 @@ Rollback artifacts remain mandatory:
 - Neon restore or PITR is the first DB rollback path.
 - Nightly `pg_dump` to R2 is the portable secondary backup.
 - Coolify instance backup is required but does not cover Redis data.
-- Redis persistence files must be copied off-host to R2 daily.
-- Monthly Redis restore drills are part of normal operations.
+- `redis-queue` persistence files must be copied off-host to R2 daily.
+- Monthly `redis-queue` restore drills are part of normal operations.
 
 ## Security posture
 
@@ -72,7 +74,10 @@ That is not the hardened final state. After cutover:
 - move the API record to proxied mode
 - validate forwarded-header behavior
 - revisit `TRUST_PROXY_HOPS`
-- tighten origin firewall rules
+- prefer explicit `TRUST_PROXY_CIDRS`
+- tighten origin firewall rules to Cloudflare IP ranges only
+- add Authenticated Origin Pulls/mTLS where supported
+- rotate the origin IP first if DNS history exposed it
 
 ## Upgrade triggers
 

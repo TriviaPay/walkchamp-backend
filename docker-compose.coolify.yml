@@ -5,8 +5,18 @@ x-app-env: &app-env
   APP_BASE_URL: ${APP_BASE_URL:?APP_BASE_URL is required}
   ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS is required}
   TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+  TRUST_PROXY_CIDRS: ${TRUST_PROXY_CIDRS:-}
+  ENABLE_EDGE_STRICT_MODE: ${ENABLE_EDGE_STRICT_MODE:-false}
   ENABLE_RATE_LIMITING: ${ENABLE_RATE_LIMITING:-true}
-  REDIS_URL: redis://redis:6379
+  ENABLE_NEW_RATE_LIMITER: ${ENABLE_NEW_RATE_LIMITER:-true}
+  ENABLE_CACHE_GET_OR_COMPUTE: ${ENABLE_CACHE_GET_OR_COMPUTE:-false}
+  ENABLE_LOAD_SHEDDING: ${ENABLE_LOAD_SHEDDING:-false}
+  ENABLE_BULLMQ_WEBHOOK_PROCESSING: ${ENABLE_BULLMQ_WEBHOOK_PROCESSING:-false}
+  ENABLE_CIRCUIT_BREAKERS: ${ENABLE_CIRCUIT_BREAKERS:-false}
+  BLOOM_GUARDS_MODE: ${BLOOM_GUARDS_MODE:-monitor}
+  REDIS_URL: redis://redis-cache:6379
+  REDIS_CACHE_URL: redis://redis-cache:6379
+  REDIS_QUEUE_URL: redis://redis-queue:6379
   DATABASE_RUNTIME_URL: ${DATABASE_RUNTIME_URL:?DATABASE_RUNTIME_URL is required}
   DATABASE_ADMIN_URL: ${DATABASE_ADMIN_URL:?DATABASE_ADMIN_URL is required}
   DESCOPE_PROJECT_ID: ${DESCOPE_PROJECT_ID:?DESCOPE_PROJECT_ID is required}
@@ -53,7 +63,9 @@ services:
     expose:
       - "8080"
     depends_on:
-      redis:
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
         condition: service_healthy
     environment:
       <<: *app-env
@@ -73,7 +85,9 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     depends_on:
-      redis:
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
         condition: service_healthy
     environment:
       <<: *app-env
@@ -90,9 +104,31 @@ services:
       retries: 5
       start_period: 30s
 
-  redis:
+  redis-cache:
     image: redis:7.2-alpine
     restart: unless-stopped
+    mem_limit: ${REDIS_CACHE_CONTAINER_MEMORY:-384m}
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - ${REDIS_CACHE_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - ${REDIS_CACHE_MAXMEMORY_POLICY:-allkeys-lfu}
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  redis-queue:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    mem_limit: ${REDIS_QUEUE_CONTAINER_MEMORY:-768m}
     command:
       - redis-server
       - --appendonly
@@ -108,8 +144,12 @@ services:
       - --save
       - "60"
       - "10000"
+      - --maxmemory
+      - ${REDIS_QUEUE_MAXMEMORY:-512mb}
+      - --maxmemory-policy
+      - noeviction
     volumes:
-      - redis-data:/data
+      - redis-queue-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -118,4 +158,4 @@ services:
       start_period: 5s
 
 volumes:
-  redis-data:
+  redis-queue-data:

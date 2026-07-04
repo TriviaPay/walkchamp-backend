@@ -10,6 +10,7 @@ const BASE_PRODUCTION_ENV = {
   DATABASE_RUNTIME_URL: "postgres://test:test@127.0.0.1:5432/test",
   DATABASE_ADMIN_URL: "postgres://test:test@127.0.0.1:5432/test",
   REDIS_URL: "redis://127.0.0.1:6379",
+  SESSION_SECRET: "test-session-secret",
   DESCOPE_PROJECT_ID: "descope-project",
   OBJECT_STORAGE_ENDPOINT: "https://example-account.r2.cloudflarestorage.com",
   OBJECT_STORAGE_REGION: "auto",
@@ -59,5 +60,47 @@ describe("production object storage config", () => {
       OCI_ACCESS_KEY_ID: "legacy-access-key",
       OCI_SECRET_ACCESS_KEY: "legacy-secret-key",
     })).rejects.toThrow("OBJECT_STORAGE_ENDPOINT is required in production");
+  });
+});
+
+describe("production hardening config", () => {
+  it("uses split Redis URLs when configured", async () => {
+    const { config } = await importConfig({
+      REDIS_CACHE_URL: "redis://cache:6379",
+      REDIS_QUEUE_URL: "redis://queue:6379",
+    });
+
+    expect(config.redis.cacheUrl).toBe("redis://cache:6379");
+    expect(config.redis.queueUrl).toBe("redis://queue:6379");
+    expect(config.redis.splitConfigured).toBe(true);
+  });
+
+  it("falls back to REDIS_URL for local compatibility", async () => {
+    const { config } = await importConfig({
+      REDIS_CACHE_URL: undefined,
+      REDIS_QUEUE_URL: undefined,
+      REDIS_URL: "redis://single:6379",
+    });
+
+    expect(config.redis.cacheUrl).toBe("redis://single:6379");
+    expect(config.redis.queueUrl).toBe("redis://single:6379");
+    expect(config.redis.splitConfigured).toBe(false);
+  });
+
+  it("prefers explicit trusted proxy CIDRs over broad hop trust", async () => {
+    const { config } = await importConfig({
+      TRUST_PROXY_CIDRS: "173.245.48.0/20,103.21.244.0/22",
+    });
+
+    expect(config.trustProxy).toEqual(["173.245.48.0/20", "103.21.244.0/22"]);
+    expect(config.trustedProxyCidrs).toEqual(["173.245.48.0/20", "103.21.244.0/22"]);
+  });
+
+  it("exposes a private token hook for detailed production readiness", async () => {
+    const { config } = await importConfig({
+      READINESS_DETAIL_TOKEN: "health-secret",
+    });
+
+    expect(config.health.readinessDetailToken).toBe("health-secret");
   });
 });

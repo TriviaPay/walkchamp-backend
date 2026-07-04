@@ -122,6 +122,17 @@ describe("HTTP integration smoke", () => {
     const { response, json } = await request("/api/healthz");
     expect(response.status).toBe(200);
     expect(json).toEqual({ status: "ok" });
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("cloudflare-cdn-cache-control")).toBe("no-store");
+    expect(response.headers.get("cdn-cache-control")).toBe("no-store");
+    expect(response.headers.get("surrogate-control")).toBe("no-store");
+  });
+
+  it("serves the liveness endpoint", async () => {
+    const { response, json } = await request("/livez");
+    expect(response.status).toBe(200);
+    expect(json).toEqual({ status: "ok" });
+    expect(response.headers.get("cache-control")).toBe("no-store");
   });
 
   it("serves the readiness endpoint", async () => {
@@ -131,6 +142,7 @@ describe("HTTP integration smoke", () => {
       status: "ready",
       checks: {
         database: "skipped",
+        migrations: "skipped",
         config: "ok",
       },
     });

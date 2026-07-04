@@ -5,6 +5,7 @@ import { db } from "../db/src/index.js";
 import { coinBalancesTable } from "../db/src/schema/index.js";
 import { config } from "./lib/config.js";
 import { startWorkerOwnedRecurringJobs } from "./lib/backgroundJobs.js";
+import { startOutboxDispatcher } from "./lib/outbox.js";
 
 async function reconcileAllCoinBalances() {
   const users = await db.select({ userId: coinBalancesTable.userId }).from(coinBalancesTable);
@@ -21,10 +22,19 @@ async function main() {
     return;
   }
 
-  if (config.redis.url) {
-    logger.info({ redisConfigured: true }, "Worker starting with Redis configured");
+  if (config.redis.cacheUrl || config.redis.queueUrl) {
+    logger.info({
+      redisCacheConfigured: Boolean(config.redis.cacheUrl),
+      redisQueueConfigured: Boolean(config.redis.queueUrl),
+      redisSplitConfigured: config.redis.splitConfigured,
+    }, "Worker starting with Redis configured");
   } else {
     logger.warn("REDIS_URL is not configured; recurring jobs are worker-owned but not queue-backed.");
+  }
+
+  if (config.features.bullmqWebhookProcessingEnabled) {
+    logger.info("Starting outbox dispatcher");
+    startOutboxDispatcher();
   }
 
   await runIdempotentJob({

@@ -45,6 +45,9 @@ function setMetadataHeaders(
   const cacheControl = cacheControlOverride ?? metadata.cacheControl;
   if (cacheControl) {
     res.setHeader("Cache-Control", cacheControl);
+    res.setHeader("Cloudflare-CDN-Cache-Control", cacheControl);
+    res.setHeader("CDN-Cache-Control", cacheControl);
+    res.setHeader("Surrogate-Control", cacheControl);
   }
 }
 

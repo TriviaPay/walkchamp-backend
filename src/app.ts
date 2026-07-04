@@ -11,6 +11,7 @@ import type { HelmetOptions } from "helmet";
 import compression from "compression";
 import { pinoHttp } from "pino-http";
 import router from "./routes/index.js";
+import healthRouter from "./routes/health.js";
 import { logger } from "./lib/logger.js";
 import { config } from "./lib/config.js";
 import {
@@ -19,6 +20,8 @@ import {
   rateLimitByIp,
 } from "./lib/rateLimit.js";
 import { errorHandler, notFoundHandler } from "./middleware/errorHandler.js";
+import { loadSheddingMiddleware } from "./middleware/loadShedding.js";
+import { resourceBudgetMiddleware } from "./middleware/resourceBudgets.js";
 
 // Helmet publishes CJS-style types; cast keeps ESM default import compatible with strict TS.
 const helmet = helmetImport as unknown as (
@@ -31,6 +34,24 @@ function parseAllowedOrigins(raw: string): string[] {
     .map((o) => o.trim())
     .filter(Boolean);
 }
+
+function authRateLimitTarget(req: Request): string | null {
+  const body = req.body as Record<string, unknown> | undefined;
+  const username = typeof req.query.username === "string" ? req.query.username : null;
+  const email = typeof body?.email === "string" ? body.email : null;
+  const phone = typeof body?.phone === "string" ? body.phone : null;
+  const loginId = typeof body?.loginId === "string" ? body.loginId : null;
+  const descopeUserId = typeof body?.descopeUserId === "string" ? body.descopeUserId : null;
+  return username ?? email ?? phone ?? loginId ?? descopeUserId;
+}
+
+const apiNoStoreMiddleware: RequestHandler = (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Cloudflare-CDN-Cache-Control", "no-store");
+  res.setHeader("CDN-Cache-Control", "no-store");
+  res.setHeader("Surrogate-Control", "no-store");
+  next();
+};
 
 const app: Express = express();
 app.disable("x-powered-by");
@@ -123,6 +144,10 @@ app.use(
   }),
 );
 
+if (config.features.loadSheddingEnabled) {
+  app.use(loadSheddingMiddleware);
+}
+
 // ── Timeouts ──────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   const isUploadRoute = /^\/api\/(?:profile\/me\/avatar|groups\/[^/]+\/image)$/.test(req.path);
@@ -155,6 +180,11 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── CDN cache deny-by-default ─────────────────────────────────────────────────
+// API responses are private unless a route deliberately overrides every cache
+// header (media compatibility routes do this for versioned public images).
+app.use("/api", apiNoStoreMiddleware);
+
 // ── Body parsing — Stripe/Razorpay webhooks need raw body ─────────────────────
 // All other routes get parsed JSON with a 2 MB body limit.
 const WEBHOOK_PATHS = new Set([
@@ -162,6 +192,7 @@ const WEBHOOK_PATHS = new Set([
   "/api/webhooks/stripe",
   "/api/webhooks/razorpay",
 ]);
+const HEALTH_PATHS = new Set(["/livez", "/healthz", "/readyz", "/api/livez", "/api/healthz", "/api/readyz"]);
 
 app.use((req, res, next) => {
   if (WEBHOOK_PATHS.has(req.path)) {
@@ -171,11 +202,14 @@ app.use((req, res, next) => {
   }
 });
 app.use(express.urlencoded({ extended: true, limit: config.runtime.urlencodedBodyLimit }));
+app.use(resourceBudgetMiddleware);
 
 // ── Response compression ───────────────────────────────────────────────────────
 // Compresses JSON/text responses. Webhook paths receive raw buffers so they are
 // naturally excluded (compression only runs on text content-types).
 app.use(compression());
+
+app.use(healthRouter);
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 if (config.features.rateLimitingEnabled) {
@@ -184,23 +218,27 @@ if (config.features.rateLimitingEnabled) {
     windowMs: 15 * 60 * 1000,
     max: 400,
     failureMode: "open",
+    enforcement: "monitor",
     message: "Too many requests — please try again later.",
     code: "GLOBAL_RATE_LIMITED",
     key: rateLimitByIp,
+    dimensions: ["ip", "device"],
   });
   app.use((req, res, next) => (
-    WEBHOOK_PATHS.has(req.path)
+    WEBHOOK_PATHS.has(req.path) || HEALTH_PATHS.has(req.path)
       ? next()
       : globalLimiter(req, res, next)
   ));
   app.use("/api/auth", createRedisRateLimit({
     bucket: "auth",
-    windowMs: 15 * 60 * 1000,
-    max: 30,
+    windowMs: 60 * 1000,
+    max: 20,
     failureMode: "closed",
     message: "Too many auth requests — please try again later.",
     code: "AUTH_RATE_LIMITED",
     key: rateLimitByIp,
+    dimensions: ["ip", "device", "token", "target"],
+    target: authRateLimitTarget,
   }));
   app.use("/api/payments", createRedisRateLimit({
     bucket: "payments",
@@ -210,6 +248,7 @@ if (config.features.rateLimitingEnabled) {
     message: "Too many payment requests — please try again later.",
     code: "PAYMENT_RATE_LIMITED",
     key: rateLimitByActorOrIp,
+    dimensions: ["ip", "actor", "device", "token"],
   }));
   app.use("/api/wallet/deposit", createRedisRateLimit({
     bucket: "deposits",
@@ -219,6 +258,7 @@ if (config.features.rateLimitingEnabled) {
     message: "Too many deposit attempts — please try again later.",
     code: "DEPOSIT_RATE_LIMITED",
     key: rateLimitByActorOrIp,
+    dimensions: ["ip", "actor", "device", "token"],
   }));
   app.use("/api/admin", createRedisRateLimit({
     bucket: "admin",
@@ -228,6 +268,7 @@ if (config.features.rateLimitingEnabled) {
     message: "Too many admin requests — please try again later.",
     code: "ADMIN_RATE_LIMITED",
     key: rateLimitByActorOrIp,
+    dimensions: ["ip", "actor", "token"],
   }));
   app.use("/api/realtime/pusher/auth", createRedisRateLimit({
     bucket: "realtime-auth",
@@ -237,6 +278,8 @@ if (config.features.rateLimitingEnabled) {
     message: "Too many realtime auth requests — please slow down.",
     code: "REALTIME_AUTH_RATE_LIMITED",
     key: rateLimitByActorOrIp,
+    dimensions: ["ip", "actor", "device", "token"],
+    enforcement: "monitor",
   }));
   app.use("/api/presence/heartbeat", createRedisRateLimit({
     bucket: "presence-heartbeat",
@@ -246,6 +289,8 @@ if (config.features.rateLimitingEnabled) {
     message: "Too many presence updates — please slow down.",
     code: "PRESENCE_RATE_LIMITED",
     key: rateLimitByActorOrIp,
+    dimensions: ["ip", "actor", "device", "token"],
+    enforcement: "monitor",
   }));
   app.use("/api/coins/ad-reward", createRedisRateLimit({
     bucket: "ad-reward",
@@ -255,6 +300,8 @@ if (config.features.rateLimitingEnabled) {
     message: "Too many ad reward requests — please try again later.",
     code: "AD_REWARD_RATE_LIMITED",
     key: rateLimitByActorOrIp,
+    dimensions: ["ip", "actor", "device", "token"],
+    enforcement: "monitor",
   }));
   app.use("/api/rooms", createRedisRateLimit({
     bucket: "room-registration",
@@ -264,6 +311,8 @@ if (config.features.rateLimitingEnabled) {
     message: "Too many registration requests — please slow down.",
     code: "ROOM_RATE_LIMITED",
     key: rateLimitByActorOrIp,
+    dimensions: ["ip", "actor", "device", "token"],
+    enforcement: "monitor",
   }));
   app.use("/api/races", createRedisRateLimit({
     bucket: "race-join",
@@ -273,6 +322,8 @@ if (config.features.rateLimitingEnabled) {
     message: "Too many race requests — please slow down.",
     code: "RACE_RATE_LIMITED",
     key: rateLimitByActorOrIp,
+    dimensions: ["ip", "actor", "device", "token"],
+    enforcement: "monitor",
   }));
 }
 

@@ -8,7 +8,7 @@ Express API plus worker for step ingestion, race state, wallets, chat, groups, a
 - `Coolify`
 - `api` container
 - `worker` container
-- local `redis`
+- split local Redis (`redis-cache` for cache/rate limits and `redis-queue` for BullMQ/outbox)
 - `Neon` Postgres
 - `Cloudflare DNS`
 - `Cloudflare R2`

@@ -8,7 +8,7 @@ The active production path in this repo is now:
 - Coolify
 - `api` container
 - `worker` container
-- local Redis
+- split Redis (`redis-cache` and `redis-queue`)
 - Neon Postgres
 - Cloudflare DNS
 - Cloudflare R2
@@ -21,8 +21,9 @@ Legacy OCI, Render, and Vercel assets are archive-only and are not part of the l
 - Active object storage runtime is provider-neutral S3-compatible code.
 - Day-1 media compatibility routes stream `200 image/*` responses from object storage.
 - Media routes support `HEAD`, reject `Range`, preserve key headers, and enforce size limits.
-- Compose deployment exists for Coolify with `api`, `worker`, and `redis`.
-- Redis persistence is configured with AOF plus RDB snapshots on a named volume.
+- Compose deployment exists for Coolify with `api`, `worker`, `redis-cache`, and `redis-queue`.
+- `redis-cache` is configured for bounded memory and `allkeys-lfu` eviction.
+- `redis-queue` is configured for BullMQ durability with AOF plus RDB snapshots, `noeviction`, and a named volume.
 - Backup helper scripts exist for nightly `pg_dump`, Redis volume backup, and Redis restore drills.
 - URL rewrite tooling exists for old OCI asset URLs after copy verification.
 
@@ -34,7 +35,7 @@ Legacy OCI, Render, and Vercel assets are archive-only and are not part of the l
 - Cloudflare custom domain and DNS setup
 - Daily execution of backup scripts
 - Monthly Redis restore drills
-- Post-cutover move from `DNS only` to proxied Cloudflare mode
+- Post-cutover move from `DNS only` to proxied Cloudflare mode, origin firewalling, and Authenticated Origin Pulls/mTLS where supported
 
 ## Launch blockers
 

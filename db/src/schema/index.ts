@@ -22,3 +22,4 @@ export * from "./cashChallengeConsents.js";
 export * from "./featureFlags.js";
 export * from "./auditLogs.js";
 export * from "./liveActivity.js";
+export * from "./hardening.js";

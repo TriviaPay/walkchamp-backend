@@ -104,6 +104,9 @@ describe("proxyStoredObjectResponse", () => {
       expect(response.headers.get("content-type")).toBe("image/png");
       expect(response.headers.get("content-length")).toBe("5");
       expect(response.headers.get("cache-control")).toBe("public, max-age=60");
+      expect(response.headers.get("cloudflare-cdn-cache-control")).toBe("public, max-age=60");
+      expect(response.headers.get("cdn-cache-control")).toBe("public, max-age=60");
+      expect(response.headers.get("surrogate-control")).toBe("public, max-age=60");
       expect(response.headers.get("etag")).toBe("\"etag-123\"");
       expect(response.headers.get("last-modified")).toBeTruthy();
       expect(await response.text()).toBe("hello");

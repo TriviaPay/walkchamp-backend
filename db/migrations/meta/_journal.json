@@ -29,6 +29,20 @@
       "when": 1781983000000,
       "tag": "0003_webhook_ledger",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1781983600000,
+      "tag": "0004_live_activity_tokens",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1781984200000,
+      "tag": "0005_hardening_outbox",
+      "breakpoints": true
     }
   ]
 }

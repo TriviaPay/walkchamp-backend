@@ -8,26 +8,6 @@ import { z } from "zod";
 
 const router = Router();
 
-// ── IP rate limiter for unauthenticated endpoints (username-check, oauth) ────
-// 60 checks per minute per IP — prevents username enumeration at scale
-interface IpBucket { count: number; resetAt: number }
-const _ipRateStore = new Map<string, IpBucket>();
-function checkIpRateLimit(ip: string, max = 60, windowMs = 60_000): { allowed: boolean } {
-  const now = Date.now();
-  const existing = _ipRateStore.get(ip);
-  const bucket: IpBucket = existing && now < existing.resetAt
-    ? existing
-    : { count: 0, resetAt: now + windowMs };
-  if (bucket.count >= max) return { allowed: false };
-  bucket.count++;
-  _ipRateStore.set(ip, bucket);
-  return { allowed: true };
-}
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of _ipRateStore) { if (now >= v.resetAt) _ipRateStore.delete(k); }
-}, 10 * 60_000);
-
 // ── Username helpers ─────────────────────────────────────────────────────────
 const BLOCKED_USERNAMES = new Set([
   "admin", "support", "official", "system", "moderator",
@@ -89,9 +69,6 @@ router.get("/me", requireAuth, async (req, res) => {
 
 // ── GET /api/auth/username-check?username=xxx ────────────────────────────────
 router.get("/auth/username-check", async (req, res) => {
-  const { allowed } = checkIpRateLimit(req.ip ?? "unknown");
-  if (!allowed) return res.status(429).json({ error: "Too many requests. Please slow down." });
-
   const username = String(req.query.username ?? "").trim().toLowerCase();
   if (!username) return res.status(400).json({ error: "username required" });
 

@@ -4,7 +4,7 @@
 
 - One OVH VPS runs Coolify.
 - Coolify deploys `docker-compose.coolify.yml`.
-- Services are `api`, `worker`, and `redis`.
+- Services are `api`, `worker`, `redis-cache`, and `redis-queue`.
 - Neon remains the source of truth for Postgres.
 - Cloudflare R2 is the only active object storage backend.
 
@@ -29,7 +29,7 @@ docker compose -f docker-compose.coolify.yml run --rm api /usr/local/bin/run-mig
    - avatar, group image, and theme image fetches
 8. Inspect logs for:
    - media proxy failures
-   - Redis connection errors
+   - Redis cache or queue connection errors
    - Neon connection errors
    - provider auth errors
 9. Mark the release healthy only after the checks pass.
@@ -89,6 +89,8 @@ After the cutover stabilizes:
 
 1. Move `api.<domain>` to proxied Cloudflare mode.
 2. Revalidate `X-Forwarded-*` behavior.
-3. Revisit `TRUST_PROXY_HOPS`.
+3. Prefer explicit `TRUST_PROXY_CIDRS`; if using `TRUST_PROXY_HOPS`, verify every proxy hop is controlled.
 4. Restrict origin ingress to Cloudflare IPs where practical.
-5. Re-test health checks and long-lived connections.
+5. Add Authenticated Origin Pulls/mTLS where supported.
+6. Rotate origin IP first if historical DNS exposed it.
+7. Re-test health checks and long-lived connections.

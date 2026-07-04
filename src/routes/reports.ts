@@ -24,6 +24,7 @@ const reportLimiter: RequestHandler = config.features.rateLimitingEnabled
       message: "You are submitting reports too quickly. Please try again later.",
       code: "REPORT_RATE_LIMITED",
       key: rateLimitByActorOrIp,
+      dimensions: ["actor", "ip", "device", "token"],
     })
   : ((_req, _res, next) => next());
 

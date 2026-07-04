@@ -56,6 +56,7 @@ const groupImageUploadLimiter: RequestHandler = config.features.rateLimitingEnab
       message: "Too many upload attempts — please try again later.",
       code: "UPLOAD_RATE_LIMITED",
       key: rateLimitByActorOrIp,
+      dimensions: ["actor", "ip", "device", "token"],
     })
   : (_req, _res, next) => next();
 

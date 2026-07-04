@@ -27,7 +27,7 @@
 - Coolify host: patched on a regular cadence
 - Docker and Coolify logs retained long enough for incident review
 - Firewall: allow only required ingress
-- Redis is never exposed with a public host port
+- Redis containers are never exposed with a public host port
 - Cloudflare DNS starts as `DNS only`, not as the final hardened state
 
 ## Object storage policy
@@ -44,13 +44,15 @@
 
 ## Redis persistence and backup
 
-- Redis runs with `appendonly yes`.
-- Redis runs with `appendfsync everysec`.
-- Redis keeps RDB snapshots.
-- Redis data lives on a named Docker volume.
-- Coolify instance backup is not enough for Redis recovery.
-- Redis volume backups must be copied off-host to R2 daily.
-- Monthly Redis restore drills are mandatory.
+- `redis-cache` uses bounded memory with `allkeys-lfu` eviction by default.
+- `redis-queue` runs with `maxmemory-policy noeviction`.
+- `redis-queue` runs with `appendonly yes`.
+- `redis-queue` runs with `appendfsync everysec`.
+- `redis-queue` keeps RDB snapshots.
+- `redis-queue` data lives on a named Docker volume.
+- Coolify instance backup is not enough for Redis queue recovery.
+- `redis-queue` volume backups must be copied off-host to R2 daily.
+- Monthly `redis-queue` restore drills are mandatory.
 
 ## Kill switches
 

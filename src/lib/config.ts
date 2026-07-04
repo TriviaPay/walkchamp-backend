@@ -12,6 +12,11 @@ function splitCsv(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
+function parseBloomGuardsMode(value: string | undefined): "off" | "monitor" | "enforce" {
+  if (value === "off" || value === "monitor" || value === "enforce") return value;
+  return "monitor";
+}
+
 const envSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -21,7 +26,16 @@ const envSchema = z
     ALLOWED_ORIGINS: z.string().optional(),
     RUN_BACKGROUND_JOBS: z.enum(["true", "false"]).optional(),
     ENABLE_RATE_LIMITING: z.enum(["true", "false"]).optional(),
+    ENABLE_NEW_RATE_LIMITER: z.enum(["true", "false"]).optional(),
+    ENABLE_CACHE_GET_OR_COMPUTE: z.enum(["true", "false"]).optional(),
+    ENABLE_LOAD_SHEDDING: z.enum(["true", "false"]).optional(),
+    ENABLE_BULLMQ_WEBHOOK_PROCESSING: z.enum(["true", "false"]).optional(),
+    ENABLE_CIRCUIT_BREAKERS: z.enum(["true", "false"]).optional(),
+    ENABLE_EDGE_STRICT_MODE: z.enum(["true", "false"]).optional(),
+    BLOOM_GUARDS_MODE: z.enum(["off", "monitor", "enforce"]).optional(),
     TRUST_PROXY_HOPS: z.coerce.number().int().min(1).optional(),
+    TRUST_PROXY_CIDRS: z.string().optional(),
+    READINESS_DETAIL_TOKEN: z.string().optional(),
     MOCK_PROVIDERS_ENABLED: z.enum(["true", "false"]).optional(),
     ALLOW_TEST_ROUTES: z.enum(["true", "false"]).optional(),
     ALLOW_DEMO_SEEDS: z.enum(["true", "false"]).optional(),
@@ -31,6 +45,9 @@ const envSchema = z
     DATABASE_ADMIN_URL: z.string().optional(),
     NEON_DATABASE_ADMIN_URL: z.string().optional(),
     REDIS_URL: z.string().optional(),
+    REDIS_CACHE_URL: z.string().optional(),
+    REDIS_QUEUE_URL: z.string().optional(),
+    RATE_LIMIT_SECRET: z.string().optional(),
     DESCOPE_PROJECT_ID: z.string().optional(),
     DESCOPE_MANAGEMENT_KEY: z.string().optional(),
     SESSION_SECRET: z.string().optional(),
@@ -76,12 +93,32 @@ const adminDatabaseUrl =
   || rawEnv.NEON_DATABASE_ADMIN_URL?.trim()
   || runtimeDatabaseUrl;
 const allowedOrigins = splitCsv(rawEnv.ALLOWED_ORIGINS);
+const trustedProxyCidrs = splitCsv(rawEnv.TRUST_PROXY_CIDRS);
+const redisCacheUrl = rawEnv.REDIS_CACHE_URL?.trim() || rawEnv.REDIS_URL?.trim() || null;
+const redisQueueUrl = rawEnv.REDIS_QUEUE_URL?.trim() || rawEnv.REDIS_URL?.trim() || null;
+const rateLimitSecret =
+  rawEnv.RATE_LIMIT_SECRET?.trim()
+  || rawEnv.SESSION_SECRET?.trim()
+  || (isTest ? "test-rate-limit-secret" : null);
 
 const featureFlags = {
   runBackgroundJobs: parseBoolean(rawEnv.RUN_BACKGROUND_JOBS, true),
   rateLimitingEnabled: rawEnv.ENABLE_RATE_LIMITING
     ? rawEnv.ENABLE_RATE_LIMITING === "true"
     : isProduction,
+  newRateLimiterEnabled: rawEnv.ENABLE_NEW_RATE_LIMITER
+    ? rawEnv.ENABLE_NEW_RATE_LIMITER === "true"
+    : isProduction,
+  cacheGetOrComputeEnabled: parseBoolean(rawEnv.ENABLE_CACHE_GET_OR_COMPUTE),
+  loadSheddingEnabled: rawEnv.ENABLE_LOAD_SHEDDING
+    ? rawEnv.ENABLE_LOAD_SHEDDING === "true"
+    : false,
+  bullmqWebhookProcessingEnabled: parseBoolean(rawEnv.ENABLE_BULLMQ_WEBHOOK_PROCESSING),
+  circuitBreakersEnabled: rawEnv.ENABLE_CIRCUIT_BREAKERS
+    ? rawEnv.ENABLE_CIRCUIT_BREAKERS === "true"
+    : false,
+  edgeStrictModeEnabled: parseBoolean(rawEnv.ENABLE_EDGE_STRICT_MODE),
+  bloomGuardsMode: parseBloomGuardsMode(rawEnv.BLOOM_GUARDS_MODE),
   cashFeaturesEnabled:
     parseBoolean(rawEnv.CASH_FEATURES_ENABLED)
     && parseBoolean(rawEnv.FEATURE_CASH_FEATURES),
@@ -105,8 +142,16 @@ if (!rawEnv.DESCOPE_PROJECT_ID?.trim() && !isTest) {
   configErrors.push("DESCOPE_PROJECT_ID is required");
 }
 
-if (featureFlags.rateLimitingEnabled && !rawEnv.REDIS_URL?.trim()) {
-  configErrors.push("REDIS_URL is required when ENABLE_RATE_LIMITING=true");
+if (featureFlags.rateLimitingEnabled && !redisCacheUrl) {
+  configErrors.push("REDIS_CACHE_URL or REDIS_URL is required when ENABLE_RATE_LIMITING=true");
+}
+
+if (featureFlags.rateLimitingEnabled && !rateLimitSecret) {
+  configErrors.push("RATE_LIMIT_SECRET or SESSION_SECRET is required when ENABLE_RATE_LIMITING=true");
+}
+
+if (featureFlags.bullmqWebhookProcessingEnabled && !redisQueueUrl) {
+  configErrors.push("REDIS_QUEUE_URL or REDIS_URL is required when ENABLE_BULLMQ_WEBHOOK_PROCESSING=true");
 }
 
 if (isProduction) {
@@ -170,7 +215,12 @@ export const config = {
   logLevel: rawEnv.LOG_LEVEL,
   appBaseUrl: rawEnv.APP_BASE_URL?.replace(/\/$/, "") ?? null,
   allowedOrigins,
-  trustProxy: isProduction ? rawEnv.TRUST_PROXY_HOPS ?? 1 : false,
+  trustProxy: trustedProxyCidrs.length > 0
+    ? trustedProxyCidrs
+    : isProduction
+      ? rawEnv.TRUST_PROXY_HOPS ?? 1
+      : false,
+  trustedProxyCidrs,
   features: featureFlags,
   processRole,
   runtime: {
@@ -179,10 +229,16 @@ export const config = {
     uploadTimeoutMs: 30_000,
     mediaProxyTimeoutMs: 12_000,
     mediaProxyUpstreamTimeoutMs: 8_000,
+    redisCommandTimeoutMs: 2_000,
+    queueEnqueueTimeoutMs: 2_000,
     jsonBodyLimit: "2mb",
     urlencodedBodyLimit: "1mb",
     uploadBodyLimitBytes: 5 * 1024 * 1024,
     themeImageBodyLimitBytes: 10 * 1024 * 1024,
+    maxJsonDepth: 8,
+    maxJsonArrayItems: 200,
+    maxJsonStringLength: 20_000,
+    maxJsonObjectKeys: 200,
     maxPaginationLimit: 100,
     maxSearchQueryLength: 64,
     maxCollectionSize: 50,
@@ -198,7 +254,16 @@ export const config = {
     totalExpectedSteadyStateMaxConnections: 17,
   },
   redis: {
-    url: rawEnv.REDIS_URL?.trim() ?? null,
+    url: redisCacheUrl,
+    cacheUrl: redisCacheUrl,
+    queueUrl: redisQueueUrl,
+    splitConfigured: Boolean(redisCacheUrl && redisQueueUrl && redisCacheUrl !== redisQueueUrl),
+  },
+  health: {
+    readinessDetailToken: rawEnv.READINESS_DETAIL_TOKEN?.trim() ?? null,
+  },
+  rateLimit: {
+    secret: rateLimitSecret,
   },
   auth: {
     descopeProjectId: rawEnv.DESCOPE_PROJECT_ID?.trim() ?? (isTest ? "test-project" : null),
