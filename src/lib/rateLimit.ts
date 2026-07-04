@@ -2,7 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { createHmac } from "node:crypto";
 import type { AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { config } from "./config.js";
-import { getRedisCache } from "./redis.js";
+import { ensureRedisCacheConnected, getRedisCache } from "./redis.js";
 
 type FailureMode = "open" | "closed";
 type RateLimitDimension = "key" | "ip" | "actor" | "token" | "device" | "target";
@@ -128,6 +128,7 @@ async function consumeRedisGcra(
   windowMs: number,
   max: number,
 ): Promise<RateLimitResult> {
+  await ensureRedisCacheConnected();
   const redis = getRedisCache();
   const nowMs = Date.now();
   const emissionMs = Math.max(1, Math.ceil(windowMs / max));

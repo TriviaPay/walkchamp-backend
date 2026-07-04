@@ -36,7 +36,11 @@ import { config } from "../lib/config.js";
 
 const router = Router();
 
-router.use(requireCashFeaturesEnabled);
+router.use([
+  "/wallet/deposit",
+  "/webhooks/stripe",
+  "/webhooks/razorpay",
+], requireCashFeaturesEnabled);
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const MIN_STRIPE_CENTS = 100;

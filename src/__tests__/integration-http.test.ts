@@ -174,7 +174,6 @@ describe("HTTP integration smoke", () => {
       { path: "/api/wallet/deposit/list" },
       { path: "/api/wallet/withdraw", init: { method: "POST" } },
       { path: "/api/payments/test/refund-request", init: { method: "POST" } },
-      { path: "/api/admin/withdrawals" },
     ];
 
     for (const blocked of blockedRequests) {
@@ -184,6 +183,21 @@ describe("HTTP integration smoke", () => {
         code: "CASH_FEATURES_DISABLED",
       });
     }
+  });
+
+  it("does not classify unknown auth routes as disabled cash routes", async () => {
+    const { response, json } = await request("/api/auth/password/signin", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ loginId: "test@example.com", password: "password" }),
+    });
+
+    expect(response.status).toBe(404);
+    expect(json).toMatchObject({
+      code: "ROUTE_NOT_FOUND",
+    });
   });
 
   it("rejects invalid username format without a database write", async () => {

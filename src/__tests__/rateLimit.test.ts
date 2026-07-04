@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { NextFunction, Request, Response } from "express";
 
 const redisEval = vi.fn();
+const ensureRedisCacheConnected = vi.fn();
 
 vi.mock("../lib/config", () => ({
   config: {
@@ -15,6 +16,7 @@ vi.mock("../lib/config", () => ({
 }));
 
 vi.mock("../lib/redis", () => ({
+  ensureRedisCacheConnected,
   getRedisCache: () => ({
     eval: redisEval,
   }),
@@ -55,6 +57,8 @@ function mockRes(): Response & { headers: Map<string, string>; statusSpy: Return
 describe("createRedisRateLimit", () => {
   beforeEach(() => {
     redisEval.mockReset();
+    ensureRedisCacheConnected.mockReset();
+    ensureRedisCacheConnected.mockResolvedValue(undefined);
   });
 
   it("sets modern and legacy rate-limit headers on Redis success", async () => {
@@ -76,6 +80,7 @@ describe("createRedisRateLimit", () => {
     await limiter(req, res, next);
 
     expect(next).toHaveBeenCalledOnce();
+    expect(ensureRedisCacheConnected).toHaveBeenCalled();
     expect(res.headers.get("ratelimit")).toBe('"unit";r=4;t=1');
     expect(res.headers.get("ratelimit-policy")).toBe('"unit";q=5;w=60');
     expect(res.headers.get("ratelimit-limit")).toBe("5");
