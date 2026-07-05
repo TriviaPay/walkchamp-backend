@@ -27,6 +27,7 @@ import { z } from "zod";
 import { randomBytes } from "crypto";
 import { triggerEvent } from "../lib/pusher.js";
 import { logger } from "../lib/logger.js";
+import { config } from "../lib/config.js";
 import { validateThemeOwnership } from "./trackThemes.js";
 import { grantCoinReward, getRaceWinRewardCode, grantVariableCoinReward } from "../lib/coinRewardService.js";
 import { evaluateAndNotify } from "./achievementHooks.js";
@@ -47,6 +48,20 @@ import {
 import { triggerLiveActivityUpdate } from "../lib/liveActivityUpdateService.js";
 import { liveActivityTokensTable } from "../../db/src/schema/index.js";
 import { firePromotionalRoomHosted, notifyPrivateRoomInvitation } from "../lib/pushNotificationService.js";
+import {
+  buildCashChallengeQuote,
+  buildRewardSplitCents as buildCashRewardSplitCents,
+  calcEntryPoolCents,
+  calcPerPlayerFees,
+  formatQuoteForApi,
+  isAllowedEntryAmountCents,
+  resolvePaymentProvider,
+} from "../lib/cashChallengeFees.js";
+import {
+  debitCashChallengeEntry,
+  hasCompletedEntryPayment,
+  refundCashChallengeEntryToWallet,
+} from "../lib/cashChallengePayments.js";
 
 const router = Router();
 
@@ -207,9 +222,9 @@ export async function cleanupOverdueRaces(): Promise<void> {
 }
 
 // ── Feature flags ─────────────────────────────────────────────────────────────
-/** Coins-only v1: all cash and coin-entry challenge types are hard-disabled. */
-const ENABLE_CASH_CHALLENGES = false;
-const ENABLE_COIN_ENTRY_CHALLENGES = false;
+/** Controlled by CASH_FEATURES_ENABLED + FEATURE_CASH_FEATURES env vars (see config.ts). */
+const ENABLE_CASH_CHALLENGES = config.features.cashFeaturesEnabled;
+const ENABLE_COIN_ENTRY_CHALLENGES = config.features.coinEntryChallengesEnabled;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -245,20 +260,15 @@ const VALID_TARGET_STEPS_BY_GOAL: Record<string, Set<number>> = {
   weekly:  new Set([10000, 20000, 35000, 50000, 70000, 100000]),
   monthly: new Set([50000, 100000, 150000, 200000, 300000, 500000]),
 };
-/** Platform fee % for all paid challenges (20%). */
-const PLATFORM_FEE_PERCENT = 20;
-/** Winner reward % for all paid challenges (80%). */
-const WINNER_REWARD_PERCENT = 100 - PLATFORM_FEE_PERCENT;
+/** Prize pool = entry fees only. Platform/service fees are charged separately at payment. */
+function calcPrizePool(entryAmountCents: number, playerCount: number) {
+  const total = calcEntryPoolCents(entryAmountCents, playerCount);
+  return { total, platformFee: 0, winners: total };
+}
+
 const MAX_PROGRESS_DELTA_FLOOR = 500;
 const MAX_PROGRESS_STEPS_PER_SECOND = 6;
 const MAX_DEVICE_TIME_SKEW_MS = 10 * 60 * 1000;
-
-function calcPrizePool(entryAmountCents: number, playerCount: number) {
-  const total = entryAmountCents * playerCount;
-  const platformFee = Math.round(total * PLATFORM_FEE_PERCENT / 100);
-  const winners = total - platformFee;
-  return { total, platformFee, winners };
-}
 
 /** How many places get prizes based on player count.
  *  2  players → 1 winner (100%)
@@ -271,7 +281,7 @@ function numWinners(playerCount: number): number {
   return 3; // 4+
 }
 
-/** Prize split ratios within the 80% winners pool for USD cash races. */
+/** Prize split ratios for USD cash races — applied to full entry pool. */
 function getPrizeSplits(playerCount: number): number[] {
   const w = numWinners(playerCount);
   if (w === 1) return [1.0];
@@ -304,30 +314,22 @@ function buildCoinRewardSlots(coinWinnersPool: number, playerCount: number): Arr
 /** Structured per-rank prize breakdown for API responses. Empty for free races. */
 function buildRewardSplit(entryAmountCents: number, playerCount: number) {
   if (entryAmountCents === 0 || playerCount < 2) return [];
-  const { winners: winnersPoolCents } = calcPrizePool(entryAmountCents, playerCount);
-  const splits = getPrizeSplits(playerCount);
-  const labels = ["1st", "2nd", "3rd"] as const;
-  return splits.map((s, i) => ({
-    rank: i + 1,
-    label: labels[i],
-    percentage: Math.round(s * 100),
-    amount: parseFloat(((winnersPoolCents / 100) * s).toFixed(2)),
+  const splits = buildCashRewardSplitCents(entryAmountCents, playerCount);
+  return splits.map((s) => ({
+    rank: s.rank,
+    label: s.label,
+    percentage: s.percentage,
+    amount: parseFloat((s.amountCents / 100).toFixed(2)),
     currency: "USD",
   }));
 }
 
-/** Reward split as integer cents — exact integer math, no floats. Rank-1 absorbs any rounding remainder. */
+/** Reward split as integer cents — full entry pool, rank-1 absorbs rounding. */
 function buildRewardSplitCents(entryAmountCents: number, playerCount: number): Array<{ rank: number; amountCents: number }> {
-  if (entryAmountCents === 0 || playerCount < 2) return [];
-  const { winners: winnersPoolCents } = calcPrizePool(entryAmountCents, playerCount);
-  const splits = getPrizeSplits(playerCount);
-  const slots = splits.map((s, i) => ({
-    rank: i + 1,
-    amountCents: Math.floor(winnersPoolCents * s),
+  return buildCashRewardSplitCents(entryAmountCents, playerCount).map((s) => ({
+    rank: s.rank,
+    amountCents: s.amountCents,
   }));
-  const distributed = slots.reduce((sum, s) => sum + s.amountCents, 0);
-  if (slots.length > 0) slots[0].amountCents += winnersPoolCents - distributed;
-  return slots;
 }
 
 interface TieParticipant {
@@ -653,10 +655,8 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   // [PaidRewards] logging for USD paid challenges
   if (isPaidUsd) {
     const participantCount = uniqueParticipants.length;
-    const totalPoolCentsLog = room.entryAmountCents * participantCount;
-    const platformFeePercent = PLATFORM_FEE_PERCENT;
-    const platformFeeCentsLog = Math.round(totalPoolCentsLog * platformFeePercent / 100);
-    const winnerPoolCentsLog = totalPoolCentsLog - platformFeeCentsLog;
+    const totalPoolCentsLog = calcEntryPoolCents(room.entryAmountCents, participantCount);
+    const winnerPoolCentsLog = totalPoolCentsLog;
     const winnerCountLog = numWinners(participantCount);
     const winnersSortedByMs = uniqueParticipants
       .filter((p) => p.finishedAt !== null)
@@ -666,10 +666,8 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     logger.info({ raceId }, "[PaidRewards] challenge id: %s", raceId);
     logger.info({ raceId, entryAmountCents: room.entryAmountCents }, "[PaidRewards] entry amount cents: %d", room.entryAmountCents);
     logger.info({ raceId, participantCount }, "[PaidRewards] participant count: %d", participantCount);
-    logger.info({ raceId, totalPoolCentsLog }, "[PaidRewards] total pool cents: %d", totalPoolCentsLog);
-    logger.info({ raceId, platformFeePercent }, "[PaidRewards] platform fee percent: %d", platformFeePercent);
-    logger.info({ raceId, platformFeeCentsLog }, "[PaidRewards] platform fee cents: %d", platformFeeCentsLog);
-    logger.info({ raceId, winnerPoolCentsLog }, "[PaidRewards] winner pool cents: %d", winnerPoolCentsLog);
+    logger.info({ raceId, totalPoolCentsLog }, "[PaidRewards] entry pool cents: %d", totalPoolCentsLog);
+    logger.info({ raceId, winnerPoolCentsLog }, "[PaidRewards] prize pool cents: %d", winnerPoolCentsLog);
     logger.info({ raceId, winnerCountLog }, "[PaidRewards] winner count: %d", winnerCountLog);
     logger.info({ raceId, winnersSortedByMs }, "[PaidRewards] winners sorted by ms: %j", winnersSortedByMs);
     logger.info({ raceId, payoutAmountsLog }, "[PaidRewards] payout amounts: %j", payoutAmountsLog);
@@ -1660,6 +1658,35 @@ const hostRaceSchema = z.object({
   timezone: z.string().max(100).optional(),
 });
 
+// ── GET /api/races/cash-challenge/payment-quote ───────────────────────────────
+router.get("/races/cash-challenge/payment-quote", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const entryFeeCents = Number(req.query.entryFeeCents ?? req.query.entryFee ?? 0);
+  const numberOfPlayers = Math.max(2, Math.min(10, Number(req.query.numberOfPlayers ?? req.query.playerCount ?? 2)));
+  const countryCode = typeof req.query.countryCode === "string" ? req.query.countryCode : undefined;
+
+  if (!isAllowedEntryAmountCents(entryFeeCents)) {
+    return res.status(400).json({
+      error: "Invalid entry amount. Allowed: $3, $5, $10, $15, $20, $25.",
+    });
+  }
+
+  const [wallet] = await db
+    .select({ availableBalanceCents: walletsTable.availableBalanceCents })
+    .from(walletsTable)
+    .where(eq(walletsTable.userId, userId))
+    .limit(1);
+
+  const provider = resolvePaymentProvider(countryCode);
+  const quote = buildCashChallengeQuote({
+    entryFeeCents,
+    numberOfPlayers,
+    paymentProvider: provider,
+  });
+
+  return res.json(formatQuoteForApi(quote, wallet?.availableBalanceCents ?? 0));
+});
+
 router.post("/races/host", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const parsed = hostRaceSchema.safeParse(req.body);
@@ -1864,6 +1891,50 @@ router.post("/races/host", requireAuth, async (req, res) => {
     entryAmountCents: amountCents,
     isScheduledFuture,
   });
+
+  // Instant paid cash challenge: charge host total payable on confirm (entry + fees).
+  if (amountCents > 0 && !isScheduledFuture && result.participant) {
+    const [profile] = await db
+      .select({ countryCode: profilesTable.countryCode })
+      .from(profilesTable)
+      .where(eq(profilesTable.id, userId))
+      .limit(1);
+    const provider = resolvePaymentProvider(profile?.countryCode);
+    const charge = await db.transaction(async (tx) =>
+      debitCashChallengeEntry(tx, {
+        userId,
+        raceRoomId: result.room.id,
+        entryFeeCents: amountCents,
+        paymentProvider: provider,
+        description: `Cash challenge host entry: ${result.room.title}`,
+      }),
+    );
+    if (!charge.ok) {
+      await db
+        .update(raceRoomsTable)
+        .set({ status: "cancelled", updatedAt: new Date() })
+        .where(eq(raceRoomsTable.id, result.room.id));
+      const fees = calcPerPlayerFees(amountCents, provider);
+      return res.status(402).json({
+        error: charge.error,
+        totalPayable: fees.totalPayableCents / 100,
+        totalPayableCents: fees.totalPayableCents,
+        walletBalance: charge.balanceCents / 100,
+        canAfford: false,
+      });
+    }
+  }
+
+  const paymentQuote =
+    amountCents > 0
+      ? formatQuoteForApi(
+          buildCashChallengeQuote({
+            entryFeeCents: amountCents,
+            numberOfPlayers: maxPlayers,
+          }),
+        )
+      : null;
+
   return res.status(201).json({
     raceId: result.room.id,
     race: result.room,
@@ -1871,6 +1942,7 @@ router.post("/races/host", requireAuth, async (req, res) => {
     isScheduled: isScheduledFuture,
     scheduledStartAt: scheduledStartAt?.toISOString() ?? null,
     ...(inviteCode ? { inviteCode } : {}),
+    ...(paymentQuote ? { paymentQuote } : {}),
   });
 });
 
@@ -1893,7 +1965,7 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
     return res.status(409).json({ error: "Need at least 2 players to start.", code: "insufficient_players" });
   }
 
-  // Charge all joined participants before marking the race in_progress
+  // Charge any joined participants who have not yet paid (legacy / scheduled flows).
   if (room.entryAmountCents > 0) {
     const participants = await db
       .select({ userId: raceParticipantsTable.userId })
@@ -1906,37 +1978,33 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
       );
 
     if (participants.length > 0) {
-      const userIds = participants.map(p => p.userId);
-      const wallets = await db
-        .select()
-        .from(walletsTable)
-        .where(inArray(walletsTable.userId, userIds));
-      const walletMap = new Map(wallets.map(w => [w.userId, w]));
+      const [hostProfile] = await db
+        .select({ countryCode: profilesTable.countryCode })
+        .from(profilesTable)
+        .where(eq(profilesTable.id, room.creatorId))
+        .limit(1);
+      const provider = resolvePaymentProvider(hostProfile?.countryCode);
 
       await db.transaction(async (tx) => {
         for (const p of participants) {
-          const wallet = walletMap.get(p.userId);
-          if (!wallet) continue;
-          await tx
-            .update(walletsTable)
-            .set({
-              availableBalanceCents: sql`GREATEST(${walletsTable.availableBalanceCents} - ${room.entryAmountCents}, 0)`,
-              updatedAt: new Date(),
-            })
-            .where(eq(walletsTable.userId, p.userId));
-          await tx.insert(walletTransactionsTable).values({
+          const paid = await hasCompletedEntryPayment(tx, p.userId, raceId);
+          if (paid) continue;
+          const result = await debitCashChallengeEntry(tx, {
             userId: p.userId,
-            walletId: wallet.id,
-            transactionType: "race_entry_wallet_debit",
-            amountCents: -room.entryAmountCents,
+            raceRoomId: raceId,
+            entryFeeCents: room.entryAmountCents,
+            paymentProvider: provider,
             description: `Entry fee for race: ${room.title}`,
           });
+          if (!result.ok) {
+            throw new Error(result.error);
+          }
         }
       });
 
       req.log.info(
         { raceId, participantCount: participants.length, amountCents: room.entryAmountCents },
-        "entry fees charged at race start",
+        "entry fees charged at race start (unpaid participants only)",
       );
     }
   }
@@ -2037,10 +2105,36 @@ router.post("/races/:id/cancel", requireAuth, async (req, res) => {
   if (room.creatorId !== userId) return res.status(403).json({ error: "Only the host can cancel the room." });
   if (room.status !== "open" && room.status !== "full" && room.status !== "scheduled") return res.status(409).json({ error: "Only open or scheduled rooms can be cancelled." });
 
-  await db
-    .update(raceRoomsTable)
-    .set({ status: "cancelled", updatedAt: new Date() })
-    .where(eq(raceRoomsTable.id, raceId));
+  if (room.entryAmountCents > 0) {
+    const activeParticipants = await db
+      .select({ userId: raceParticipantsTable.userId })
+      .from(raceParticipantsTable)
+      .where(
+        and(
+          eq(raceParticipantsTable.raceRoomId, raceId),
+          ne(raceParticipantsTable.status, "left"),
+        ),
+      );
+    const uniqueUserIds = [...new Set(activeParticipants.map((p) => p.userId))];
+    await db.transaction(async (tx) => {
+      for (const uid of uniqueUserIds) {
+        await refundCashChallengeEntryToWallet(tx, {
+          userId: uid,
+          raceRoomId: raceId,
+          reason: "host_cancelled_room",
+        });
+      }
+      await tx
+        .update(raceRoomsTable)
+        .set({ status: "cancelled", updatedAt: new Date() })
+        .where(eq(raceRoomsTable.id, raceId));
+    });
+  } else {
+    await db
+      .update(raceRoomsTable)
+      .set({ status: "cancelled", updatedAt: new Date() })
+      .where(eq(raceRoomsTable.id, raceId));
+  }
 
   await triggerEvent(`public-live-race-${raceId}`, "race:cancelled", { raceId });
   triggerEvent("public-rooms-available", "room:cancelled", { room_id: raceId }).catch(() => {});
@@ -2090,8 +2184,10 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
     return res.status(404).json({ error: "You are not an active participant in this race." });
   }
 
+  let refundBreakdown: Record<string, unknown> | null = null;
+
   if (room.status === "open" || room.status === "full") {
-    // ── Waiting room: remove from lobby ────────────────────────────────────
+    // ── Waiting room: remove from lobby + refund entry fee to wallet ───────
     await db.transaction(async (tx) => {
       await tx
         .update(raceParticipantsTable)
@@ -2105,6 +2201,26 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
           updatedAt: new Date(),
         })
         .where(eq(raceRoomsTable.id, raceId));
+
+      if (room.entryAmountCents > 0) {
+        const refund = await refundCashChallengeEntryToWallet(tx, {
+          userId,
+          raceRoomId: raceId,
+          reason: leaveReason,
+        });
+        if (refund.ok) {
+          const fees = calcPerPlayerFees(room.entryAmountCents);
+          refundBreakdown = {
+            amountPaid: fees.totalPayableCents / 100,
+            entryFee: room.entryAmountCents / 100,
+            paymentProcessingFee: fees.paymentProcessingFeeCents / 100,
+            platformServiceFee: fees.platformServiceFeeCents / 100,
+            walletRefundAmount: refund.walletRefundAmountCents / 100,
+            refundDestination: "wallet",
+            alreadyRefunded: refund.alreadyRefunded,
+          };
+        }
+      }
     });
 
     await triggerEvent(`public-live-race-${raceId}`, "race:player-left", { userId, raceId });
@@ -2184,6 +2300,81 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
     room_id: raceId,
     participant_status: isForfeited ? "forfeited" : "left",
     can_rejoin: false,
+    ...(refundBreakdown ? { refundBreakdown } : {}),
+  });
+});
+
+// ── POST /api/races/:id/refund-entry ───────────────────────────────────────────
+// Refund entry fee to wallet (pre-start lobby cancel). Idempotent.
+router.post("/races/:id/refund-entry", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const raceId = String(req.params.id);
+
+  const [room] = await db
+    .select()
+    .from(raceRoomsTable)
+    .where(eq(raceRoomsTable.id, raceId))
+    .limit(1);
+
+  if (!room) return res.status(404).json({ error: "Race not found." });
+  if (room.status === "in_progress" || room.status === "completed") {
+    return res.status(409).json({ error: "Refunds are only available before the race starts." });
+  }
+  if (room.entryAmountCents <= 0) {
+    return res.status(400).json({ error: "This is not a paid cash challenge." });
+  }
+
+  const [participant] = await db
+    .select()
+    .from(raceParticipantsTable)
+    .where(
+      and(
+        eq(raceParticipantsTable.raceRoomId, raceId),
+        eq(raceParticipantsTable.userId, userId),
+        ne(raceParticipantsTable.status, "left"),
+      ),
+    )
+    .limit(1);
+
+  if (!participant) {
+    return res.status(404).json({ error: "You are not an active participant in this challenge." });
+  }
+
+  const fees = calcPerPlayerFees(room.entryAmountCents);
+  const result = await db.transaction(async (tx) =>
+    refundCashChallengeEntryToWallet(tx, {
+      userId,
+      raceRoomId: raceId,
+      reason: typeof req.body?.reason === "string" ? req.body.reason : "user_refund",
+    }),
+  );
+
+  if (!result.ok) {
+    return res.status(400).json({ error: result.error });
+  }
+
+  const [wallet] = await db
+    .select({ availableBalanceCents: walletsTable.availableBalanceCents })
+    .from(walletsTable)
+    .where(eq(walletsTable.userId, userId))
+    .limit(1);
+
+  return res.json({
+    success: true,
+    refundBreakdown: {
+      amountPaid: fees.totalPayableCents / 100,
+      amountPaidCents: fees.totalPayableCents,
+      entryFee: fees.entryFeeCents / 100,
+      entryFeeCents: fees.entryFeeCents,
+      paymentProcessingFee: fees.paymentProcessingFeeCents / 100,
+      platformServiceFee: fees.platformServiceFeeCents / 100,
+      walletRefundAmount: result.walletRefundAmountCents / 100,
+      walletRefundAmountCents: result.walletRefundAmountCents,
+      refundDestination: "wallet",
+      alreadyRefunded: result.alreadyRefunded,
+    },
+    walletBalance: (wallet?.availableBalanceCents ?? 0) / 100,
+    walletBalanceCents: wallet?.availableBalanceCents ?? 0,
   });
 });
 
@@ -2347,7 +2538,7 @@ router.get("/races", requireAuth, async (req, res) => {
         prizePool: prizeTotal / 100,
         prizePoolCents: room.prizePoolCents ?? 0,
         winnersPool: winnersPoolCents / 100,
-        platformFee: (prizeTotal - winnersPoolCents) / 100,
+        platformFee: 0,
         prizeTiers,
         rewardSplit,
         winnerCount,
@@ -2623,12 +2814,31 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   if (!profile.paidRaceEnabled) return res.status(403).json({ error: "Paid challenges are not available for your account." });
   if (profile.accountStatus !== "active") return res.status(403).json({ error: "Your account is under review." });
 
-  // Wallet check
+  // Wallet check — require total payable (entry + processing + platform service fees)
   const [wallet] = await db.select().from(walletsTable).where(eq(walletsTable.userId, userId)).limit(1);
   const balance = wallet?.availableBalanceCents ?? 0;
-  if (balance < room.entryAmountCents) {
+  const [profileForFees] = await db
+    .select({ countryCode: profilesTable.countryCode })
+    .from(profilesTable)
+    .where(eq(profilesTable.id, userId))
+    .limit(1);
+  const provider = resolvePaymentProvider(profileForFees?.countryCode);
+  const perPlayerFees = calcPerPlayerFees(room.entryAmountCents, provider);
+  if (balance < perPlayerFees.totalPayableCents) {
     return res.status(402).json({
-      error: `Insufficient balance. You need $${(room.entryAmountCents / 100).toFixed(2)} but have $${(balance / 100).toFixed(2)}.`,
+      error: `Insufficient balance. You need $${(perPlayerFees.totalPayableCents / 100).toFixed(2)} to join this challenge.`,
+      totalPayable: perPlayerFees.totalPayableCents / 100,
+      totalPayableCents: perPlayerFees.totalPayableCents,
+      walletBalance: balance / 100,
+      canAfford: false,
+      ...formatQuoteForApi(
+        buildCashChallengeQuote({
+          entryFeeCents: room.entryAmountCents,
+          numberOfPlayers: room.maxPlayers,
+          paymentProvider: provider,
+        }),
+        balance,
+      ),
     });
   }
 
@@ -2678,6 +2888,20 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
         updatedAt: new Date(),
       })
       .where(eq(raceRoomsTable.id, lockedRoom.id));
+
+    const debit = await debitCashChallengeEntry(tx, {
+      userId,
+      raceRoomId: raceId,
+      entryFeeCents: lockedRoom.entryAmountCents,
+      paymentProvider: provider,
+      description: `Cash challenge join: ${lockedRoom.title}`,
+    });
+    if (!debit.ok) {
+      joinErrorStatus = 402;
+      joinErrorBody = { error: debit.error };
+      return;
+    }
+
     joinedCurrentPlayers = newPlayerCount;
     lockedRoom = { ...lockedRoom, currentPlayers: newPlayerCount, status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers) };
   });
@@ -2692,7 +2916,15 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   await triggerEvent(`public-live-race-${raceId}`, "race:player-joined", { userId, raceId });
   triggerEvent("public-rooms-available", "room:participant_joined", { room_id: raceId, current_players: joinedCurrentPlayers }).catch(() => {});
   req.log.info({ raceId, userId, amountCents: room.entryAmountCents }, "user joined paid race");
-  return res.status(201).json({ participant, isHost: false });
+  const paymentQuote = formatQuoteForApi(
+    buildCashChallengeQuote({
+      entryFeeCents: room.entryAmountCents,
+      numberOfPlayers: room.maxPlayers,
+      paymentProvider: provider,
+    }),
+    balance - perPlayerFees.totalPayableCents,
+  );
+  return res.status(201).json({ participant, isHost: false, paymentQuote });
 });
 
 // ── POST /api/races/:id/join (free only — paid uses payment intent) ───────────
@@ -3456,7 +3688,7 @@ router.get("/races/:id", requireAuth, async (req, res) => {
       entryAmountDollars: room.entryAmountCents / 100,
       prizePool: prizeTotal / 100,
       winnersPool: winnersPoolCents / 100,
-      platformFee: (prizeTotal - winnersPoolCents) / 100,
+      platformFee: 0,
       prizeTiers,
       rewardSplit,
       winnerCount,

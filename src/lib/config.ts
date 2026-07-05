@@ -53,6 +53,7 @@ const envSchema = z
     SESSION_SECRET: z.string().optional(),
     CASH_FEATURES_ENABLED: z.enum(["true", "false"]).optional(),
     FEATURE_CASH_FEATURES: z.enum(["true", "false"]).optional(),
+    FEATURE_COIN_ENTRY_CHALLENGES: z.enum(["true", "false"]).optional(),
     STRIPE_SECRET_KEY: z.string().optional(),
     STRIPE_WEBHOOK_SECRET: z.string().optional(),
     RAZORPAY_KEY_ID: z.string().optional(),
@@ -122,6 +123,7 @@ const featureFlags = {
   cashFeaturesEnabled:
     parseBoolean(rawEnv.CASH_FEATURES_ENABLED)
     && parseBoolean(rawEnv.FEATURE_CASH_FEATURES),
+  coinEntryChallengesEnabled: parseBoolean(rawEnv.FEATURE_COIN_ENTRY_CHALLENGES),
   allowTestRoutes: parseBoolean(rawEnv.ALLOW_TEST_ROUTES),
   allowDemoSeeds: parseBoolean(rawEnv.ALLOW_DEMO_SEEDS),
   mockProvidersEnabled: parseBoolean(rawEnv.MOCK_PROVIDERS_ENABLED),
