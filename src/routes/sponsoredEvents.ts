@@ -559,6 +559,9 @@ router.get("/sponsored-events", requireAuth, async (req, res) => {
         r.scheduledStartAt !== null &&
         now.getTime() >= (r.scheduledStartAt.getTime() - JOIN_WINDOW_MS) &&
         now.getTime() < r.scheduledStartAt.getTime();
+      const registrationOpen = r.status === "scheduled" &&
+        r.scheduledStartAt !== null &&
+        now.getTime() < r.scheduledStartAt.getTime();
 
       return {
         id: r.id,
@@ -581,8 +584,7 @@ router.get("/sponsored-events", requireAuth, async (req, res) => {
         canRegister:
           !myRegRoomIds.has(r.id) &&
           r.registeredCount < r.maxPlayers &&
-          r.status === "scheduled" &&
-          joinWindowOpen,
+          registrationOpen,
         registeredUsers: (registrantsMap.get(r.id) ?? []) as Array<{
           userId: string; username: string; avatarUrl: string | null;
           avatarColor: string; countryFlag: string | null; badge: string;
@@ -710,13 +712,10 @@ router.post("/sponsored-events/:roomId/register", requireAuth, async (req, res) 
       return res.status(409).json({ error: "This event is full." });
     }
 
-    // Registration only opens in the 10-minute window before start
-    const JOIN_WINDOW_MS = 10 * 60 * 1000;
-    if (room.scheduledStartAt) {
-      const msToStart = room.scheduledStartAt.getTime() - now.getTime();
-      if (msToStart > JOIN_WINDOW_MS) {
-        return res.status(409).json({ error: "Registration opens 10 minutes before the race starts." });
-      }
+    // Registration is open for scheduled events until the scheduled start time.
+    // joinWindowOpen remains a UI hint only; it is not the registration gate.
+    if (!room.scheduledStartAt || now.getTime() >= room.scheduledStartAt.getTime()) {
+      return res.status(409).json({ error: "Registration is closed — this event has already started." });
     }
 
     // Check already registered (registered or active)
