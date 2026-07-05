@@ -8,7 +8,7 @@ import {
 import { sendPushToUser } from "./push.js";
 import { requireAdminKey } from "../middleware/requireAdminKey.js";
 import { profilesTable } from "../../db/src/schema/index.js";
-import { eq, and, sql, inArray, lte, or, gte, asc, ne, desc } from "drizzle-orm";
+import { eq, and, sql, inArray, lte, or, gte, gt, asc, ne, desc } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { triggerEvent } from "../lib/pusher.js";
 import { spendCoins, getCoinBalance, recordCoinLedgerEntry } from "../lib/coinsService.js";
@@ -449,7 +449,10 @@ router.get("/sponsored-events", requireAuth, async (req, res) => {
           eq(raceRoomsTable.type, "sponsored"),
           eq(raceRoomsTable.scheduleType, "scheduled"),
           or(
-            eq(raceRoomsTable.status, "scheduled"),
+            and(
+              eq(raceRoomsTable.status, "scheduled"),
+              gt(raceRoomsTable.scheduledStartAt, now),
+            ),
             eq(raceRoomsTable.status, "in_progress"),
             and(
               or(eq(raceRoomsTable.status, "completed"), eq(raceRoomsTable.status, "cancelled")),
