@@ -12,6 +12,7 @@ const APP_QUEUE_NAMES = new Set<AppQueueName>([
   "coin-reconciliation",
   "race-finalization",
   "achievement-evaluation",
+  "refund-processing",
 ]);
 
 export type OutboxEventInput = {

@@ -50,10 +50,11 @@ function walletToDollars(wallet: typeof walletsTable.$inferSelect) {
 }
 
 // Map DB transaction type to frontend type
-function mapTxType(type: string): "reward" | "withdrawal" | "bonus" | "referral" | "race_entry" | "prize" {
+function mapTxType(type: string): "reward" | "withdrawal" | "bonus" | "referral" | "race_entry" | "prize" | "refund" {
   if (type.includes("prize") || type.includes("reward") || type === "sponsored_reward") return "reward";
   if (type.includes("withdrawal")) return "withdrawal";
   if (type === "referral_credit") return "referral";
+  if (type === "race_entry_refund") return "refund";
   if (type === "race_entry_payment" || type === "race_entry_wallet_debit") return "race_entry";
   if (type === "promo_discount") return "bonus";
   return "bonus";

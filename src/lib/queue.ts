@@ -15,7 +15,8 @@ export type AppQueueName =
   | "scheduled-jobs"
   | "coin-reconciliation"
   | "race-finalization"
-  | "achievement-evaluation";
+  | "achievement-evaluation"
+  | "refund-processing";
 
 const queues = new Map<AppQueueName, Queue>();
 const workers: Worker[] = [];

@@ -68,6 +68,10 @@ export const walletTransactionsTable = pgTable("wallet_transactions", {
   challengeId: uuid("challenge_id"),
   paymentId: uuid("payment_id"),
   withdrawalId: uuid("withdrawal_id"),
+  refundId: uuid("refund_id"),
+  refundItemId: uuid("refund_item_id"),
+  balanceBeforeCents: integer("balance_before_cents"),
+  balanceAfterCents: integer("balance_after_cents"),
   metadata: jsonb("metadata"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });

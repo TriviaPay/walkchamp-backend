@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, date, uniqueIndex, boolean, jsonb, index } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, date, uniqueIndex, boolean, jsonb, index, uuid } from "drizzle-orm/pg-core";
 
 // ── Coin Balances ─────────────────────────────────────────────────────────────
 // One row per user. userId is the PK.
@@ -26,6 +26,8 @@ export const coinTransactionsTable = pgTable("coin_transactions", {
   idempotencyKey: text("idempotency_key").notNull(),
   description: text("description").notNull(),
   balanceAfter: integer("balance_after"),
+  refundId: uuid("refund_id"),
+  refundItemId: uuid("refund_item_id"),
   metadata: jsonb("metadata"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [

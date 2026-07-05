@@ -60,8 +60,11 @@ import {
 import {
   debitCashChallengeEntry,
   hasCompletedEntryPayment,
-  refundCashChallengeEntryToWallet,
 } from "../lib/cashChallengePayments.js";
+import {
+  createRefundBatchForRaceCancellation,
+  createRefundForRaceLeave,
+} from "../lib/refundService.js";
 
 const router = Router();
 
@@ -2105,29 +2108,12 @@ router.post("/races/:id/cancel", requireAuth, async (req, res) => {
   if (room.creatorId !== userId) return res.status(403).json({ error: "Only the host can cancel the room." });
   if (room.status !== "open" && room.status !== "full" && room.status !== "scheduled") return res.status(409).json({ error: "Only open or scheduled rooms can be cancelled." });
 
+  let refundBatch: Awaited<ReturnType<typeof createRefundBatchForRaceCancellation>> | null = null;
   if (room.entryAmountCents > 0) {
-    const activeParticipants = await db
-      .select({ userId: raceParticipantsTable.userId })
-      .from(raceParticipantsTable)
-      .where(
-        and(
-          eq(raceParticipantsTable.raceRoomId, raceId),
-          ne(raceParticipantsTable.status, "left"),
-        ),
-      );
-    const uniqueUserIds = [...new Set(activeParticipants.map((p) => p.userId))];
-    await db.transaction(async (tx) => {
-      for (const uid of uniqueUserIds) {
-        await refundCashChallengeEntryToWallet(tx, {
-          userId: uid,
-          raceRoomId: raceId,
-          reason: "host_cancelled_room",
-        });
-      }
-      await tx
-        .update(raceRoomsTable)
-        .set({ status: "cancelled", updatedAt: new Date() })
-        .where(eq(raceRoomsTable.id, raceId));
+    refundBatch = await createRefundBatchForRaceCancellation({
+      raceId,
+      hostUserId: userId,
+      reasonCode: "host_cancelled_room",
     });
   } else {
     await db
@@ -2139,7 +2125,7 @@ router.post("/races/:id/cancel", requireAuth, async (req, res) => {
   await triggerEvent(`public-live-race-${raceId}`, "race:cancelled", { raceId });
   triggerEvent("public-rooms-available", "room:cancelled", { room_id: raceId }).catch(() => {});
   req.log.info({ raceId, userId }, "race room cancelled by host");
-  return res.json({ success: true });
+  return res.json({ success: true, ...(refundBatch ? { refundBatch } : {}) });
 });
 
 // ── POST /api/races/:id/leave ─────────────────────────────────────────────────
@@ -2188,40 +2174,17 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
 
   if (room.status === "open" || room.status === "full") {
     // ── Waiting room: remove from lobby + refund entry fee to wallet ───────
-    await db.transaction(async (tx) => {
-      await tx
-        .update(raceParticipantsTable)
-        .set({ status: "left", completedAt: new Date() })
-        .where(eq(raceParticipantsTable.id, participant.id));
-
-      await tx
-        .update(raceRoomsTable)
-        .set({
-          currentPlayers: sql`GREATEST(${raceRoomsTable.currentPlayers} - 1, 0)`,
-          updatedAt: new Date(),
-        })
-        .where(eq(raceRoomsTable.id, raceId));
-
-      if (room.entryAmountCents > 0) {
-        const refund = await refundCashChallengeEntryToWallet(tx, {
-          userId,
-          raceRoomId: raceId,
-          reason: leaveReason,
-        });
-        if (refund.ok) {
-          const fees = calcPerPlayerFees(room.entryAmountCents);
-          refundBreakdown = {
-            amountPaid: fees.totalPayableCents / 100,
-            entryFee: room.entryAmountCents / 100,
-            paymentProcessingFee: fees.paymentProcessingFeeCents / 100,
-            platformServiceFee: fees.platformServiceFeeCents / 100,
-            walletRefundAmount: refund.walletRefundAmountCents / 100,
-            refundDestination: "wallet",
-            alreadyRefunded: refund.alreadyRefunded,
-          };
-        }
-      }
+    const leaveResult = await createRefundForRaceLeave({
+      raceId,
+      userId,
+      reasonCode: leaveReason,
     });
+    refundBreakdown = {
+      refund: leaveResult.refund,
+      message: leaveResult.refund.succeededCashCents > 0
+        ? "refund completed"
+        : "refund requested and pending review",
+    };
 
     await triggerEvent(`public-live-race-${raceId}`, "race:player-left", { userId, raceId });
     triggerEvent("public-rooms-available", "room:participant_left", { room_id: raceId }).catch(() => {});
@@ -2301,80 +2264,6 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
     participant_status: isForfeited ? "forfeited" : "left",
     can_rejoin: false,
     ...(refundBreakdown ? { refundBreakdown } : {}),
-  });
-});
-
-// ── POST /api/races/:id/refund-entry ───────────────────────────────────────────
-// Refund entry fee to wallet (pre-start lobby cancel). Idempotent.
-router.post("/races/:id/refund-entry", requireAuth, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
-  const raceId = String(req.params.id);
-
-  const [room] = await db
-    .select()
-    .from(raceRoomsTable)
-    .where(eq(raceRoomsTable.id, raceId))
-    .limit(1);
-
-  if (!room) return res.status(404).json({ error: "Race not found." });
-  if (room.status === "in_progress" || room.status === "completed") {
-    return res.status(409).json({ error: "Refunds are only available before the race starts." });
-  }
-  if (room.entryAmountCents <= 0) {
-    return res.status(400).json({ error: "This is not a paid cash challenge." });
-  }
-
-  const [participant] = await db
-    .select()
-    .from(raceParticipantsTable)
-    .where(
-      and(
-        eq(raceParticipantsTable.raceRoomId, raceId),
-        eq(raceParticipantsTable.userId, userId),
-        ne(raceParticipantsTable.status, "left"),
-      ),
-    )
-    .limit(1);
-
-  if (!participant) {
-    return res.status(404).json({ error: "You are not an active participant in this challenge." });
-  }
-
-  const fees = calcPerPlayerFees(room.entryAmountCents);
-  const result = await db.transaction(async (tx) =>
-    refundCashChallengeEntryToWallet(tx, {
-      userId,
-      raceRoomId: raceId,
-      reason: typeof req.body?.reason === "string" ? req.body.reason : "user_refund",
-    }),
-  );
-
-  if (!result.ok) {
-    return res.status(400).json({ error: result.error });
-  }
-
-  const [wallet] = await db
-    .select({ availableBalanceCents: walletsTable.availableBalanceCents })
-    .from(walletsTable)
-    .where(eq(walletsTable.userId, userId))
-    .limit(1);
-
-  return res.json({
-    success: true,
-    refundBreakdown: {
-      amountPaid: fees.totalPayableCents / 100,
-      amountPaidCents: fees.totalPayableCents,
-      entryFee: fees.entryFeeCents / 100,
-      entryFeeCents: fees.entryFeeCents,
-      paymentProcessingFee: fees.paymentProcessingFeeCents / 100,
-      platformServiceFee: fees.platformServiceFeeCents / 100,
-      walletRefundAmount: result.walletRefundAmountCents / 100,
-      walletRefundAmountCents: result.walletRefundAmountCents,
-      refundDestination: "wallet",
-      alreadyRefunded: result.alreadyRefunded,
-    },
-    walletBalance: (wallet?.availableBalanceCents ?? 0) / 100,
-    walletBalanceCents: wallet?.availableBalanceCents ?? 0,
   });
 });
 
@@ -2827,10 +2716,6 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   if (balance < perPlayerFees.totalPayableCents) {
     return res.status(402).json({
       error: `Insufficient balance. You need $${(perPlayerFees.totalPayableCents / 100).toFixed(2)} to join this challenge.`,
-      totalPayable: perPlayerFees.totalPayableCents / 100,
-      totalPayableCents: perPlayerFees.totalPayableCents,
-      walletBalance: balance / 100,
-      canAfford: false,
       ...formatQuoteForApi(
         buildCashChallengeQuote({
           entryFeeCents: room.entryAmountCents,

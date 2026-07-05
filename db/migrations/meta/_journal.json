@@ -43,6 +43,13 @@
       "when": 1781984200000,
       "tag": "0005_hardening_outbox",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1781984800000,
+      "tag": "0006_refund_system",
+      "breakpoints": true
     }
   ]
 }

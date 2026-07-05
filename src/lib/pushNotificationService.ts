@@ -528,6 +528,56 @@ export async function notifyFriendRequestRejected(params: {
   );
 }
 
+export async function notifyFriendRequestReceived(params: {
+  recipientUserId: string;
+  senderUserId: string;
+  senderUsername: string;
+  requestId: string;
+}): Promise<void> {
+  if (params.recipientUserId === params.senderUserId) return;
+  if (await areUsersBlocked(params.recipientUserId, params.senderUserId)) return;
+
+  const deepLink = "walkchamp://chat/requests";
+  await safeSend(
+    params.recipientUserId,
+    "👋 New friend request",
+    `${params.senderUsername} wants to connect with you on Walk Champ.`,
+    {
+      type: "friend_request",
+      requestId: params.requestId,
+      senderUserId: params.senderUserId,
+      senderUsername: params.senderUsername,
+      deepLink,
+    },
+    { url: deepLink, category: "invite", dedupeKey: `friend_request:${params.requestId}` },
+  );
+}
+
+export async function notifyFriendRequestAccepted(params: {
+  senderUserId: string;
+  acceptedByUserId: string;
+  acceptedByUsername: string;
+  requestId: string;
+}): Promise<void> {
+  if (params.senderUserId === params.acceptedByUserId) return;
+  if (await areUsersBlocked(params.senderUserId, params.acceptedByUserId)) return;
+
+  const deepLink = "walkchamp://chat/friends";
+  await safeSend(
+    params.senderUserId,
+    "✅ Friend request accepted",
+    `${params.acceptedByUsername} accepted your friend request. Start walking together!`,
+    {
+      type: "friend_request_accepted",
+      requestId: params.requestId,
+      friendId: params.acceptedByUserId,
+      friendUsername: params.acceptedByUsername,
+      deepLink,
+    },
+    { url: deepLink, category: "invite", dedupeKey: `friend_request_accepted:${params.requestId}` },
+  );
+}
+
 export async function getUsername(userId: string): Promise<string> {
   const [p] = await db
     .select({ username: profilesTable.username })

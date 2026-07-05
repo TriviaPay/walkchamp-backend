@@ -210,4 +210,14 @@ export async function sendNotification(
   });
 }
 
+export async function createInAppNotification(
+  userId: string,
+  type: typeof notificationsTable.$inferInsert["type"],
+  title: string,
+  body: string,
+  data?: Record<string, unknown>,
+): Promise<void> {
+  await db.insert(notificationsTable).values({ userId, type, title, body, data });
+}
+
 export default router;

@@ -1,11 +1,12 @@
 import { logger } from "./lib/logger.js";
-import { runIdempotentJob } from "./lib/queue.js";
+import { runIdempotentJob, startQueueWorker } from "./lib/queue.js";
 import { recomputeCoinProjection } from "./lib/coinsService.js";
 import { db } from "../db/src/index.js";
 import { coinBalancesTable } from "../db/src/schema/index.js";
 import { config } from "./lib/config.js";
 import { startWorkerOwnedRecurringJobs } from "./lib/backgroundJobs.js";
 import { startOutboxDispatcher } from "./lib/outbox.js";
+import { processApprovedRefundJob } from "./lib/refundService.js";
 
 async function reconcileAllCoinBalances() {
   const users = await db.select({ userId: coinBalancesTable.userId }).from(coinBalancesTable);
@@ -35,6 +36,12 @@ async function main() {
   if (config.features.bullmqWebhookProcessingEnabled) {
     logger.info("Starting outbox dispatcher");
     startOutboxDispatcher();
+    startQueueWorker("refund-processing", async (job) => {
+      if (job.name !== "provider_refund.approved") return;
+      const refundItemId = String((job.data.payload as { refundItemId?: unknown } | undefined)?.refundItemId ?? "");
+      if (!refundItemId) throw new Error("refund-processing job missing refundItemId");
+      await processApprovedRefundJob({ refundItemId });
+    }, { concurrency: 2 });
   }
 
   await runIdempotentJob({

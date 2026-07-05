@@ -16,6 +16,7 @@ export * from "./userPreferences.js";
 export * from "./entitlements.js";
 export * from "./voiceSessions.js";
 export * from "./deposits.js";
+export * from "./refunds.js";
 export * from "./groups.js";
 export * from "./friendActivity.js";
 export * from "./cashChallengeConsents.js";

@@ -16,10 +16,82 @@ import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAut
 import { requireAdminRole } from "../middleware/requireAdminRole.js";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
 import { writeAuditLog } from "../lib/auditLog.js";
+import {
+  approveRefund,
+  getRefund,
+  getRefundBatch,
+  listRefunds,
+  rejectRefund,
+} from "../lib/refundService.js";
 
 const router = Router();
 
 router.use("/admin", requireAuth, requireAdminRole);
+
+// ── Refund Administration ────────────────────────────────────────────────────
+router.get("/admin/refunds", async (req, res) => {
+  const status = typeof req.query.status === "string" ? req.query.status : undefined;
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const refunds = await listRefunds({ status, limit, offset });
+  return res.json({ refunds });
+});
+
+router.get("/admin/refunds/:id", async (req, res) => {
+  const refund = await getRefund(String(req.params.id));
+  if (!refund) return res.status(404).json({ error: "Refund not found" });
+  return res.json({ refund });
+});
+
+const approveRefundSchema = z.object({
+  approvedItems: z.array(z.object({
+    refundItemId: z.string().uuid(),
+    approvedAmount: z.number().int().positive().optional(),
+    rejectReason: z.string().min(3).max(500).optional(),
+  })).optional(),
+});
+
+router.post("/admin/refunds/:id/approve", async (req, res) => {
+  const parsed = approveRefundSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "Invalid request", details: parsed.error.issues });
+  try {
+    const refund = await approveRefund({
+      refundId: String(req.params.id),
+      adminUserId: (req as unknown as AuthenticatedRequest).descopeUserId,
+      approvedItems: parsed.data.approvedItems,
+    });
+    return res.json({ refund });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Approval failed";
+    if (message === "REFUND_NOT_FOUND") return res.status(404).json({ error: "Refund not found" });
+    return res.status(400).json({ error: message });
+  }
+});
+
+const rejectRefundSchema = z.object({ reason: z.string().min(3).max(500) });
+
+router.post("/admin/refunds/:id/reject", async (req, res) => {
+  const parsed = rejectRefundSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "reason is required" });
+  try {
+    const refund = await rejectRefund({
+      refundId: String(req.params.id),
+      adminUserId: (req as unknown as AuthenticatedRequest).descopeUserId,
+      reason: parsed.data.reason,
+    });
+    return res.json({ refund });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Rejection failed";
+    if (message === "REFUND_NOT_FOUND") return res.status(404).json({ error: "Refund not found" });
+    return res.status(400).json({ error: message });
+  }
+});
+
+router.get("/admin/refund-batches/:id", async (req, res) => {
+  const batch = await getRefundBatch(String(req.params.id));
+  if (!batch) return res.status(404).json({ error: "Refund batch not found" });
+  return res.json({ batch });
+});
 
 // ── GET /api/admin/stats ──────────────────────────────────────────────────────
 router.get("/admin/stats", async (_req, res) => {

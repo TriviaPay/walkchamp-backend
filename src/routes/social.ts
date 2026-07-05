@@ -11,11 +11,15 @@ import {
 } from "../../db/src/schema/index.js";
 import { eq, and, or, desc, inArray, sql, gte, ne } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
-import { sendNotification } from "./notifications.js";
+import { createInAppNotification } from "./notifications.js";
 import { triggerEvent } from "../lib/pusher.js";
 import { z } from "zod";
 import { grantCoinReward } from "../lib/coinRewardService.js";
-import { notifyFriendRequestRejected } from "../lib/pushNotificationService.js";
+import {
+  notifyFriendRequestAccepted,
+  notifyFriendRequestReceived,
+  notifyFriendRequestRejected,
+} from "../lib/pushNotificationService.js";
 
 const router = Router();
 
@@ -206,11 +210,11 @@ router.post("/friends/request", requireAuth, async (req, res) => {
     .where(eq(profilesTable.id, userId))
     .limit(1);
 
-  sendNotification(
+  createInAppNotification(
     targetId,
     "friend_request",
-    "Friend request received",
-    `@${senderProfile?.username ?? "Someone"} sent you a friend request`,
+    "👋 New friend request",
+    `${senderProfile?.username ?? "Someone"} wants to connect with you on Walk Champ.`,
     {
       requestId: request.id,
       senderUserId: userId,
@@ -218,6 +222,12 @@ router.post("/friends/request", requireAuth, async (req, res) => {
       deepLink: "walkchamp://chat/requests",
     },
   ).catch(() => {});
+  void notifyFriendRequestReceived({
+    recipientUserId: targetId,
+    senderUserId: userId,
+    senderUsername: senderProfile?.username ?? "Someone",
+    requestId: request.id,
+  });
 
   const senderSummary = {
     id: userId,
@@ -295,11 +305,11 @@ router.post("/friends/accept", requireAuth, async (req, res) => {
 
   req.log.info({ requestId: request.id, senderId: request.senderId, receiverId: userId }, "friend request accepted — friendship rows inserted for both directions");
 
-  sendNotification(
+  createInAppNotification(
     request.senderId,
     "friend_request_accepted",
-    "Friend request accepted",
-    `@${receiverProfile?.username ?? "Someone"} accepted your friend request`,
+    "✅ Friend request accepted",
+    `${receiverProfile?.username ?? "Someone"} accepted your friend request. Start walking together!`,
     {
       requestId: request.id,
       friendId: userId,
@@ -307,19 +317,12 @@ router.post("/friends/accept", requireAuth, async (req, res) => {
       deepLink: "walkchamp://chat/friends",
     },
   ).catch(() => {});
-
-  sendNotification(
-    userId,
-    "friend_request_accepted",
-    "You're now friends",
-    `You and @${senderProfile?.username ?? "Someone"} are now friends`,
-    {
-      requestId: request.id,
-      friendId: request.senderId,
-      friendUsername: senderProfile?.username ?? "Someone",
-      deepLink: "walkchamp://chat/friends",
-    },
-  ).catch(() => {});
+  void notifyFriendRequestAccepted({
+    senderUserId: request.senderId,
+    acceptedByUserId: userId,
+    acceptedByUsername: receiverProfile?.username ?? "Someone",
+    requestId: request.id,
+  });
 
   const acceptPayload = {
     requestId: request.id,

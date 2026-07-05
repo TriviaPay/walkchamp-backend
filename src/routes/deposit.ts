@@ -33,6 +33,7 @@ import { createHmac } from "crypto";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
 import { lockDepositTransactionById, lockWalletByUserId, type DbTx } from "../lib/raceIntegrity.js";
 import { config } from "../lib/config.js";
+import { recordProviderRefundWebhook } from "../lib/refundService.js";
 
 const router = Router();
 
@@ -1206,6 +1207,19 @@ router.post("/webhooks/razorpay", async (req, res) => {
     ));
 
   try {
+    if (eventType.startsWith("refund.")) {
+      const payload = body.payload as { refund?: { entity?: Record<string, unknown> } } | undefined;
+      const refundEntity = payload?.refund?.entity ?? {};
+      const providerRefundId = typeof refundEntity.id === "string" ? refundEntity.id : null;
+      await recordProviderRefundWebhook({
+        provider: "razorpay",
+        providerEventId: eventId,
+        eventType,
+        providerRefundId,
+        payload: refundEntity,
+      });
+    }
+
     if (eventType === "payment.captured" || eventType === "order.paid") {
       const payload = body.payload as {
         order?: { entity?: { id?: string } };

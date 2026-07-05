@@ -26,6 +26,12 @@ import {
   type DbTx,
 } from "../lib/raceIntegrity.js";
 import { config } from "../lib/config.js";
+import {
+  createRefundForPaymentRequest,
+  createRefundForPaymentRecordTx,
+  getLatestRefundForSource,
+  recordProviderRefundWebhook,
+} from "../lib/refundService.js";
 
 const router = Router();
 
@@ -85,10 +91,6 @@ function getPaymentMetadata(payment: typeof paymentsTable.$inferSelect): Record<
   return ((payment.metadata as Record<string, unknown> | null) ?? {});
 }
 
-function hasRefundRequested(payment: typeof paymentsTable.$inferSelect): boolean {
-  return getPaymentMetadata(payment).refundRequested === true;
-}
-
 async function ensureLockedWallet(tx: DbTx, userId: string, currency: string) {
   let wallet = await lockWalletByUserId(tx, userId);
   if (!wallet) {
@@ -98,25 +100,13 @@ async function ensureLockedWallet(tx: DbTx, userId: string, currency: string) {
   return wallet;
 }
 
-async function creditWalletRefund(tx: DbTx, payment: typeof paymentsTable.$inferSelect, reason: string) {
-  const wallet = await ensureLockedWallet(tx, payment.userId, payment.currency);
-  await tx
-    .update(walletsTable)
-    .set({
-      availableBalanceCents: sql`${walletsTable.availableBalanceCents} + ${payment.amountCents}`,
-      updatedAt: new Date(),
-    })
-    .where(eq(walletsTable.id, wallet.id));
-
-  await tx.insert(walletTransactionsTable).values({
-    walletId: wallet.id,
+async function requestProviderRefundForPayment(tx: DbTx, payment: typeof paymentsTable.$inferSelect, reason: string) {
+  await createRefundForPaymentRecordTx(tx, {
+    payment: { ...payment, status: "succeeded" },
     userId: payment.userId,
-    transactionType: "race_entry_refund",
-    amountCents: payment.amountCents,
-    currency: payment.currency,
-    status: "completed",
-    description: reason,
-    paymentId: payment.id,
+    reasonCode: reason,
+    requestSource: "payment_webhook_auto_refund",
+    idempotencyKey: `payment_auto_refund:${payment.id}:${reason.replace(/[^a-zA-Z0-9_-]/g, "_")}`,
   });
 }
 
@@ -393,6 +383,22 @@ router.post(
       ));
 
     try {
+      if (event.type.startsWith("refund.") || event.type === "charge.refunded") {
+        const obj = event.data.object as unknown as Record<string, unknown>;
+        const providerRefundId = typeof obj.id === "string" && obj.id.startsWith("re_")
+          ? obj.id
+          : typeof obj.refund === "string"
+            ? obj.refund
+            : null;
+        await recordProviderRefundWebhook({
+          provider: "stripe",
+          providerEventId: event.id,
+          eventType: event.type,
+          providerRefundId,
+          payload: obj,
+        });
+      }
+
       if (event.type === "payment_intent.succeeded") {
         const pi = event.data.object as StripePaymentIntent;
         const meta = pi.metadata;
@@ -415,7 +421,7 @@ router.post(
             const room = await lockRaceRoom(tx, raceId);
 
             if (!room || (room.status !== "open" && room.status !== "full") || room.currentPlayers >= room.maxPlayers) {
-              await creditWalletRefund(tx, lockedPayment, "Race entry refunded — race full or cancelled");
+              await requestProviderRefundForPayment(tx, lockedPayment, "Race entry refunded — race full or cancelled");
               await tx
                 .update(paymentsTable)
                 .set({
@@ -434,7 +440,7 @@ router.post(
             const promoResult = await settlePromoRedemption(tx, lockedPayment);
 
             if (!promoResult.ok) {
-              await creditWalletRefund(tx, lockedPayment, "Race entry refunded — promo code could not be fulfilled");
+              await requestProviderRefundForPayment(tx, lockedPayment, "Race entry refunded — promo code could not be fulfilled");
               await tx
                 .update(paymentsTable)
                 .set({
@@ -457,7 +463,7 @@ router.post(
             });
 
             if (participantResult.reason === "blocked" || participantResult.reason === "already_joined") {
-              await creditWalletRefund(tx, lockedPayment, "Race entry refunded — duplicate or blocked participation");
+              await requestProviderRefundForPayment(tx, lockedPayment, "Race entry refunded — duplicate or blocked participation");
               await tx
                 .update(paymentsTable)
                 .set({
@@ -546,6 +552,7 @@ router.get("/payments/:id", requireAuth, async (req, res) => {
     .limit(1);
 
   if (!payment) return res.status(404).json({ error: "Payment not found" });
+  const refund = await getLatestRefundForSource("payment", payment.id, userId);
 
   return res.json({
     payment: {
@@ -553,7 +560,8 @@ router.get("/payments/:id", requireAuth, async (req, res) => {
       amount: payment.amountCents / 100,
       currency: payment.currency,
       status: payment.status,
-      refundRequested: hasRefundRequested(payment),
+      refundRequested: Boolean(refund),
+      refund,
       paymentType: payment.paymentType,
       raceRoomId: payment.raceRoomId,
       createdAt: payment.createdAt,
@@ -565,36 +573,22 @@ router.get("/payments/:id", requireAuth, async (req, res) => {
 router.post("/payments/:id/refund-request", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const paymentId = String(req.params.id);
+  const reasonCode = typeof req.body?.reason === "string" ? req.body.reason : "user_request";
 
-  const [payment] = await db
-    .select()
-    .from(paymentsTable)
-    .where(and(eq(paymentsTable.id, paymentId), eq(paymentsTable.userId, userId)))
-    .limit(1);
-
-  if (!payment) return res.status(404).json({ error: "Payment not found" });
-  if (payment.status !== "succeeded") {
-    return res.status(400).json({ error: "Only succeeded payments can be refunded." });
+  try {
+    const refund = await createRefundForPaymentRequest({ paymentId, userId, reasonCode });
+    return res.json({
+      message: "Refund requested and pending review.",
+      refund,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Refund request failed";
+    if (message === "PAYMENT_NOT_FOUND") return res.status(404).json({ error: "Payment not found" });
+    if (message === "PAYMENT_NOT_REFUNDABLE") return res.status(400).json({ error: "Only succeeded payments can be refunded." });
+    if (message === "PAYMENT_PROVIDER_MISSING") return res.status(400).json({ error: "Payment provider reference is missing." });
+    req.log.error({ err, paymentId, userId }, "payment refund request failed");
+    return res.status(500).json({ error: "Failed to request refund." });
   }
-  if (hasRefundRequested(payment)) {
-    return res.json({ message: "Refund request already submitted for admin review." });
-  }
-
-  // Store refund request in metadata for admin review
-  await db
-    .update(paymentsTable)
-    .set({
-      metadata: {
-        ...getPaymentMetadata(payment),
-        refundRequested: true,
-        refundRequestedAt: new Date().toISOString(),
-        refundReason: req.body.reason ?? "user_request",
-      },
-      updatedAt: new Date(),
-    })
-    .where(eq(paymentsTable.id, payment.id));
-
-  return res.json({ message: "Refund request submitted for admin review." });
 });
 
 export default router;
