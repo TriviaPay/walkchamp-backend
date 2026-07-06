@@ -48,6 +48,7 @@ export function buildCashChallengeQuote(input: {
   const fees = calcPerPlayerFees(input.entryFeeCents, provider);
   return {
     paymentProvider: provider,
+    numberOfPlayers: input.numberOfPlayers,
     entryFeeCents: fees.entryFeeCents,
     paymentProcessingFeeCents: fees.paymentProcessingFeeCents,
     platformServiceFeeCents: fees.platformServiceFeeCents,
@@ -60,8 +61,11 @@ export function buildCashChallengeQuote(input: {
 export function formatQuoteForApi(quote: ReturnType<typeof buildCashChallengeQuote>, walletBalanceCents = 0) {
   return {
     paymentProvider: quote.paymentProvider,
+    numberOfPlayers: quote.numberOfPlayers,
     entryFee: quote.entryFeeCents / 100,
     entryFeeCents: quote.entryFeeCents,
+    entryPool: quote.prizePoolCents / 100,
+    entryPoolCents: quote.prizePoolCents,
     paymentProcessingFee: quote.paymentProcessingFeeCents / 100,
     paymentProcessingFeeCents: quote.paymentProcessingFeeCents,
     platformServiceFee: quote.platformServiceFeeCents / 100,
@@ -78,5 +82,9 @@ export function formatQuoteForApi(quote: ReturnType<typeof buildCashChallengeQuo
     walletBalance: walletBalanceCents / 100,
     walletBalanceCents,
     canAfford: walletBalanceCents >= quote.totalPayableCents,
+    walletRefundAmount: quote.entryFeeCents / 100,
+    walletRefundAmountCents: quote.entryFeeCents,
+    refundDestination: "wallet" as const,
+    currency: "usd" as const,
   };
 }

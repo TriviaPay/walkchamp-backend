@@ -386,6 +386,11 @@ router.post("/friends/reject", requireAuth, async (req, res) => {
     requestId: request.id,
   });
 
+  triggerEvent(`private-user-${request.senderId}`, "friend_request:rejected", {
+    requestId: request.id,
+    otherUserId: userId,
+  }).catch(() => {});
+
   return res.json({ ok: true });
 });
 
@@ -441,16 +446,29 @@ router.post("/friends/cancel", requireAuth, async (req, res) => {
   const parsed = z.object({ requestId: z.string().min(1) }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "requestId required" });
 
-  await db
-    .update(friendRequestsTable)
-    .set({ status: "rejected", updatedAt: new Date() })
+  const [request] = await db
+    .select()
+    .from(friendRequestsTable)
     .where(
       and(
         eq(friendRequestsTable.id, parsed.data.requestId),
         eq(friendRequestsTable.senderId, userId),
         eq(friendRequestsTable.status, "pending"),
       ),
-    );
+    )
+    .limit(1);
+
+  if (!request) return res.status(404).json({ error: "Request not found" });
+
+  await db
+    .update(friendRequestsTable)
+    .set({ status: "rejected", updatedAt: new Date() })
+    .where(eq(friendRequestsTable.id, request.id));
+
+  triggerEvent(`private-user-${request.recipientId}`, "friend_request:rejected", {
+    requestId: request.id,
+    otherUserId: userId,
+  }).catch(() => {});
 
   return res.json({ ok: true });
 });

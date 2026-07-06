@@ -1,0 +1,55 @@
+# Render.com blueprint — optional one-click deploy
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: walkchamp-api
+    runtime: node
+    plan: starter
+    buildCommand: pnpm install --frozen-lockfile && pnpm run build
+    startCommand: pnpm run start
+    healthCheckPath: /api/healthz
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 8080
+      - key: NEON_DATABASE_URL
+        sync: false
+      - key: DESCOPE_PROJECT_ID
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: APP_BASE_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: CASH_FEATURES_ENABLED
+        value: false
+      - key: REDIS_URL
+        sync: false
+      - key: ADMIN_SERVICE_KEY
+        sync: false
+      - key: ADMIN_USER_IDS
+        sync: false
+  - type: worker
+    name: walkchamp-worker
+    runtime: node
+    plan: starter
+    buildCommand: pnpm install --frozen-lockfile && pnpm run build
+    startCommand: pnpm run worker
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NEON_DATABASE_URL
+        sync: false
+      - key: DESCOPE_PROJECT_ID
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: RUN_BACKGROUND_JOBS
+        value: true
+      - key: CASH_FEATURES_ENABLED
+        value: false

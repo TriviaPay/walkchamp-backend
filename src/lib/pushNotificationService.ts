@@ -322,6 +322,7 @@ export async function notifyChatMessageReceived(params: {
 }
 
 // ── Private room invite ───────────────────────────────────────────────────────
+// DISABLED: Race-Private Room Invitation push (temporarily removed from product)
 
 export async function notifyPrivateRoomInvitation(params: {
   roomId: string;
@@ -332,7 +333,10 @@ export async function notifyPrivateRoomInvitation(params: {
   invitedUserId: string;
   roomInviteId: string;
 }): Promise<void> {
-  const { roomId, roomCode, challengeType, inviterUserId, inviterUsername, invitedUserId, roomInviteId } =
+  void params;
+  return;
+
+  /* const { roomId, roomCode, challengeType, inviterUserId, inviterUsername, invitedUserId, roomInviteId } =
     params;
 
   if (inviterUserId === invitedUserId) return;
@@ -359,13 +363,18 @@ export async function notifyPrivateRoomInvitation(params: {
       category: "invite",
       dedupeKey: `private_room_invite:${roomInviteId}`,
     },
-  );
+  ); */
 }
 
 // ── Promotional (eligible users with active devices + race updates on) ────────
+// DISABLED: Host-Rooms Available Now push (temporarily removed from product)
 
 export async function notifyPromotionalRoomsAvailable(roomsCount: number, excludeUserId?: string): Promise<void> {
-  if (roomsCount <= 0) return;
+  void roomsCount;
+  void excludeUserId;
+  return;
+
+  /* if (roomsCount <= 0) return;
   const recipients = await filterDedupedRecipients(
     await getPromotionalRecipientIds(excludeUserId),
     `promo_rooms_available:${roomsCount}`,
@@ -379,15 +388,20 @@ export async function notifyPromotionalRoomsAvailable(roomsCount: number, exclud
     `${roomsCount} rooms are open. Join a challenge before they fill up!`,
     { type: "promotional_rooms_available", roomsCount, deepLink },
     { url: deepLink, category: "race", dedupeKey: `promo_rooms_available:${roomsCount}` },
-  );
+  ); */
 }
+
+// DISABLED: Host-Free Challenge Available push (temporarily removed from product)
 
 export async function notifyPromotionalFreeChallenge(params: {
   roomId: string;
   challengeType: string;
   hostUserId: string;
 }): Promise<void> {
-  const dedupeKey = `promo_free_challenge:${params.roomId}`;
+  void params;
+  return;
+
+  /* const dedupeKey = `promo_free_challenge:${params.roomId}`;
   const recipients = await filterDedupedRecipients(await getPromotionalRecipientIds(params.hostUserId), dedupeKey);
   if (recipients.length === 0) return;
 
@@ -398,15 +412,20 @@ export async function notifyPromotionalFreeChallenge(params: {
     `A new ${params.challengeType} room is open. Join now and start walking!`,
     { type: "promotional_free_challenge", roomId: params.roomId, challengeType: params.challengeType, deepLink },
     { url: deepLink, category: "race", dedupeKey },
-  );
+  ); */
 }
+
+// DISABLED: Host-Coins Battle Open push (temporarily removed from product)
 
 export async function notifyPromotionalCoinsBattle(params: {
   roomId: string;
   coinsEntry: number;
   hostUserId: string;
 }): Promise<void> {
-  const dedupeKey = `promo_coins_battle:${params.roomId}`;
+  void params;
+  return;
+
+  /* const dedupeKey = `promo_coins_battle:${params.roomId}`;
   const recipients = await filterDedupedRecipients(await getPromotionalRecipientIds(params.hostUserId), dedupeKey);
   if (recipients.length === 0) return;
 
@@ -417,15 +436,20 @@ export async function notifyPromotionalCoinsBattle(params: {
     `Join a ${params.coinsEntry} coins battle and compete for the prize pool.`,
     { type: "promotional_coins_battle", roomId: params.roomId, coinsEntry: params.coinsEntry, deepLink },
     { url: deepLink, category: "race", dedupeKey },
-  );
+  ); */
 }
+
+// DISABLED: Host-Cash Challenge Open push (temporarily removed from product)
 
 export async function notifyPromotionalCashChallenge(params: {
   roomId: string;
   entryFee: string;
   hostUserId: string;
 }): Promise<void> {
-  const dedupeKey = `promo_cash_challenge:${params.roomId}`;
+  void params;
+  return;
+
+  /* const dedupeKey = `promo_cash_challenge:${params.roomId}`;
   const recipients = await filterDedupedRecipients(await getPromotionalRecipientIds(params.hostUserId), dedupeKey);
   if (recipients.length === 0) return;
 
@@ -436,7 +460,7 @@ export async function notifyPromotionalCashChallenge(params: {
     `A ${params.entryFee} skill-based walking challenge is available. Review and join now.`,
     { type: "promotional_cash_challenge", roomId: params.roomId, entryFee: params.entryFee, deepLink },
     { url: deepLink, category: "race", dedupeKey },
-  );
+  ); */
 }
 
 export async function notifyPromotionalSponsoredEvent(params: {

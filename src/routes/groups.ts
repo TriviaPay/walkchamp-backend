@@ -78,11 +78,32 @@ async function getProfile(userId: string) {
       fullName: profilesTable.fullName,
       avatarUrl: profilesTable.avatarUrl,
       countryCode: profilesTable.countryCode,
+      updatedAt: profilesTable.updatedAt,
     })
     .from(profilesTable)
     .where(eq(profilesTable.id, userId))
     .limit(1);
-  return p ?? null;
+  return p ? toPublicProfile(p) : null;
+}
+
+function toPublicProfile(p: {
+  id: string;
+  username: string;
+  fullName?: string | null;
+  avatarUrl?: string | null;
+  avatarColor?: string | null;
+  countryCode?: string | null;
+  updatedAt?: Date | null;
+}) {
+  return {
+    id: p.id,
+    username: p.username,
+    fullName: p.fullName ?? null,
+    avatarUrl: p.avatarUrl ?? null,
+    ...(p.avatarColor !== undefined ? { avatarColor: p.avatarColor ?? null } : {}),
+    countryCode: p.countryCode ?? null,
+    avatarVersion: p.updatedAt?.getTime() ?? 0,
+  };
 }
 
 async function getActiveGroupMembersCount(groupId: string): Promise<number> {
@@ -214,6 +235,7 @@ router.get("/groups/overview", requireAuth, async (req, res) => {
         username: profilesTable.username,
         avatarUrl: profilesTable.avatarUrl,
         avatarColor: profilesTable.avatarColor,
+        updatedAt: profilesTable.updatedAt,
       })
       .from(profilesTable)
       .where(inArray(profilesTable.id, allMemberIds))
@@ -226,13 +248,14 @@ router.get("/groups/overview", requireAuth, async (req, res) => {
     if (!membersByGroupId[m.groupId]) membersByGroupId[m.groupId] = [];
     membersByGroupId[m.groupId].push(m);
   }
-  const memberAvatarsPerGroup: Record<string, { userId: string; username: string; avatarUrl: string | null; avatarColor: string | null }[]> = {};
+  const memberAvatarsPerGroup: Record<string, { userId: string; username: string; avatarUrl: string | null; avatarColor: string | null; avatarVersion: number }[]> = {};
   for (const gId of groupIds) {
     memberAvatarsPerGroup[gId] = (membersByGroupId[gId] ?? []).slice(0, 5).map((m) => ({
       userId: m.userId,
       username: allMemberProfileMap[m.userId]?.username ?? "?",
       avatarUrl: allMemberProfileMap[m.userId]?.avatarUrl ?? null,
       avatarColor: allMemberProfileMap[m.userId]?.avatarColor ?? null,
+      avatarVersion: allMemberProfileMap[m.userId]?.updatedAt?.getTime() ?? 0,
     }));
   }
 
@@ -351,6 +374,7 @@ router.get("/groups/overview", requireAuth, async (req, res) => {
           userId: tw.userId,
           username: allMemberProfileMap[tw.userId]?.username ?? "Unknown",
           avatarUrl: allMemberProfileMap[tw.userId]?.avatarUrl ?? null,
+          avatarVersion: allMemberProfileMap[tw.userId]?.updatedAt?.getTime() ?? 0,
           steps: tw.steps,
         }
         : null,
@@ -496,18 +520,20 @@ router.get("/groups/:groupId", requireAuth, async (req, res) => {
     .where(and(eq(walkingGroupMembersTable.groupId, groupId), eq(walkingGroupMembersTable.status, "active")));
 
   const memberUserIds = members.map((m) => m.userId);
-  let profiles: { id: string; username: string; fullName: string | null; avatarUrl: string | null; countryCode: string | null }[] = [];
+  let profiles: ReturnType<typeof toPublicProfile>[] = [];
   if (memberUserIds.length > 0) {
-    profiles = await db
+    const rawProfiles = await db
       .select({
         id: profilesTable.id,
         username: profilesTable.username,
         fullName: profilesTable.fullName,
         avatarUrl: profilesTable.avatarUrl,
         countryCode: profilesTable.countryCode,
+        updatedAt: profilesTable.updatedAt,
       })
       .from(profilesTable)
       .where(inArray(profilesTable.id, memberUserIds));
+    profiles = rawProfiles.map(toPublicProfile);
   }
   const profileMap = Object.fromEntries(profiles.map((p) => [p.id, p]));
 
@@ -606,10 +632,11 @@ router.get("/groups/:groupId", requireAuth, async (req, res) => {
           fullName: profilesTable.fullName,
           avatarUrl: profilesTable.avatarUrl,
           countryCode: profilesTable.countryCode,
+          updatedAt: profilesTable.updatedAt,
         })
         .from(profilesTable)
         .where(inArray(profilesTable.id, invUserIds));
-      const ipMap = Object.fromEntries(invProfiles.map((p) => [p.id, p]));
+      const ipMap = Object.fromEntries(invProfiles.map((p) => [p.id, toPublicProfile(p)]));
       pendingGroupInvites = rawInvites.map((inv) => ({ ...inv, invitedProfile: ipMap[inv.invitedUserId] ?? null }));
     }
   }
@@ -980,18 +1007,20 @@ router.get("/groups/:groupId/leaderboard", requireAuth, async (req, res) => {
   const memberUserIds = members.map((m) => m.userId);
   const roleMap = Object.fromEntries(members.map((m) => [m.userId, m.role]));
 
-  let profiles: { id: string; username: string; fullName: string | null; avatarUrl: string | null; countryCode: string | null }[] = [];
+  let profiles: ReturnType<typeof toPublicProfile>[] = [];
   if (memberUserIds.length > 0) {
-    profiles = await db
+    const rawProfiles = await db
       .select({
         id: profilesTable.id,
         username: profilesTable.username,
         fullName: profilesTable.fullName,
         avatarUrl: profilesTable.avatarUrl,
         countryCode: profilesTable.countryCode,
+        updatedAt: profilesTable.updatedAt,
       })
       .from(profilesTable)
       .where(inArray(profilesTable.id, memberUserIds));
+    profiles = rawProfiles.map(toPublicProfile);
   }
   const profileMap = Object.fromEntries(profiles.map((p) => [p.id, p]));
 
