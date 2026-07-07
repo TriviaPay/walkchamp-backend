@@ -6,16 +6,19 @@
 import { db } from "../../db/src/index.js";
 import {
   blockedUsersTable,
+  groupDailyGoalNotificationEventsTable,
   notificationDevicesTable,
+  notificationsTable,
   pushNotificationLogsTable,
-  raceRoomsTable,
   userNotificationPreferencesTable,
+  userPreferencesTable,
   walkingGroupMembersTable,
   walkingGroupsTable,
   profilesTable,
 } from "../../db/src/schema/index.js";
 import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
 import { sendPushToUser, sendPushToUsers, type PushCategory } from "../routes/push.js";
+import { logger } from "./logger.js";
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
@@ -56,18 +59,6 @@ async function filterDedupedRecipients(userIds: string[], dedupeKey: string): Pr
     if (!(await wasRecentlySent(uid, dedupeKey))) out.push(uid);
   }
   return out;
-}
-
-function entryTypeDisplay(entryType: string, entryAmountCents = 0): string {
-  const map: Record<string, string> = {
-    free: "Free",
-    paid_1: "$1",
-    paid_3: "$3",
-    paid_5: "$5",
-    paid_usd: `$${entryAmountCents / 100}`,
-    coins_battle: "Coins Battle",
-  };
-  return map[entryType] ?? entryType;
 }
 
 async function safeSend(
@@ -138,6 +129,222 @@ async function getPromotionalRecipientIds(excludeUserId?: string, cap = 500): Pr
 }
 
 // ── Walking groups ────────────────────────────────────────────────────────────
+
+export interface GroupDailyGoalNotificationResult {
+  groupsFound: number;
+  eventsCreated: number;
+  sentGroups: number;
+  skippedDuplicate: number;
+  skippedNoRecipients: number;
+  failedGroups: number;
+}
+
+async function getEligibleGroupGoalRecipientIds(
+  completedUserId: string,
+  groupId: string,
+): Promise<string[]> {
+  const memberRows = await db
+    .select({ userId: walkingGroupMembersTable.userId })
+    .from(walkingGroupMembersTable)
+    .where(
+      and(
+        eq(walkingGroupMembersTable.groupId, groupId),
+        eq(walkingGroupMembersTable.status, "active"),
+      ),
+    );
+
+  let recipientIds = [...new Set(memberRows.map((m) => m.userId).filter((id) => id !== completedUserId))];
+  if (recipientIds.length === 0) return [];
+
+  const prefRows = await db
+    .select({
+      userId: userPreferencesTable.userId,
+      receiveFriendActivityNotifications: userPreferencesTable.receiveFriendActivityNotifications,
+    })
+    .from(userPreferencesTable)
+    .where(inArray(userPreferencesTable.userId, recipientIds));
+  const prefMap = new Map(prefRows.map((p) => [p.userId, p]));
+  recipientIds = recipientIds.filter((id) => prefMap.get(id)?.receiveFriendActivityNotifications !== false);
+  if (recipientIds.length === 0) return [];
+
+  const blockedRows = await db
+    .select({ blockerId: blockedUsersTable.blockerId, blockedId: blockedUsersTable.blockedId })
+    .from(blockedUsersTable)
+    .where(
+      or(
+        and(eq(blockedUsersTable.blockerId, completedUserId), inArray(blockedUsersTable.blockedId, recipientIds)),
+        and(inArray(blockedUsersTable.blockerId, recipientIds), eq(blockedUsersTable.blockedId, completedUserId)),
+      ),
+    );
+
+  const blockedRecipientIds = new Set<string>();
+  for (const row of blockedRows) {
+    blockedRecipientIds.add(row.blockerId === completedUserId ? row.blockedId : row.blockerId);
+  }
+
+  return recipientIds.filter((id) => !blockedRecipientIds.has(id));
+}
+
+export async function notifyGroupsOnDailyGoalCompletion(params: {
+  completedUserId: string;
+  currentSteps: number;
+  goalSteps: number;
+  localDate: string;
+  timezone: string;
+}): Promise<GroupDailyGoalNotificationResult> {
+  const { completedUserId, currentSteps, goalSteps, localDate, timezone } = params;
+  const result: GroupDailyGoalNotificationResult = {
+    groupsFound: 0,
+    eventsCreated: 0,
+    sentGroups: 0,
+    skippedDuplicate: 0,
+    skippedNoRecipients: 0,
+    failedGroups: 0,
+  };
+
+  try {
+    logger.info({ userId: completedUserId, localDate }, "[GroupGoalNotification] checkStarted");
+
+    const [profile] = await db
+      .select({ username: profilesTable.username })
+      .from(profilesTable)
+      .where(eq(profilesTable.id, completedUserId))
+      .limit(1);
+    const username = profile?.username ?? "Someone";
+
+    const groupRows = await db
+      .select({ groupId: walkingGroupsTable.id, groupName: walkingGroupsTable.groupName })
+      .from(walkingGroupMembersTable)
+      .innerJoin(walkingGroupsTable, eq(walkingGroupMembersTable.groupId, walkingGroupsTable.id))
+      .where(
+        and(
+          eq(walkingGroupMembersTable.userId, completedUserId),
+          eq(walkingGroupMembersTable.status, "active"),
+          eq(walkingGroupsTable.status, "active"),
+        ),
+      );
+
+    result.groupsFound = groupRows.length;
+    logger.info(
+      { userId: completedUserId, localDate, todaySteps: currentSteps, dailyGoal: goalSteps, groupsFound: result.groupsFound },
+      "[GroupGoalNotification] groupsFound",
+    );
+
+    for (const group of groupRows) {
+      const deepLink = `walkchamp://walking-groups/${group.groupId}`;
+      const notificationType = "group_daily_goal_completed" as const;
+      const dedupeKey = `group_daily_goal_completed:${completedUserId}:${group.groupId}:${localDate}`;
+      const title = "🏆 Daily Goal Completed";
+      const body = `${username} completed their daily goal in ${group.groupName}!`;
+      const dataPayload: Record<string, unknown> = {
+        type: notificationType,
+        groupId: group.groupId,
+        completedUserId,
+        username,
+        groupName: group.groupName,
+        deepLink,
+        dedupeKey,
+      };
+
+      try {
+        const recipientIds = await getEligibleGroupGoalRecipientIds(completedUserId, group.groupId);
+        logger.info(
+          {
+            userId: completedUserId,
+            groupId: group.groupId,
+            recipientsCount: recipientIds.length,
+            excludedCompletedUser: true,
+          },
+          "[GroupGoalNotification] recipientsSelected",
+        );
+
+        const inserted = await db
+          .insert(groupDailyGoalNotificationEventsTable)
+          .values({
+            completedUserId,
+            groupId: group.groupId,
+            localDate,
+            timezone,
+            recipientUserIds: recipientIds,
+            title,
+            body,
+            dataPayload,
+            status: recipientIds.length === 0 ? "skipped_no_recipients" : "pending",
+          })
+          .onConflictDoNothing()
+          .returning({ id: groupDailyGoalNotificationEventsTable.id });
+
+        if (inserted.length === 0) {
+          result.skippedDuplicate++;
+          logger.info(
+            { userId: completedUserId, groupId: group.groupId, localDate, alreadySent: true },
+            "[GroupGoalNotification] duplicateSkipped",
+          );
+          continue;
+        }
+
+        result.eventsCreated++;
+
+        if (recipientIds.length === 0) {
+          result.skippedNoRecipients++;
+          logger.info(
+            { userId: completedUserId, groupId: group.groupId, skippedNoRecipients: true },
+            "[GroupGoalNotification] skippedNoRecipients",
+          );
+          continue;
+        }
+
+        await db.insert(notificationsTable).values(
+          recipientIds.map((userId) => ({
+            userId,
+            type: notificationType,
+            title,
+            body,
+            data: dataPayload,
+          })),
+        );
+
+        const delivery = await sendPushToUsers(recipientIds, title, body, dataPayload, {
+          url: deepLink,
+          dedupeKey,
+        });
+
+        const status =
+          delivery.batches.length > 0 && delivery.batches.every((batch) => batch.status === "sent")
+            ? "sent"
+            : delivery.skippedReason ?? "failed";
+
+        await db
+          .update(groupDailyGoalNotificationEventsTable)
+          .set({
+            status,
+            providerResponse: delivery as unknown as Record<string, unknown>,
+            sentAt: status === "sent" ? new Date() : undefined,
+            updatedAt: new Date(),
+          })
+          .where(eq(groupDailyGoalNotificationEventsTable.id, inserted[0].id));
+
+        if (status === "sent") {
+          result.sentGroups++;
+        } else {
+          result.failedGroups++;
+        }
+
+        logger.info(
+          { userId: completedUserId, groupId: group.groupId, recipientsCount: recipientIds.length, sent: status === "sent" },
+          "[GroupGoalNotification] sendCompleted",
+        );
+      } catch (err) {
+        result.failedGroups++;
+        logger.warn({ err, userId: completedUserId, groupId: group.groupId }, "[GroupGoalNotification] groupFailed");
+      }
+    }
+  } catch (err) {
+    logger.warn({ err, userId: completedUserId }, "[GroupGoalNotification] notificationFailed");
+  }
+
+  return result;
+}
 
 export async function notifyWalkingGroupInviteReceived(params: {
   invitedUserId: string;
@@ -463,6 +670,8 @@ export async function notifyPromotionalCashChallenge(params: {
   ); */
 }
 
+// ── Promotional sponsored events ──────────────────────────────────────────────
+
 export async function notifyPromotionalSponsoredEvent(params: {
   eventId: string;
   eventName: string;
@@ -490,47 +699,6 @@ export async function notifyPromotionalSponsoredEvent(params: {
     },
     { url: deepLink, category: "race", dedupeKey },
   );
-}
-
-/** Fire promotional pushes when a public room is hosted (non-scheduled). */
-export async function firePromotionalRoomHosted(params: {
-  roomId: string;
-  entryType: string;
-  isPrivate: boolean;
-  hostUserId: string;
-  coinEntryAmount?: number;
-  entryAmountCents?: number;
-  isScheduledFuture?: boolean;
-}): Promise<void> {
-  if (params.isPrivate || params.isScheduledFuture) return;
-
-  const [countRow] = await db
-    .select({ count: sql<number>`count(*)::int` })
-    .from(raceRoomsTable)
-    .where(and(eq(raceRoomsTable.status, "open"), eq(raceRoomsTable.isPrivate, false)));
-
-  const roomsCount = countRow?.count ?? 0;
-  void notifyPromotionalRoomsAvailable(roomsCount, params.hostUserId);
-
-  if (params.entryType === "free") {
-    void notifyPromotionalFreeChallenge({
-      roomId: params.roomId,
-      challengeType: "Free",
-      hostUserId: params.hostUserId,
-    });
-  } else if (params.entryType === "coins_battle" && params.coinEntryAmount) {
-    void notifyPromotionalCoinsBattle({
-      roomId: params.roomId,
-      coinsEntry: params.coinEntryAmount,
-      hostUserId: params.hostUserId,
-    });
-  } else if (["paid_1", "paid_3", "paid_5", "paid_usd"].includes(params.entryType)) {
-    void notifyPromotionalCashChallenge({
-      roomId: params.roomId,
-      entryFee: entryTypeDisplay(params.entryType, params.entryAmountCents ?? 0),
-      hostUserId: params.hostUserId,
-    });
-  }
 }
 
 export async function notifyFriendRequestRejected(params: {

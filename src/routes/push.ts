@@ -96,6 +96,19 @@ export interface PushSendOptions {
   dedupeKey?: string;
 }
 
+export interface PushDeliveryBatchSummary {
+  userIds: string[];
+  status: "sent" | "failed";
+  onesignalResponse?: Record<string, unknown>;
+}
+
+export interface PushDeliverySummary {
+  requestedUserIds: string[];
+  eligibleUserIds: string[];
+  batches: PushDeliveryBatchSummary[];
+  skippedReason?: "no_config" | "no_recipients" | "no_eligible_recipients";
+}
+
 async function isPushAllowedForUser(userId: string, category?: PushCategory): Promise<boolean> {
   const [prefs] = await db
     .select({
@@ -206,20 +219,33 @@ export async function sendPushToUsers(
   body: string,
   data?: Record<string, unknown>,
   options?: PushSendOptions,
-): Promise<void> {
+): Promise<PushDeliverySummary> {
   const oneSignalKey = process.env.ONESIGNAL_REST_API_KEY;
   const oneSignalAppId = process.env.ONESIGNAL_APP_ID;
-  if (!oneSignalKey || !oneSignalAppId) return;
+  const unique = [...new Set(userIds.filter(Boolean))];
+  const summary: PushDeliverySummary = {
+    requestedUserIds: unique,
+    eligibleUserIds: [],
+    batches: [],
+  };
+
+  if (!oneSignalKey || !oneSignalAppId) {
+    return { ...summary, skippedReason: "no_config" };
+  }
 
   const notificationType = String(data?.type ?? "notification");
-  const unique = [...new Set(userIds.filter(Boolean))];
-  if (unique.length === 0) return;
+  if (unique.length === 0) {
+    return { ...summary, skippedReason: "no_recipients" };
+  }
 
   const eligible: string[] = [];
   for (const uid of unique) {
     if (await isPushAllowedForUser(uid, options?.category)) eligible.push(uid);
   }
-  if (eligible.length === 0) return;
+  summary.eligibleUserIds = eligible;
+  if (eligible.length === 0) {
+    return { ...summary, skippedReason: "no_eligible_recipients" };
+  }
 
   const payloadData = { ...(data ?? {}), dedupeKey: options?.dedupeKey };
   const BATCH = 2000;
@@ -255,6 +281,8 @@ export async function sendPushToUsers(
       status = "failed";
     }
 
+    summary.batches.push({ userIds: batch, status, onesignalResponse });
+
     await Promise.all(
       batch.map((userId) =>
         db.insert(pushNotificationLogsTable).values({
@@ -269,6 +297,8 @@ export async function sendPushToUsers(
       ),
     );
   }
+
+  return summary;
 }
 
 export default router;

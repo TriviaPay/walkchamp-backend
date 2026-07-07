@@ -1,6 +1,6 @@
 import { pgTable, text, timestamp, boolean, pgEnum, index, uniqueIndex } from "drizzle-orm/pg-core";
 
-export const friendStatusEnum = pgEnum("friend_status", ["pending", "accepted", "rejected", "blocked"]);
+export const friendStatusEnum = pgEnum("friend_status", ["pending", "accepted", "rejected", "canceled", "blocked"]);
 export const friendRequestDirectionEnum = pgEnum("friend_request_direction", ["sent", "received"]);
 
 // ── Friends table ─────────────────────────────────────────────────────────────

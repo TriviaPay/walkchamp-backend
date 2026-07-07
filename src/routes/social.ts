@@ -443,34 +443,65 @@ router.get("/friends/status", requireAuth, async (req, res) => {
 // ── POST /api/friends/cancel ─────────────────────────────────────────────────
 router.post("/friends/cancel", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
-  const parsed = z.object({ requestId: z.string().min(1) }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: "requestId required" });
+  const parsed = z
+    .object({
+      requestId: z.string().min(1).optional(),
+      targetUserId: z.string().min(1).optional(),
+    })
+    .refine((data) => data.requestId || data.targetUserId, {
+      message: "requestId or targetUserId required",
+    })
+    .safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "requestId or targetUserId required" });
+  }
+  if (parsed.data.targetUserId === userId) {
+    return res.status(400).json({ error: "Cannot cancel request to yourself" });
+  }
+
+  const matchRequest = parsed.data.requestId
+    ? eq(friendRequestsTable.id, parsed.data.requestId)
+    : eq(friendRequestsTable.recipientId, parsed.data.targetUserId!);
 
   const [request] = await db
-    .select()
-    .from(friendRequestsTable)
+    .update(friendRequestsTable)
+    .set({ status: "canceled", updatedAt: new Date() })
     .where(
       and(
-        eq(friendRequestsTable.id, parsed.data.requestId),
+        matchRequest,
         eq(friendRequestsTable.senderId, userId),
         eq(friendRequestsTable.status, "pending"),
       ),
     )
-    .limit(1);
+    .returning({
+      id: friendRequestsTable.id,
+      senderId: friendRequestsTable.senderId,
+      recipientId: friendRequestsTable.recipientId,
+      status: friendRequestsTable.status,
+    });
 
-  if (!request) return res.status(404).json({ error: "Request not found" });
+  if (!request) {
+    return res.status(404).json({ error: "Pending sent friend request not found" });
+  }
 
-  await db
-    .update(friendRequestsTable)
-    .set({ status: "rejected", updatedAt: new Date() })
-    .where(eq(friendRequestsTable.id, request.id));
-
-  triggerEvent(`private-user-${request.recipientId}`, "friend_request:rejected", {
+  const payload = {
     requestId: request.id,
-    otherUserId: userId,
-  }).catch(() => {});
+    senderId: request.senderId,
+    recipientId: request.recipientId,
+    canceledAt: new Date().toISOString(),
+  };
 
-  return res.json({ ok: true });
+  triggerEvent(`private-user-${request.recipientId}`, "friend_request:canceled", payload).catch(() => {});
+  triggerEvent(`private-user-${userId}`, "friend_request:canceled", payload).catch(() => {});
+
+  return res.json({
+    ok: true,
+    request: {
+      id: request.id,
+      status: request.status,
+      recipientId: request.recipientId,
+    },
+  });
 });
 
 // ── POST /api/friends/remove ─────────────────────────────────────────────────

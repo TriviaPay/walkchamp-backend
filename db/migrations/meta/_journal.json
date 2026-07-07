@@ -50,6 +50,20 @@
       "when": 1781984800000,
       "tag": "0006_refund_system",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1781985400000,
+      "tag": "0007_friend_request_cancel",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1781986000000,
+      "tag": "0008_group_daily_goal_notifications",
+      "breakpoints": true
     }
   ]
 }

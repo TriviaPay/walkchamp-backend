@@ -1,4 +1,4 @@
-import { pgTable, text, timestamp, boolean, jsonb, pgEnum, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, jsonb, pgEnum, index, uniqueIndex, date } from "drizzle-orm/pg-core";
 
 export const pushNotificationStatusEnum = pgEnum("push_notification_status", [
   "sent",
@@ -25,6 +25,7 @@ export const notificationTypeEnum = pgEnum("notification_type", [
   "followed_player_started_race",
   "country_battle_update",
   "friend_daily_goal_completed",
+  "group_daily_goal_completed",
 ]);
 
 // ── In-app notifications ───────────────────────────────────────────────────────
@@ -105,5 +106,35 @@ export const pushNotificationLogsTable = pgTable(
   (t) => [
     index("push_notif_logs_user_idx").on(t.userId),
     index("push_notif_logs_created_idx").on(t.createdAt),
+  ],
+);
+
+// ── Group daily goal notification idempotency events ─────────────────────────
+export const groupDailyGoalNotificationEventsTable = pgTable(
+  "group_daily_goal_notification_events",
+  {
+    id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+    completedUserId: text("completed_user_id").notNull(),
+    groupId: text("group_id").notNull(),
+    localDate: date("local_date").notNull(),
+    timezone: text("timezone").notNull().default("UTC"),
+    recipientUserIds: jsonb("recipient_user_ids").$type<string[]>().notNull().default([]),
+    title: text("title").notNull(),
+    body: text("body").notNull(),
+    dataPayload: jsonb("data_payload").$type<Record<string, unknown>>().notNull().default({}),
+    status: text("status").notNull().default("pending"),
+    providerResponse: jsonb("provider_response").$type<Record<string, unknown>>(),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("group_goal_notif_completed_group_date_unique_idx").on(
+      t.completedUserId,
+      t.groupId,
+      t.localDate,
+    ),
+    index("group_goal_notif_completed_user_idx").on(t.completedUserId),
+    index("group_goal_notif_group_date_idx").on(t.groupId, t.localDate),
   ],
 );

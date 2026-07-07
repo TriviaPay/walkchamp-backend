@@ -176,17 +176,19 @@ export async function registerOrReviveScheduledRegistration(
   tx: DbTx,
   raceRoomId: string,
   userId: string,
+  opts: { registeredAt?: Date } = {},
 ): Promise<{
   changed: boolean;
   reason: "inserted" | "revived" | "already_registered";
   registration: typeof scheduledRoomRegistrationsTable.$inferSelect;
 }> {
+  const registeredAt = opts.registeredAt ?? new Date();
   const existing = await lockScheduledRegistration(tx, raceRoomId, userId);
 
   if (!existing) {
     const [registration] = await tx
       .insert(scheduledRoomRegistrationsTable)
-      .values({ raceRoomId, userId, status: "registered" })
+      .values({ raceRoomId, userId, status: "registered", registeredAt })
       .returning();
 
     return { changed: true, reason: "inserted", registration };
@@ -197,6 +199,7 @@ export async function registerOrReviveScheduledRegistration(
       .update(scheduledRoomRegistrationsTable)
       .set({
         status: "registered",
+        registeredAt,
         activatedAt: null,
         cancelledAt: null,
       })

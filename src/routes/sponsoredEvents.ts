@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { db } from "../../db/src/index.js";
 import {
+  coinBalancesTable,
   raceRoomsTable,
   scheduledRoomRegistrationsTable,
   raceParticipantsTable,
@@ -11,10 +12,10 @@ import { profilesTable } from "../../db/src/schema/index.js";
 import { eq, and, sql, inArray, lte, or, gte, gt, asc, ne, desc } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { triggerEvent } from "../lib/pusher.js";
-import { spendCoins, getCoinBalance, recordCoinLedgerEntry } from "../lib/coinsService.js";
+import { getCoinBalance, recordCoinLedgerEntry } from "../lib/coinsService.js";
 import { grantVariableCoinReward } from "../lib/coinRewardService.js";
 import { logger } from "../lib/logger.js";
-import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration } from "../lib/raceIntegrity.js";
+import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration, registerOrReviveScheduledRegistration } from "../lib/raceIntegrity.js";
 import { notifyPromotionalSponsoredEvent } from "../lib/pushNotificationService.js";
 
 const router = Router();
@@ -78,27 +79,6 @@ function getUpcomingWeekends(count = 2): Array<{ sat: Date; sun: Date }> {
   return weekends;
 }
 
-
-async function refundCoins(userId: string, amount: number, roomId: string, description: string) {
-  try {
-    await db.transaction(async (tx) => {
-      await recordCoinLedgerEntry(tx, {
-        userId,
-        amount,
-        transactionType: "refund",
-        source: "sponsored_event_refund",
-        sourceId: roomId,
-        rewardCode: null,
-        reasonCode: "sponsored_event_refund",
-        idempotencyKey: `sponsored-refund:${userId}:${roomId}:${amount}`,
-        description,
-        metadata: { roomId },
-      });
-    });
-  } catch (err) {
-    logger.error({ err, userId, roomId }, "[SponsoredEvents] refundCoins failed");
-  }
-}
 
 // ── Background: auto-generate the next 8 weekends (~2 months) of events ───────
 // Idempotent — skips events that already exist (keyed by inviteCode).
@@ -689,109 +669,117 @@ router.post("/sponsored-events/:roomId/register", requireAuth, async (req, res) 
   req.log.info({ userId, roomId }, "[SponsoredEvents] register clicked");
 
   try {
-    // Load event
-    const [room] = await db
-      .select()
-      .from(raceRoomsTable)
-      .where(
-        and(
-          eq(raceRoomsTable.id, roomId),
-          eq(raceRoomsTable.type, "sponsored"),
-        ),
-      )
-      .limit(1);
+    const result = await db.transaction(async (tx) => {
+      const room = await lockRaceRoom(tx, roomId);
 
-    if (!room) return res.status(404).json({ error: "Event not found." });
+      if (!room || room.type !== "sponsored") {
+        return { status: 404 as const, body: { error: "Event not found." } };
+      }
 
-    const now = new Date();
-    const RACE_DURATION_MS = 3 * 60 * 60 * 1000;
+      const now = new Date();
 
-    // Registration only allowed for scheduled (not yet started) events
-    if (room.status !== "scheduled") {
-      return res.status(409).json({ error: "Registration is closed — this event has already started." });
-    }
+      // Registration only allowed for scheduled events before their start time.
+      if (room.status !== "scheduled" || !room.scheduledStartAt || now.getTime() >= room.scheduledStartAt.getTime()) {
+        return { status: 409 as const, body: { error: "Registration is closed — this event has already started." } };
+      }
 
-    if (room.registeredCount >= room.maxPlayers) {
-      return res.status(409).json({ error: "This event is full." });
-    }
+      if (room.registeredCount >= room.maxPlayers) {
+        return { status: 409 as const, body: { error: "This event is full." } };
+      }
 
-    // Registration is open for scheduled events until the scheduled start time.
-    // joinWindowOpen remains a UI hint only; it is not the registration gate.
-    if (!room.scheduledStartAt || now.getTime() >= room.scheduledStartAt.getTime()) {
-      return res.status(409).json({ error: "Registration is closed — this event has already started." });
-    }
+      await tx
+        .insert(coinBalancesTable)
+        .values({ userId, currentBalance: 0, lifetimeEarned: 0, lifetimeSpent: 0 })
+        .onConflictDoNothing();
 
-    // Check already registered (registered or active)
-    const existing = await db
-      .select({ id: scheduledRoomRegistrationsTable.id })
-      .from(scheduledRoomRegistrationsTable)
-      .where(
-        and(
-          eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
-          eq(scheduledRoomRegistrationsTable.userId, userId),
-          inArray(scheduledRoomRegistrationsTable.status, ["registered", "active"]),
-        ),
-      )
-      .limit(1);
+      const [balance] = await tx
+        .select({ currentBalance: coinBalancesTable.currentBalance })
+        .from(coinBalancesTable)
+        .where(eq(coinBalancesTable.userId, userId))
+        .limit(1)
+        .for("update");
 
-    if (existing.length > 0) return res.status(409).json({ error: "You are already registered for this event." });
+      const currentBalance = balance?.currentBalance ?? 0;
+      if (currentBalance < ENTRY_COINS) {
+        return {
+          status: 402 as const,
+          body: {
+            error: `You need ${ENTRY_COINS.toLocaleString()} coins to register. You have ${currentBalance.toLocaleString()} coins.`,
+            coinsNeeded: ENTRY_COINS - currentBalance,
+            currentBalance,
+          },
+        };
+      }
 
-    // Deduct coins immediately at registration time
-    const spendResult = await spendCoins({
-      userId,
-      amount: ENTRY_COINS,
-      source: "sponsored_event_entry",
-      sourceId: roomId,
-      description: `Entry fee: ${room.title}`,
-    });
+      const registeredAt = new Date();
+      const registrationResult = await registerOrReviveScheduledRegistration(tx, roomId, userId, { registeredAt });
 
-    if (!spendResult.success) {
-      const balance = await getCoinBalance(userId);
-      return res.status(402).json({
-        error: `You need ${ENTRY_COINS.toLocaleString()} coins to register. You have ${balance.currentBalance.toLocaleString()} coins.`,
-        coinsNeeded: ENTRY_COINS - balance.currentBalance,
-        currentBalance: balance.currentBalance,
-      });
-    }
+      if (!registrationResult.changed) {
+        return { status: 409 as const, body: { error: "You are already registered for this event." } };
+      }
 
-    // Create registration and increment count
-    const newCount = room.registeredCount + 1;
-    await db.transaction(async (tx) => {
-      await tx.insert(scheduledRoomRegistrationsTable).values({
-        raceRoomId: roomId,
-        userId,
-        status: "registered",
-      });
+      const newCount = room.registeredCount + 1;
       await tx
         .update(raceRoomsTable)
         .set({ registeredCount: newCount, updatedAt: new Date() })
         .where(eq(raceRoomsTable.id, roomId));
+
+      const debit = await recordCoinLedgerEntry(tx, {
+        userId,
+        amount: -ENTRY_COINS,
+        transactionType: "spend",
+        source: "sponsored_event_entry",
+        sourceId: roomId,
+        rewardCode: null,
+        reasonCode: "sponsored_event_entry",
+        idempotencyKey: `sponsored-entry:${userId}:${roomId}:${registrationResult.registration.id}:${registeredAt.getTime()}`,
+        description: `Entry fee: ${room.title}`,
+        metadata: { roomId, registrationId: registrationResult.registration.id },
+      });
+
+      return {
+        status: 200 as const,
+        body: {
+          success: true,
+          registered: true,
+          registeredCount: newCount,
+          coinBalance: debit.newBalance,
+        },
+        room,
+        newCount,
+      };
     });
+
+    if (result.status !== 200) {
+      return res.status(result.status).json(result.body);
+    }
 
     req.log.info({ userId, roomId }, "[SponsoredEvents] registered — coins deducted immediately");
 
     // Broadcast slot update
     triggerEvent(PUSHER_CHANNEL, "sponsored_event.registration_updated", {
       room_id: roomId,
-      registered_count: newCount,
-      max_slots: room.maxPlayers,
+      registered_count: result.newCount,
+      max_slots: result.room.maxPlayers,
     }).catch(() => {});
 
-    const updatedBalance = await getCoinBalance(userId);
+    triggerEvent(`private-user-${userId}`, "wallet.updated", {
+      type: "coins_spent",
+      reason: "sponsored_event_entry",
+      coins: ENTRY_COINS,
+      changeAmount: -ENTRY_COINS,
+      coinBalance: result.body.coinBalance,
+      description: `Entry fee: ${result.room.title}`,
+    }).catch(() => {});
 
     sendPushToUser(
       userId,
       "🎟️ Registered!",
-      `You're in for ${room.title}! ${ENTRY_COINS.toLocaleString()} coins deducted. Leave anytime before start for a full refund.`,
+      `You're in for ${result.room.title}! ${ENTRY_COINS.toLocaleString()} coins deducted. Leave anytime before start for a full refund.`,
       { type: "sponsored_event_registered", room_id: roomId },
     );
 
-    return res.json({
-      success: true,
-      registered: true,
-      registeredCount: newCount,
-      coinBalance: updatedBalance.currentBalance,
-    });
+    return res.json(result.body);
   } catch (err) {
     req.log.error({ err }, "[SponsoredEvents] register failed");
     return res.status(500).json({ error: "Registration failed. Please try again." });
@@ -804,36 +792,23 @@ router.post("/sponsored-events/:roomId/cancel-registration", requireAuth, async 
   const roomId = String(req.params.roomId);
 
   try {
-    const [room] = await db
-      .select()
-      .from(raceRoomsTable)
-      .where(and(eq(raceRoomsTable.id, roomId), eq(raceRoomsTable.type, "sponsored")))
-      .limit(1);
+    const result = await db.transaction(async (tx) => {
+      const room = await lockRaceRoom(tx, roomId);
+      if (!room || room.type !== "sponsored") {
+        return { status: 404 as const, body: { error: "Event not found." } };
+      }
 
-    if (!room) return res.status(404).json({ error: "Event not found." });
+      const reg = await lockScheduledRegistration(tx, roomId, userId);
+      if (!reg || reg.status !== "registered") {
+        return { status: 404 as const, body: { error: "Registration not found." } };
+      }
 
-    const [reg] = await db
-      .select()
-      .from(scheduledRoomRegistrationsTable)
-      .where(
-        and(
-          eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
-          eq(scheduledRoomRegistrationsTable.userId, userId),
-          eq(scheduledRoomRegistrationsTable.status, "registered"),
-        ),
-      )
-      .limit(1);
+      const now = new Date();
+      if (room.scheduledStartAt && room.scheduledStartAt <= now) {
+        return { status: 409 as const, body: { error: "Cannot cancel after the event has started." } };
+      }
 
-    if (!reg) return res.status(404).json({ error: "Registration not found." });
-
-    const now = new Date();
-    if (room.scheduledStartAt && room.scheduledStartAt <= now) {
-      return res.status(409).json({ error: "Cannot cancel after the event has started." });
-    }
-
-    // Refund coins — coins were charged at registration time
-    const newCount = Math.max(0, room.registeredCount - 1);
-    await db.transaction(async (tx) => {
+      const newCount = Math.max(0, room.registeredCount - 1);
       await tx
         .update(scheduledRoomRegistrationsTable)
         .set({ status: "cancelled", cancelledAt: now })
@@ -842,28 +817,56 @@ router.post("/sponsored-events/:roomId/cancel-registration", requireAuth, async 
         .update(raceRoomsTable)
         .set({ registeredCount: newCount, updatedAt: new Date() })
         .where(eq(raceRoomsTable.id, roomId));
+
+      const refund = await recordCoinLedgerEntry(tx, {
+        userId,
+        amount: ENTRY_COINS,
+        transactionType: "refund",
+        source: "sponsored_event_refund",
+        sourceId: roomId,
+        rewardCode: null,
+        reasonCode: "sponsored_event_refund",
+        idempotencyKey: `sponsored-refund:${userId}:${roomId}:${reg.id}:${now.getTime()}`,
+        description: `Refund: left ${room.title} before start`,
+        metadata: { roomId, registrationId: reg.id },
+      });
+
+      return {
+        status: 200 as const,
+        body: { success: true, coinBalance: refund.newBalance },
+        room,
+        newCount,
+      };
     });
 
-    // Refund the entry fee
-    await refundCoins(userId, ENTRY_COINS, roomId, `Refund: left ${room.title} before start`);
-
-    const balance = await getCoinBalance(userId);
+    if (result.status !== 200) {
+      return res.status(result.status).json(result.body);
+    }
 
     triggerEvent(PUSHER_CHANNEL, "sponsored_event.registration_updated", {
       room_id: roomId,
-      registered_count: newCount,
-      max_slots: room.maxPlayers,
+      registered_count: result.newCount,
+      max_slots: result.room.maxPlayers,
+    }).catch(() => {});
+
+    triggerEvent(`private-user-${userId}`, "wallet.updated", {
+      type: "coins_refunded",
+      reason: "sponsored_event_refund",
+      coins: ENTRY_COINS,
+      changeAmount: ENTRY_COINS,
+      coinBalance: result.body.coinBalance,
+      description: `Refund: left ${result.room.title} before start`,
     }).catch(() => {});
 
     sendPushToUser(
       userId,
       "💰 Coins Refunded",
-      `You left ${room.title}. ${ENTRY_COINS.toLocaleString()} coins have been refunded to your wallet.`,
+      `You left ${result.room.title}. ${ENTRY_COINS.toLocaleString()} coins have been refunded to your wallet.`,
       { type: "sponsored_event_left", room_id: roomId },
     );
 
     req.log.info({ userId, roomId }, "[SponsoredEvents] registration cancelled — coins refunded");
-    return res.json({ success: true, coinBalance: balance.currentBalance });
+    return res.json(result.body);
   } catch (err) {
     req.log.error({ err }, "[SponsoredEvents] cancel-registration failed");
     return res.status(500).json({ error: "Failed to cancel registration." });

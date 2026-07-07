@@ -47,7 +47,6 @@ import {
 } from "../lib/raceLeaderboardService.js";
 import { triggerLiveActivityUpdate } from "../lib/liveActivityUpdateService.js";
 import { liveActivityTokensTable } from "../../db/src/schema/index.js";
-import { firePromotionalRoomHosted, notifyPrivateRoomInvitation } from "../lib/pushNotificationService.js";
 import {
   buildCashChallengeQuote,
   buildRewardSplitCents as buildCashRewardSplitCents,
@@ -1885,16 +1884,6 @@ router.post("/races/host", requireAuth, async (req, res) => {
       }).catch(() => {});
     }
   }
-  void firePromotionalRoomHosted({
-    roomId: result.room.id,
-    entryType,
-    isPrivate,
-    hostUserId: userId,
-    coinEntryAmount,
-    entryAmountCents: amountCents,
-    isScheduledFuture,
-  });
-
   // Instant paid cash challenge: charge host total payable on confirm (entry + fees).
   if (amountCents > 0 && !isScheduledFuture && result.participant) {
     const [profile] = await db
@@ -4570,18 +4559,6 @@ router.post("/races/:id/invites", requireAuth, async (req, res) => {
     inviteCode: room.isPrivate ? room.inviteCode : null,
     expiresAt: expiresAt.toISOString(),
   }).catch(() => {});
-
-  if (room.isPrivate && room.inviteCode) {
-    void notifyPrivateRoomInvitation({
-      roomId: raceId,
-      roomCode: room.inviteCode,
-      challengeType: challengeLabel,
-      inviterUserId: currentUserId,
-      inviterUsername: hostProfile?.username ?? "Someone",
-      invitedUserId: inviteeId,
-      roomInviteId: invite.id,
-    });
-  }
 
   // Auto-expire after 20s
   setTimeout(() => {

@@ -10,6 +10,7 @@ import { z } from "zod";
 import { evaluateStepMilestones } from "../lib/coinsService.js";
 import { evaluateAndNotify } from "./achievementHooks.js";
 import { notifyFriendsOnDailyGoal } from "../lib/friendActivityService.js";
+import { notifyGroupsOnDailyGoalCompletion } from "../lib/pushNotificationService.js";
 
 const router = Router();
 
@@ -380,7 +381,7 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   if (updatedForCoins) {
     (async () => {
       const currentSteps = updatedForCoins.steps ?? 0;
-      const { goal: userGoal, notifyFriendsOnGoal } = await getUserGoalAndUnit(userId);
+      const { goal: userGoal, timezone, notifyFriendsOnGoal } = await getUserGoalAndUnit(userId);
 
       req.log.info(
         { userId, localDate: today, previousSteps, newSteps: currentSteps, goalSteps: userGoal },
@@ -396,6 +397,14 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
         req.log.info({ userId }, "[DailyGoalNotify] sender disabled goal notifications — skipping");
         return;
       }
+
+      notifyGroupsOnDailyGoalCompletion({
+        completedUserId: userId,
+        currentSteps,
+        goalSteps: userGoal,
+        localDate: today,
+        timezone,
+      }).catch(() => {});
 
       notifyFriendsOnDailyGoal(userId, currentSteps, userGoal, today).catch(() => {});
     })().catch(() => {});
