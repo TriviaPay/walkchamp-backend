@@ -186,6 +186,9 @@ describe("wallet payment hardening", () => {
   it("requires explicit production readiness gates for real-money cash features", () => {
     const config = readFileSync("src/lib/config.ts", "utf8");
 
+    expect(config).toContain("PAYMENTS_LIVE_MODE");
+    expect(config).toContain("paymentsLiveMode: parseBoolean(rawEnv.PAYMENTS_LIVE_MODE, true)");
+    expect(config).toContain("realMoneyReadiness.paymentsLiveMode && !realMoneyReadiness.productionApproved");
     expect(config).toContain("REAL_MONEY_PRODUCTION_APPROVED");
     expect(config).toContain("REAL_MONEY_LEGAL_APPROVED");
     expect(config).toContain("REAL_MONEY_KYC_TAX_READY");

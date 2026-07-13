@@ -54,6 +54,7 @@ const envSchema = z
     CASH_FEATURES_ENABLED: z.enum(["true", "false"]).optional(),
     FEATURE_CASH_FEATURES: z.enum(["true", "false"]).optional(),
     FEATURE_COIN_ENTRY_CHALLENGES: z.enum(["true", "false"]).optional(),
+    PAYMENTS_LIVE_MODE: z.enum(["true", "false"]).optional(),
     REAL_MONEY_PRODUCTION_APPROVED: z.enum(["true", "false"]).optional(),
     REAL_MONEY_LEGAL_APPROVED: z.enum(["true", "false"]).optional(),
     REAL_MONEY_KYC_TAX_READY: z.enum(["true", "false"]).optional(),
@@ -135,6 +136,7 @@ const featureFlags = {
 };
 
 const realMoneyReadiness = {
+  paymentsLiveMode: parseBoolean(rawEnv.PAYMENTS_LIVE_MODE, true),
   productionApproved: parseBoolean(rawEnv.REAL_MONEY_PRODUCTION_APPROVED),
   legalApproved: parseBoolean(rawEnv.REAL_MONEY_LEGAL_APPROVED),
   kycTaxReady: parseBoolean(rawEnv.REAL_MONEY_KYC_TAX_READY),
@@ -219,19 +221,19 @@ if (isProduction) {
   }
 
   if (featureFlags.cashFeaturesEnabled) {
-    if (!realMoneyReadiness.productionApproved) {
+    if (realMoneyReadiness.paymentsLiveMode && !realMoneyReadiness.productionApproved) {
       configErrors.push("REAL_MONEY_PRODUCTION_APPROVED=true is required when cash features are enabled in production");
     }
-    if (!realMoneyReadiness.legalApproved) {
+    if (realMoneyReadiness.paymentsLiveMode && !realMoneyReadiness.legalApproved) {
       configErrors.push("REAL_MONEY_LEGAL_APPROVED=true is required when cash features are enabled in production");
     }
-    if (!realMoneyReadiness.kycTaxReady) {
+    if (realMoneyReadiness.paymentsLiveMode && !realMoneyReadiness.kycTaxReady) {
       configErrors.push("REAL_MONEY_KYC_TAX_READY=true is required when cash features are enabled in production");
     }
-    if (!realMoneyReadiness.providerSandboxTested) {
+    if (realMoneyReadiness.paymentsLiveMode && !realMoneyReadiness.providerSandboxTested) {
       configErrors.push("REAL_MONEY_PROVIDER_SANDBOX_TESTED=true is required when cash features are enabled in production");
     }
-    if (!realMoneyReadiness.withdrawalControlsReady) {
+    if (realMoneyReadiness.paymentsLiveMode && !realMoneyReadiness.withdrawalControlsReady) {
       configErrors.push("REAL_MONEY_WITHDRAWAL_CONTROLS_READY=true is required when cash features are enabled in production");
     }
     if (!featureFlags.bullmqWebhookProcessingEnabled) {
