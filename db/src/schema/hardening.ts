@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, uuid, jsonb, uniqueIndex, index } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, uuid, jsonb, uniqueIndex, index, boolean } from "drizzle-orm/pg-core";
 import { raceRoomsTable } from "./races.js";
 import { profilesTable } from "./profiles.js";
 
@@ -62,7 +62,20 @@ export const finalizationAttemptsTable = pgTable("finalization_attempts", {
     .on(table.raceId, table.finalStateVersion),
 ]);
 
+export const operationalLocksTable = pgTable("operational_locks", {
+  key: text("key").primaryKey(),
+  locked: boolean("locked").notNull().default(false),
+  reason: text("reason"),
+  metadata: jsonb("metadata"),
+  lockedAt: timestamp("locked_at"),
+  resolvedAt: timestamp("resolved_at"),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+}, (table) => [
+  index("operational_locks_locked_idx").on(table.locked),
+]);
+
 export type OutboxEvent = typeof outboxEventsTable.$inferSelect;
 export type NotificationDelivery = typeof notificationDeliveryTable.$inferSelect;
 export type RaceFinalizationLock = typeof raceFinalizationLocksTable.$inferSelect;
 export type FinalizationAttempt = typeof finalizationAttemptsTable.$inferSelect;
+export type OperationalLock = typeof operationalLocksTable.$inferSelect;

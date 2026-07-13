@@ -1,4 +1,4 @@
-import { pgTable, text, integer, timestamp, pgEnum, uuid, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, timestamp, pgEnum, uuid, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 import { profilesTable } from "./profiles.js";
@@ -30,6 +30,7 @@ export const withdrawalsTable = pgTable("withdrawals", {
   currency: text("currency").notNull().default("usd"),
   payoutMethod: payoutMethodEnum("payout_method").notNull(),
   payoutDetails: jsonb("payout_details").notNull(),
+  idempotencyKey: text("idempotency_key"),
   status: withdrawalStatusEnum("status").notNull().default("pending"),
   adminNotes: text("admin_notes"),
   reviewNotes: text("review_notes"),
@@ -42,7 +43,9 @@ export const withdrawalsTable = pgTable("withdrawals", {
   rejectedAt: timestamp("rejected_at"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
-});
+}, (table) => [
+  uniqueIndex("withdrawals_idempotency_key_unique_idx").on(table.idempotencyKey),
+]);
 
 export const insertWithdrawalSchema = createInsertSchema(withdrawalsTable).omit({
   id: true,

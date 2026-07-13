@@ -13,7 +13,6 @@ import {
 } from "../../db/src/schema/index.js";
 import { eq, and, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
-import { z } from "zod";
 import StripeConstructor from "stripe";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
 import {
@@ -155,168 +154,13 @@ async function settlePromoRedemption(tx: DbTx, payment: typeof paymentsTable.$in
 }
 
 // ── POST /api/payments/create-race-entry-intent ───────────────────────────────
-// Creates a Stripe PaymentIntent for joining a paid race.
-// Returns clientSecret + ephemeralKey for use with Stripe Payment Sheet.
-const createIntentSchema = z.object({
-  raceId: z.string().uuid(),
-  promoCode: z.string().optional(),
-});
-
+// Compatibility blocker: paid races now use wallet ledger debits only.
 router.post("/payments/create-race-entry-intent", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
-  const parsed = createIntentSchema.safeParse(req.body);
-  if (!parsed.success) {
-    return res.status(400).json({ error: "Invalid request", details: parsed.error.issues });
-  }
-
-  const { raceId, promoCode } = parsed.data;
-
-  // --- Validate user eligibility ---
-  const [profile] = await db
-    .select()
-    .from(profilesTable)
-    .where(eq(profilesTable.id, userId))
-    .limit(1);
-
-  if (!profile) return res.status(404).json({ error: "Profile not found" });
-  if (profile.accountStatus === "suspended" || profile.accountStatus === "banned") {
-    return res.status(403).json({ error: "Your account is not eligible for paid races." });
-  }
-  if (!profile.isAdult) {
-    return res.status(403).json({ error: "You must be 18+ to join paid races." });
-  }
-  if (!profile.paidRaceEnabled) {
-    return res.status(403).json({ error: "Paid races are not enabled for your account." });
-  }
-
-  // --- Validate race ---
-  const [room] = await db
-    .select()
-    .from(raceRoomsTable)
-    .where(eq(raceRoomsTable.id, raceId))
-    .limit(1);
-
-  if (!room) return res.status(404).json({ error: "Race not found" });
-  if (room.status !== "open") return res.status(409).json({ error: "Race is no longer accepting entries." });
-  if (room.currentPlayers >= room.maxPlayers) return res.status(409).json({ error: "Race is full." });
-  if (room.entryAmountCents === 0) return res.status(400).json({ error: "This is a free race. Use the join endpoint." });
-
-  // Check not already joined
-  const [existing] = await db
-    .select()
-    .from(raceParticipantsTable)
-    .where(
-      and(
-        eq(raceParticipantsTable.raceRoomId, raceId),
-        eq(raceParticipantsTable.userId, userId),
-        ne(raceParticipantsTable.status, "left"),
-      ),
-    )
-    .limit(1);
-  if (existing) return res.status(409).json({ error: "You are already in this race." });
-
-  // --- Promo code validation ---
-  let discountCents = 0;
-  let promoCodeRow: typeof promoCodesTable.$inferSelect | null = null;
-
-  if (promoCode) {
-    const [promo] = await db
-      .select()
-      .from(promoCodesTable)
-      .where(eq(promoCodesTable.code, promoCode.toUpperCase()))
-      .limit(1);
-
-    if (!promo || !promo.active) {
-      return res.status(400).json({ error: "Promo code is invalid or expired." });
-    }
-    if (promo.endsAt && promo.endsAt < new Date()) {
-      return res.status(400).json({ error: "Promo code has expired." });
-    }
-    if (promo.maxUses !== null && promo.usedCount >= promo.maxUses) {
-      return res.status(400).json({ error: "Promo code has reached its usage limit." });
-    }
-
-    if (promo.discountType === "percent") {
-      discountCents = Math.round((room.entryAmountCents * promo.discountValue) / 100);
-    } else {
-      discountCents = Math.min(promo.discountValue, room.entryAmountCents);
-    }
-    promoCodeRow = promo;
-  }
-
-  const finalAmountCents = Math.max(0, room.entryAmountCents - discountCents);
-
-  // --- Create Stripe PaymentIntent ---
-  const stripe = getStripe();
-  const idempotencyKey = `race-entry-${userId}-${raceId}-${Date.now()}`;
-
-  const customerId = await getOrCreateStripeCustomer(userId, profile.email);
-  const ephemeralKey = await stripe.ephemeralKeys.create(
-    { customer: customerId },
-    { apiVersion: "2026-05-27.dahlia" },
-  );
-
-  const paymentIntent = await stripe.paymentIntents.create(
-    {
-      amount: finalAmountCents,
-      currency: "usd",
-      customer: customerId,
-      automatic_payment_methods: { enabled: true },
-      metadata: {
-        descopeUserId: userId,
-        userProfileId: userId,
-        raceRoomId: raceId,
-        entryAmountCents: room.entryAmountCents.toString(),
-        discountCents: discountCents.toString(),
-        paymentType: "race_entry",
-        idempotencyKey,
-      },
-    },
-    { idempotencyKey: `pi-${idempotencyKey}` },
-  );
-
-  // Store pending payment record
-  const [payment] = await db
-    .insert(paymentsTable)
-    .values({
-      userId,
-      stripePaymentIntentId: paymentIntent.id,
-      stripeCustomerId: customerId,
-      raceRoomId: raceId,
-      amountCents: finalAmountCents,
-      currency: "usd",
-      status: "pending",
-      paymentType: "race_entry",
-      idempotencyKey,
-      metadata: {
-        entryAmountCents: room.entryAmountCents,
-        discountCents,
-        promoCode: promoCode ?? null,
-      },
-    })
-    .returning();
-
-  req.log.info(
-    { paymentId: payment.id, raceId, amountCents: finalAmountCents },
-    "payment intent created",
-  );
-
-  return res.json({
-    paymentIntentClientSecret: paymentIntent.client_secret,
-    ephemeralKey: ephemeralKey.secret,
-    customerId,
-    paymentId: payment.id,
-    amountCents: finalAmountCents,
-    originalAmountCents: room.entryAmountCents,
-    discountCents,
-    race: {
-      id: room.id,
-      title: room.title,
-      entryType: room.entryType,
-      targetSteps: room.targetSteps,
-      maxPlayers: room.maxPlayers,
-      currentPlayers: room.currentPlayers,
-    },
+  req.log.warn({ userId }, "direct Stripe race-entry payments are disabled; use wallet-funded challenge entry");
+  return res.status(410).json({
+    error: "Direct paid-race payments are disabled. Add funds to your wallet and join the challenge from wallet balance.",
+    code: "DIRECT_RACE_PAYMENTS_DISABLED",
   });
 });
 
@@ -410,86 +254,28 @@ router.post(
           .limit(1);
 
         if (payment && payment.status !== "succeeded") {
-          const raceId = meta.raceRoomId;
-
           await db.transaction(async (tx) => {
             const lockedPayment = await lockPaymentById(tx, payment.id);
-            if (!lockedPayment || lockedPayment.status === "succeeded") {
-              return;
-            }
+            if (!lockedPayment || lockedPayment.status === "succeeded") return;
 
-            const room = await lockRaceRoom(tx, raceId);
-
-            if (!room || (room.status !== "open" && room.status !== "full") || room.currentPlayers >= room.maxPlayers) {
-              await requestProviderRefundForPayment(tx, lockedPayment, "Race entry refunded — race full or cancelled");
+            if (lockedPayment.paymentType === "race_entry") {
+              await requestProviderRefundForPayment(tx, lockedPayment, "Direct race-entry payments are disabled; refunding legacy provider payment");
               await tx
                 .update(paymentsTable)
                 .set({
                   status: "succeeded",
                   metadata: {
                     ...getPaymentMetadata(lockedPayment),
-                    autoRefundReason: "race_unavailable",
+                    directRacePaymentsDisabled: true,
+                    autoRefundReason: "direct_race_payments_disabled",
                     autoRefundedAt: new Date().toISOString(),
+                    stripePaymentIntentMetadata: meta,
                   },
                   updatedAt: new Date(),
                 })
                 .where(eq(paymentsTable.id, lockedPayment.id));
               return;
             }
-
-            const promoResult = await settlePromoRedemption(tx, lockedPayment);
-
-            if (!promoResult.ok) {
-              await requestProviderRefundForPayment(tx, lockedPayment, "Race entry refunded — promo code could not be fulfilled");
-              await tx
-                .update(paymentsTable)
-                .set({
-                  status: "succeeded",
-                  metadata: {
-                    ...getPaymentMetadata(lockedPayment),
-                    autoRefundReason: "promo_unavailable",
-                    autoRefundedAt: new Date().toISOString(),
-                  },
-                  updatedAt: new Date(),
-                })
-                .where(eq(paymentsTable.id, lockedPayment.id));
-              return;
-            }
-
-            const participantResult = await joinOrReviveParticipant(tx, {
-              raceRoomId: raceId,
-              userId: lockedPayment.userId,
-              paymentId: lockedPayment.id,
-            });
-
-            if (participantResult.reason === "blocked" || participantResult.reason === "already_joined") {
-              await requestProviderRefundForPayment(tx, lockedPayment, "Race entry refunded — duplicate or blocked participation");
-              await tx
-                .update(paymentsTable)
-                .set({
-                  status: "succeeded",
-                  metadata: {
-                    ...getPaymentMetadata(lockedPayment),
-                    autoRefundReason: participantResult.reason,
-                    autoRefundedAt: new Date().toISOString(),
-                  },
-                  updatedAt: new Date(),
-                })
-                .where(eq(paymentsTable.id, lockedPayment.id));
-              return;
-            }
-
-            const newPlayerCount = room.currentPlayers + 1;
-
-            await tx
-              .update(raceRoomsTable)
-              .set({
-                currentPlayers: newPlayerCount,
-                status: deriveOpenRoomStatus(newPlayerCount, room.maxPlayers),
-                prizePoolCents: sql`${raceRoomsTable.prizePoolCents} + ${lockedPayment.amountCents}`,
-                updatedAt: new Date(),
-              })
-              .where(eq(raceRoomsTable.id, room.id));
 
             await tx
               .update(paymentsTable)

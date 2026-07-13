@@ -1198,9 +1198,33 @@ export async function debitWalletForCashChallenge(tx: DbTx, input: {
   raceRoomId: string;
   entryFeeCents: number;
   description: string;
+  idempotencyKey?: string;
 }) {
   const wallet = await lockWalletByUserId(tx, input.userId);
   if (!wallet) return { ok: false as const, error: "Wallet not found.", balanceCents: 0 };
+  if (wallet.currency.toLowerCase() !== "usd") {
+    return {
+      ok: false as const,
+      error: "Cash challenges currently require a USD wallet.",
+      balanceCents: wallet.availableBalanceCents,
+    };
+  }
+
+  const idempotencyKey = input.idempotencyKey ?? `challenge_entry:${input.raceRoomId}:${input.userId}`;
+  const [existingDebit] = await tx
+    .select({ id: walletTransactionsTable.id })
+    .from(walletTransactionsTable)
+    .where(and(
+      eq(walletTransactionsTable.userId, input.userId),
+      eq(walletTransactionsTable.raceRoomId, input.raceRoomId),
+      eq(walletTransactionsTable.transactionType, "race_entry_wallet_debit"),
+      eq(walletTransactionsTable.status, "completed"),
+    ))
+    .limit(1);
+  if (existingDebit) {
+    return { ok: true as const, balanceCents: wallet.availableBalanceCents };
+  }
+
   if (wallet.availableBalanceCents < input.entryFeeCents) {
     return { ok: false as const, error: "Insufficient balance.", balanceCents: wallet.availableBalanceCents };
   }
@@ -1217,6 +1241,7 @@ export async function debitWalletForCashChallenge(tx: DbTx, input: {
     currency: wallet.currency,
     status: "completed",
     description: input.description,
+    idempotencyKey,
     raceRoomId: input.raceRoomId,
     balanceBeforeCents: before,
     balanceAfterCents: after,

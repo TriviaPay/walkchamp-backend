@@ -21,19 +21,21 @@ import {
   depositTransactionsTable,
   depositWebhookEventsTable,
   walletsTable,
-  walletTransactionsTable,
   profilesTable,
 } from "../../db/src/schema/index.js";
 import { eq, and, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import StripeConstructor from "stripe";
-import Razorpay from "razorpay";
-import { createHmac } from "crypto";
+import { createHash, createHmac } from "crypto";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
-import { lockDepositTransactionById, lockWalletByUserId, type DbTx } from "../lib/raceIntegrity.js";
 import { config } from "../lib/config.js";
-import { recordProviderRefundWebhook } from "../lib/refundService.js";
+import { recordOutboxEvent } from "../lib/outbox.js";
+import { processDepositWebhookEvent } from "../lib/depositWebhookProcessor.js";
+import {
+  getRazorpay,
+  getStripe,
+  settleRazorpayPayment,
+} from "../lib/depositSettlement.js";
 
 const router = Router();
 
@@ -65,95 +67,38 @@ function appDoneUrl(status: "success" | "processing" | "failed" | "cancelled", t
   return `${getBaseUrl()}/api/wallet/deposit/done?status=${status}&transaction_id=${encodeURIComponent(transactionId)}`;
 }
 
-// ── Stripe client ─────────────────────────────────────────────────────────────
-type StripeClient = InstanceType<typeof StripeConstructor>;
-type StripeCheckoutSession = Awaited<ReturnType<StripeClient["checkout"]["sessions"]["create"]>>;
+type StripeClient = ReturnType<typeof getStripe>;
+type StripeCheckoutSession = Awaited<ReturnType<StripeClient["checkout"]["sessions"]["retrieve"]>>;
+type StripeCreatedCheckoutSession = Awaited<ReturnType<StripeClient["checkout"]["sessions"]["create"]>>;
 type StripeEvent = ReturnType<StripeClient["webhooks"]["constructEvent"]>;
 
-let _stripe: StripeClient | null = null;
-function getStripe(): StripeClient {
-  if (_stripe) return _stripe;
-  const key = config.payments.stripeSecretKey;
-  if (!key) throw new Error("STRIPE_SECRET_KEY is not configured.");
-  _stripe = new StripeConstructor(key, { apiVersion: "2026-05-27.dahlia" });
-  return _stripe;
-}
-
-// ── Razorpay client ───────────────────────────────────────────────────────────
-let _razorpay: InstanceType<typeof Razorpay> | null = null;
-function getRazorpay(): InstanceType<typeof Razorpay> {
-  if (_razorpay) return _razorpay;
-  const keyId = config.payments.razorpayKeyId;
-  const keySecret = config.payments.razorpayKeySecret;
-  if (!keyId || !keySecret) throw new Error("RAZORPAY_KEY_ID or RAZORPAY_KEY_SECRET is not configured.");
-  _razorpay = new Razorpay({ key_id: keyId, key_secret: keySecret });
-  return _razorpay;
-}
-
 // ── Wallet helpers ────────────────────────────────────────────────────────────
-async function getOrCreateWallet(userId: string) {
+async function getOrCreateWalletForCurrency(userId: string, expectedCurrency: "usd" | "inr") {
   const [existing] = await db
     .select()
     .from(walletsTable)
     .where(eq(walletsTable.userId, userId))
     .limit(1);
-  if (existing) return existing;
-  const [created] = await db.insert(walletsTable).values({ userId }).returning();
-  return created;
-}
+  if (!existing) {
+    const [created] = await db.insert(walletsTable).values({ userId, currency: expectedCurrency }).returning();
+    return { wallet: created, mismatch: false as const };
+  }
 
-function normalizeWalletCurrency(raw: string | null | undefined): "usd" | "inr" | null {
-  if (!raw) return null;
-  const normalized = raw.trim().toLowerCase();
-  if (normalized === "usd" || normalized === "inr") return normalized;
-  return null;
-}
-
-async function getOrCreateWalletForCurrency(userId: string, expectedCurrency: "usd" | "inr") {
-  const wallet = await getOrCreateWallet(userId);
-  const walletCurrency = normalizeWalletCurrency(wallet.currency);
-
-  if (!walletCurrency) {
+  const walletCurrency = existing.currency.trim().toLowerCase();
+  if (walletCurrency !== "usd" && walletCurrency !== "inr") {
     const [updated] = await db
       .update(walletsTable)
       .set({ currency: expectedCurrency, updatedAt: new Date() })
-      .where(eq(walletsTable.id, wallet.id))
+      .where(eq(walletsTable.id, existing.id))
       .returning();
-    return { wallet: updated ?? wallet, mismatch: false as const };
+    return { wallet: updated ?? existing, mismatch: false as const };
   }
 
   if (walletCurrency !== expectedCurrency) {
-    return { wallet, mismatch: true as const };
+    return { wallet: existing, mismatch: true as const };
   }
 
-  return { wallet, mismatch: false as const };
-}
-
-async function ensureLockedWalletForCurrency(tx: DbTx, userId: string, expectedCurrency: "usd" | "inr") {
-  let wallet = await lockWalletByUserId(tx, userId);
-  if (!wallet) {
-    const [created] = await tx
-      .insert(walletsTable)
-      .values({ userId, currency: expectedCurrency })
-      .returning();
-    wallet = created;
-  }
-
-  const walletCurrency = normalizeWalletCurrency(wallet.currency);
-  if (walletCurrency && walletCurrency !== expectedCurrency) {
-    return { wallet, mismatch: true as const };
-  }
-
-  if (!walletCurrency) {
-    const [updated] = await tx
-      .update(walletsTable)
-      .set({ currency: expectedCurrency, updatedAt: new Date() })
-      .where(eq(walletsTable.id, wallet.id))
-      .returning();
-    return { wallet: updated ?? wallet, mismatch: false as const };
-  }
-
-  return { wallet, mismatch: false as const };
+  return { wallet: existing, mismatch: false as const };
 }
 
 /** Returns the ISO country code (e.g. "IN", "US") from the user's profile, or null if unset. */
@@ -166,38 +111,9 @@ async function getUserCountryCode(userId: string): Promise<string | null> {
   return row?.countryCode ?? null;
 }
 
-async function creditWalletForDeposit(
-  userId: string,
-  walletId: string,
-  amountMinorUnits: number,
-  description: string,
-  currency: "USD" | "INR" = "USD",
-): Promise<void> {
-  await db.transaction(async (tx) => {
-    await tx
-      .update(walletsTable)
-      .set({
-        availableBalanceCents: sql`${walletsTable.availableBalanceCents} + ${amountMinorUnits}`,
-        totalEarnedCents: sql`${walletsTable.totalEarnedCents} + ${amountMinorUnits}`,
-        updatedAt: new Date(),
-      })
-      .where(eq(walletsTable.id, walletId));
-
-    await tx.insert(walletTransactionsTable).values({
-      walletId,
-      userId,
-      transactionType: "manual_adjustment",
-      amountCents: amountMinorUnits,
-      currency: currency.toLowerCase(),
-      status: "completed",
-      description,
-    });
-  });
-}
-
 async function markDepositReturnObserved(
   transactionId: string,
-  patch: Partial<Record<"returnSeenAt" | "returnSessionIdVerified" | "returnDisplayStatus", unknown>>,
+  patch: Record<string, unknown>,
 ) {
   const [depositTx] = await db
     .select({ id: depositTransactionsTable.id, metadata: depositTransactionsTable.metadata })
@@ -290,7 +206,7 @@ router.post("/wallet/deposit/stripe/create-payment-intent", requireAuth, async (
       .values({
         userId,
         provider: "stripe",
-        status: "pending",
+        status: "processing",
         amountMinorUnits: amountCents,
         currency: "USD",
         walletCreditCents: amountCents,
@@ -302,25 +218,28 @@ router.post("/wallet/deposit/stripe/create-payment-intent", requireAuth, async (
     return res.status(500).json({ error: "Failed to create payment record." });
   }
 
-  let session: StripeCheckoutSession;
+  let session: StripeCreatedCheckoutSession;
   try {
-    session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      line_items: [
-        {
-          price_data: {
-            currency: "usd",
-            product_data: { name: "WalkChamp Wallet Deposit" },
-            unit_amount: amountCents,
+    session = await stripe.checkout.sessions.create(
+      {
+        payment_method_types: ["card"],
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: { name: "WalkChamp Wallet Deposit" },
+              unit_amount: amountCents,
+            },
+            quantity: 1,
           },
-          quantity: 1,
-        },
-      ],
-      mode: "payment",
-      success_url: `${baseUrl}/api/wallet/deposit/stripe/return?session_id={CHECKOUT_SESSION_ID}&transaction_id=${depositTx.id}`,
-      cancel_url: `${baseUrl}/api/wallet/deposit/stripe/return?transaction_id=${depositTx.id}&status=cancelled`,
-      metadata: { depositTransactionId: depositTx.id, userId },
-    });
+        ],
+        mode: "payment",
+        success_url: `${baseUrl}/api/wallet/deposit/stripe/return?session_id={CHECKOUT_SESSION_ID}&transaction_id=${depositTx.id}`,
+        cancel_url: `${baseUrl}/api/wallet/deposit/stripe/return?transaction_id=${depositTx.id}&status=cancelled`,
+        metadata: { depositTransactionId: depositTx.id, userId },
+      },
+      { idempotencyKey: `deposit_checkout:${depositTx.id}` },
+    );
   } catch (err) {
     req.log.error({ err, depositTxId: depositTx.id }, "[PaymentBackend] stripe: session create failed");
     await db.update(depositTransactionsTable)
@@ -453,7 +372,7 @@ router.post("/wallet/deposit/razorpay/create-order", requireAuth, async (req, re
     });
   }
 
-  let razorpay: InstanceType<typeof Razorpay>;
+  let razorpay: ReturnType<typeof getRazorpay>;
   try {
     razorpay = getRazorpay();
   } catch {
@@ -477,7 +396,7 @@ router.post("/wallet/deposit/razorpay/create-order", requireAuth, async (req, re
       .values({
         userId,
         provider: "razorpay",
-        status: "pending",
+        status: "processing",
         amountMinorUnits: amountPaise,
         currency: "INR",
         walletCreditCents,
@@ -495,6 +414,7 @@ router.post("/wallet/deposit/razorpay/create-order", requireAuth, async (req, re
       amount: amountPaise,
       currency: "INR",
       receipt: `wc_dep_${depositTx.id.replace(/-/g, "").slice(0, 20)}`,
+      partial_payment: false,
       notes: { depositTransactionId: depositTx.id, userId },
     });
   } catch (err) {
@@ -663,18 +583,18 @@ router.get("/wallet/deposit/razorpay/verify", async (req, res) => {
   }
 
   try {
-    const keySecret = process.env.RAZORPAY_KEY_SECRET ?? "";
+    const keySecret = config.payments.razorpayKeySecret ?? "";
     const expectedSignature = createHmac("sha256", keySecret)
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
       .digest("hex");
 
     if (razorpay_signature !== expectedSignature) {
       req.log.warn({ transaction_id, razorpay_payment_id }, "[PaymentBackend] razorpay verify: signature mismatch");
-      await db
-        .update(depositTransactionsTable)
-        .set({ status: "failed", failureReason: "signature_mismatch", updatedAt: new Date() })
-        .where(eq(depositTransactionsTable.id, transaction_id))
-        .catch(() => {});
+      await markDepositReturnObserved(transaction_id, {
+        returnSeenAt: new Date().toISOString(),
+        returnDisplayStatus: "failed",
+        razorpayCallbackSignatureVerified: false,
+      });
       return res.redirect(appDoneUrl("failed", transaction_id));
     }
 
@@ -689,52 +609,46 @@ router.get("/wallet/deposit/razorpay/verify", async (req, res) => {
       return res.redirect(appDoneUrl("failed", transaction_id));
     }
 
-    if (depositTx.status === "succeeded") {
-      req.log.info({ transaction_id }, "[PaymentBackend] razorpay verify: already credited (idempotent)");
-      return res.redirect(appDoneUrl("success", transaction_id));
-    }
-
     if (depositTx.providerOrderId !== razorpay_order_id) {
       req.log.warn({ transaction_id, razorpay_order_id }, "[PaymentBackend] razorpay verify: order_id mismatch");
+      await markDepositReturnObserved(transaction_id, {
+        returnSeenAt: new Date().toISOString(),
+        returnDisplayStatus: "failed",
+        razorpayCallbackSignatureVerified: true,
+        razorpayOrderIdVerified: false,
+      });
       return res.redirect(appDoneUrl("failed", transaction_id));
     }
 
-    const wallet = await getOrCreateWallet(depositTx.userId);
-    const creditCents = depositTx.walletCreditCents ?? 1;
-    const amountINR = (depositTx.amountMinorUnits / 100).toFixed(2);
+    await markDepositReturnObserved(transaction_id, {
+      returnSeenAt: new Date().toISOString(),
+      returnDisplayStatus: "processing",
+      razorpayCallbackSignatureVerified: true,
+      razorpayOrderIdVerified: true,
+    });
 
-    const updated = await db
-      .update(depositTransactionsTable)
-      .set({
-        status: "succeeded",
-        providerPaymentId: razorpay_payment_id,
-        providerSignature: razorpay_signature,
-        creditedAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(depositTransactionsTable.id, transaction_id),
-          ne(depositTransactionsTable.status, "succeeded"),
-        ),
-      )
-      .returning();
+    const settlement = await settleRazorpayPayment({
+      depositId: transaction_id,
+      orderId: razorpay_order_id,
+      paymentId: razorpay_payment_id,
+    });
 
-    if (updated.length > 0) {
-      await creditWalletForDeposit(
-        depositTx.userId,
-        wallet.id,
-        creditCents,
-        `Deposit via Razorpay — ₹${amountINR}`,
-        "INR",
-      );
-      req.log.info({ txId: transaction_id, creditCents }, "[PaymentBackend] wallet credited: INR");
+    if (settlement.status === "succeeded") {
+      req.log.info({ txId: transaction_id, settled: settlement.settled }, "[PaymentBackend] razorpay verify: settled from fetched provider state");
+      return res.redirect(appDoneUrl("success", transaction_id));
     }
 
-    return res.redirect(appDoneUrl("success", transaction_id));
+    return res.redirect(appDoneUrl(settlement.status === "processing" ? "processing" : "failed", transaction_id));
   } catch (err) {
     req.log.error({ err }, "[PaymentBackend] razorpay verify: exception");
-    return res.redirect(appDoneUrl("failed", transaction_id ?? ""));
+    if (transaction_id) {
+      await db
+        .update(depositTransactionsTable)
+        .set({ status: "settlement_error", failureReason: "razorpay_verify_settlement_error", updatedAt: new Date() })
+        .where(and(eq(depositTransactionsTable.id, transaction_id), ne(depositTransactionsTable.status, "succeeded")))
+        .catch(() => {});
+    }
+    return res.redirect(appDoneUrl("processing", transaction_id ?? ""));
   }
 });
 
@@ -819,25 +733,18 @@ const browserUpdateSchema = z.object({
 /**
  * POST /api/wallet/deposit/razorpay/browser-cancel
  *
- * Called from the Razorpay checkout HTML (ondismiss) to mark the transaction
- * cancelled before the browser navigates to the /done page.
- * No auth required — transaction_id is a UUID secret; can only downgrade to
- * "cancelled", never upgrade to "succeeded".
+ * Called from the Razorpay checkout HTML (ondismiss) to record browser UX state.
+ * Browser cancellation is not provider settlement state.
  */
 router.post("/wallet/deposit/razorpay/browser-cancel", async (req, res) => {
   const parsed = browserUpdateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ ok: false });
 
-  await db
-    .update(depositTransactionsTable)
-    .set({ status: "cancelled", updatedAt: new Date() })
-    .where(
-      and(
-        eq(depositTransactionsTable.id, parsed.data.transaction_id),
-        ne(depositTransactionsTable.status, "succeeded"),
-      ),
-    )
-    .catch(() => {});
+  await markDepositReturnObserved(parsed.data.transaction_id, {
+    browserCancelSeenAt: new Date().toISOString(),
+    browserCancelReason: parsed.data.reason ?? "browser_cancel",
+    returnDisplayStatus: "cancelled",
+  });
 
   return res.json({ ok: true });
 });
@@ -845,8 +752,8 @@ router.post("/wallet/deposit/razorpay/browser-cancel", async (req, res) => {
 /**
  * POST /api/wallet/deposit/razorpay/browser-fail
  *
- * Called from the Razorpay checkout HTML (payment.failed event) to mark the
- * transaction failed before the browser navigates to the /done page.
+ * Called from the Razorpay checkout HTML (payment.failed event) to record browser
+ * UX state. A later captured payment can still settle through verify/webhook.
  * No auth required — same rationale as browser-cancel.
  */
 router.post("/wallet/deposit/razorpay/browser-fail", async (req, res) => {
@@ -855,16 +762,11 @@ router.post("/wallet/deposit/razorpay/browser-fail", async (req, res) => {
 
   const reason = parsed.data.reason ?? "razorpay_payment_failed";
 
-  await db
-    .update(depositTransactionsTable)
-    .set({ status: "failed", failureReason: reason, updatedAt: new Date() })
-    .where(
-      and(
-        eq(depositTransactionsTable.id, parsed.data.transaction_id),
-        ne(depositTransactionsTable.status, "succeeded"),
-      ),
-    )
-    .catch(() => {});
+  await markDepositReturnObserved(parsed.data.transaction_id, {
+    browserFailSeenAt: new Date().toISOString(),
+    browserFailReason: reason,
+    returnDisplayStatus: "failed",
+  });
 
   return res.json({ ok: true });
 });
@@ -913,8 +815,7 @@ const cancelSchema = z.object({
 /**
  * POST /api/wallet/deposit/:provider/cancel
  *
- * Marks a pending/processing transaction as cancelled.
- * Never downgrades a succeeded transaction.
+ * Records user-observed cancellation. Provider settlement remains authoritative.
  */
 router.post("/wallet/deposit/:provider/cancel", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
@@ -943,22 +844,14 @@ router.post("/wallet/deposit/:provider/cancel", requireAuth, async (req, res) =>
     return res.status(404).json({ success: false, error: "Transaction not found." });
   }
 
-  if (depositTx.status === "succeeded") {
-    return res.json({ success: true, status: "succeeded" });
-  }
-
-  await db
-    .update(depositTransactionsTable)
-    .set({ status: "cancelled", updatedAt: new Date() })
-    .where(
-      and(
-        eq(depositTransactionsTable.id, transaction_id),
-        ne(depositTransactionsTable.status, "succeeded"),
-      ),
-    );
+  await markDepositReturnObserved(transaction_id, {
+    userCancelSeenAt: new Date().toISOString(),
+    userCancelReason: parsed.data.reason ?? "user_cancel",
+    returnDisplayStatus: "cancelled",
+  });
 
   req.log.info({ transaction_id, provider }, "[PaymentBackend] transaction cancelled");
-  return res.json({ success: true, status: "cancelled" });
+  return res.json({ success: true, status: depositTx.status, displayStatus: "cancelled" });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1035,6 +928,13 @@ router.post("/webhooks/stripe", async (req, res) => {
     .limit(1);
 
   if (existing?.processed) {
+    await db
+      .update(depositWebhookEventsTable)
+      .set({ processingStatus: "ignored_duplicate", failureReason: null })
+      .where(and(
+        eq(depositWebhookEventsTable.provider, "stripe"),
+        eq(depositWebhookEventsTable.providerEventId, event.id),
+      ));
     return res.json({ received: true });
   }
 
@@ -1045,109 +945,32 @@ router.post("/webhooks/stripe", async (req, res) => {
       providerEventId: event.id,
       eventType: event.type,
       payload: event as unknown as Record<string, unknown>,
-      processingStatus: "pending",
+      processingStatus: "received",
     })
     .onConflictDoNothing();
 
   await db
     .update(depositWebhookEventsTable)
-    .set({
-      processingStatus: "processing",
-      processingAttemptCount: sql`${depositWebhookEventsTable.processingAttemptCount} + 1`,
-      failureReason: null,
-    })
+    .set({ processingStatus: "signature_verified", failureReason: null })
     .where(and(
       eq(depositWebhookEventsTable.provider, "stripe"),
       eq(depositWebhookEventsTable.providerEventId, event.id),
     ));
 
-  try {
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object as StripeCheckoutSession;
-      const depositTxId = session.metadata?.depositTransactionId;
-
-      if (depositTxId && session.payment_status === "paid") {
-        const [depositTx] = await db
-          .select()
-          .from(depositTransactionsTable)
-          .where(eq(depositTransactionsTable.id, depositTxId))
-          .limit(1);
-
-        if (depositTx && depositTx.status !== "succeeded") {
-          await db.transaction(async (tx) => {
-            const lockedDepositTx = await lockDepositTransactionById(tx, depositTxId);
-            if (!lockedDepositTx || lockedDepositTx.status === "succeeded") return;
-            if (lockedDepositTx.provider !== "stripe" || lockedDepositTx.providerOrderId !== session.id) {
-              req.log.warn(
-                { depositTxId, provider: lockedDepositTx?.provider, providerOrderId: lockedDepositTx?.providerOrderId, sessionId: session.id },
-                "[PaymentBackend] stripe webhook: binding mismatch",
-              );
-              return;
-            }
-
-            const walletResult = await ensureLockedWalletForCurrency(tx, lockedDepositTx.userId, "usd");
-            if (walletResult.mismatch) {
-              req.log.warn({ depositTxId, userId: lockedDepositTx.userId, walletCurrency: walletResult.wallet.currency }, "[PaymentBackend] stripe webhook: wallet currency mismatch");
-              return;
-            }
-
-            const creditCents = lockedDepositTx.walletCreditCents ?? lockedDepositTx.amountMinorUnits;
-
-            await tx
-              .update(depositTransactionsTable)
-              .set({
-                status: "succeeded",
-                providerPaymentId: String(session.payment_intent ?? ""),
-                creditedAt: new Date(),
-                updatedAt: new Date(),
-              })
-              .where(eq(depositTransactionsTable.id, lockedDepositTx.id));
-
-            await tx
-              .update(walletsTable)
-              .set({
-                availableBalanceCents: sql`${walletsTable.availableBalanceCents} + ${creditCents}`,
-                totalEarnedCents: sql`${walletsTable.totalEarnedCents} + ${creditCents}`,
-                updatedAt: new Date(),
-              })
-              .where(eq(walletsTable.id, walletResult.wallet.id));
-
-            await tx.insert(walletTransactionsTable).values({
-              walletId: walletResult.wallet.id,
-              userId: lockedDepositTx.userId,
-              transactionType: "manual_adjustment",
-              amountCents: creditCents,
-              currency: "usd",
-              status: "completed",
-              description: `Deposit via Stripe — $${(creditCents / 100).toFixed(2)}`,
-            });
-          });
-          req.log.info({ depositTxId }, "[PaymentBackend] wallet credited via webhook: USD");
-        }
-      }
-    }
-
-    await db
-      .update(depositWebhookEventsTable)
-      .set({ processed: true, processedAt: new Date(), processingStatus: "processed", failureReason: null })
-      .where(and(
-        eq(depositWebhookEventsTable.provider, "stripe"),
-        eq(depositWebhookEventsTable.providerEventId, event.id),
-      ));
-  } catch (err) {
-    const failureReason = err instanceof Error ? err.message : "Unknown webhook processing failure";
-    await db
-      .update(depositWebhookEventsTable)
-      .set({ processed: false, processingStatus: "failed", failureReason })
-      .where(and(
-        eq(depositWebhookEventsTable.provider, "stripe"),
-        eq(depositWebhookEventsTable.providerEventId, event.id),
-      ));
-    req.log.error({ err, eventId: event.id, eventType: event.type }, "Stripe deposit webhook processing failed");
-    return res.status(500).json({ error: "Webhook processing failed" });
+  if (config.features.bullmqWebhookProcessingEnabled) {
+    await recordOutboxEvent({
+      topic: "webhook-processing",
+      eventType: "deposit_webhook.process",
+      aggregateType: "deposit_webhook_event",
+      aggregateId: event.id,
+      idempotencyKey: `deposit-webhook:stripe:${event.id}`,
+      payload: { provider: "stripe", providerEventId: event.id },
+    });
+    return res.json({ received: true, queued: true });
   }
 
-  return res.json({ received: true });
+  await processDepositWebhookEvent({ provider: "stripe", providerEventId: event.id });
+  return res.json({ received: true, queued: false });
 });
 
 router.post("/webhooks/razorpay", async (req, res) => {
@@ -1174,7 +997,12 @@ router.post("/webhooks/razorpay", async (req, res) => {
     ? JSON.parse(req.body.toString())
     : req.body) as Record<string, unknown>;
   const eventType = String(body.event ?? "");
-  const eventId = String((body as { id?: string }).id ?? `rzp-${Date.now()}`);
+  const headerEventId = typeof req.headers["x-razorpay-event-id"] === "string"
+    && req.headers["x-razorpay-event-id"].trim()
+    ? req.headers["x-razorpay-event-id"].trim()
+    : null;
+  const bodyEventId = typeof body.id === "string" && body.id.trim() ? body.id.trim() : null;
+  const eventId = headerEventId ?? bodyEventId ?? `rzp-${createHash("sha256").update(rawBody).digest("hex").slice(0, 32)}`;
 
   req.log.info({ eventType, eventId }, "[PaymentBackend] razorpay webhook received");
 
@@ -1187,135 +1015,44 @@ router.post("/webhooks/razorpay", async (req, res) => {
     ))
     .limit(1);
 
-  if (existing?.processed) return res.json({ received: true });
+  if (existing?.processed) {
+    await db
+      .update(depositWebhookEventsTable)
+      .set({ processingStatus: "ignored_duplicate", failureReason: null })
+      .where(and(
+        eq(depositWebhookEventsTable.provider, "razorpay"),
+        eq(depositWebhookEventsTable.providerEventId, eventId),
+      ));
+    return res.json({ received: true });
+  }
 
   await db
     .insert(depositWebhookEventsTable)
-    .values({ provider: "razorpay", providerEventId: eventId, eventType, payload: body, processingStatus: "pending" })
+    .values({ provider: "razorpay", providerEventId: eventId, eventType, payload: body, processingStatus: "received" })
     .onConflictDoNothing();
 
   await db
     .update(depositWebhookEventsTable)
-    .set({
-      processingStatus: "processing",
-      processingAttemptCount: sql`${depositWebhookEventsTable.processingAttemptCount} + 1`,
-      failureReason: null,
-    })
+    .set({ processingStatus: "signature_verified", failureReason: null })
     .where(and(
       eq(depositWebhookEventsTable.provider, "razorpay"),
       eq(depositWebhookEventsTable.providerEventId, eventId),
     ));
 
-  try {
-    if (eventType.startsWith("refund.")) {
-      const payload = body.payload as { refund?: { entity?: Record<string, unknown> } } | undefined;
-      const refundEntity = payload?.refund?.entity ?? {};
-      const providerRefundId = typeof refundEntity.id === "string" ? refundEntity.id : null;
-      await recordProviderRefundWebhook({
-        provider: "razorpay",
-        providerEventId: eventId,
-        eventType,
-        providerRefundId,
-        payload: refundEntity,
-      });
-    }
-
-    if (eventType === "payment.captured" || eventType === "order.paid") {
-      const payload = body.payload as {
-        order?: { entity?: { id?: string } };
-        payment?: { entity?: { id?: string } };
-      } | undefined;
-      const orderId = payload?.order?.entity?.id;
-      const razorpayPaymentId = payload?.payment?.entity?.id;
-
-      if (orderId) {
-        const [depositTx] = await db
-          .select()
-          .from(depositTransactionsTable)
-          .where(
-            and(
-              eq(depositTransactionsTable.providerOrderId, orderId),
-              eq(depositTransactionsTable.provider, "razorpay"),
-            ),
-          )
-          .limit(1);
-
-        if (depositTx && depositTx.status !== "succeeded") {
-          await db.transaction(async (tx) => {
-            const lockedDepositTx = await lockDepositTransactionById(tx, depositTx.id);
-            if (!lockedDepositTx || lockedDepositTx.status === "succeeded") return;
-            if (lockedDepositTx.provider !== "razorpay" || lockedDepositTx.providerOrderId !== orderId) {
-              req.log.warn(
-                { depositTxId: depositTx.id, provider: lockedDepositTx?.provider, providerOrderId: lockedDepositTx?.providerOrderId, orderId },
-                "[PaymentBackend] razorpay webhook: binding mismatch",
-              );
-              return;
-            }
-
-            const walletResult = await ensureLockedWalletForCurrency(tx, lockedDepositTx.userId, "inr");
-            if (walletResult.mismatch) {
-              req.log.warn({ depositTxId: depositTx.id, userId: lockedDepositTx.userId, walletCurrency: walletResult.wallet.currency }, "[PaymentBackend] razorpay webhook: wallet currency mismatch");
-              return;
-            }
-
-            const creditCents = lockedDepositTx.walletCreditCents ?? 1;
-            const amountINR = (lockedDepositTx.amountMinorUnits / 100).toFixed(2);
-
-            await tx
-              .update(depositTransactionsTable)
-              .set({
-                status: "succeeded",
-                providerPaymentId: razorpayPaymentId ?? null,
-                creditedAt: new Date(),
-                updatedAt: new Date(),
-              })
-              .where(eq(depositTransactionsTable.id, lockedDepositTx.id));
-
-            await tx
-              .update(walletsTable)
-              .set({
-                availableBalanceCents: sql`${walletsTable.availableBalanceCents} + ${creditCents}`,
-                totalEarnedCents: sql`${walletsTable.totalEarnedCents} + ${creditCents}`,
-                updatedAt: new Date(),
-              })
-              .where(eq(walletsTable.id, walletResult.wallet.id));
-
-            await tx.insert(walletTransactionsTable).values({
-              walletId: walletResult.wallet.id,
-              userId: lockedDepositTx.userId,
-              transactionType: "manual_adjustment",
-              amountCents: creditCents,
-              currency: "inr",
-              status: "completed",
-              description: `Deposit via Razorpay — ₹${amountINR}`,
-            });
-          });
-          req.log.info({ txId: depositTx.id }, "[PaymentBackend] wallet credited via webhook: INR");
-        }
-      }
-    }
-
-    await db
-      .update(depositWebhookEventsTable)
-      .set({ processed: true, processedAt: new Date(), processingStatus: "processed", failureReason: null })
-      .where(and(
-        eq(depositWebhookEventsTable.provider, "razorpay"),
-        eq(depositWebhookEventsTable.providerEventId, eventId),
-      ));
-  } catch (err) {
-    const failureReason = err instanceof Error ? err.message : "Unknown webhook processing failure";
-    await db
-      .update(depositWebhookEventsTable)
-      .set({ processed: false, processingStatus: "failed", failureReason })
-      .where(and(
-        eq(depositWebhookEventsTable.provider, "razorpay"),
-        eq(depositWebhookEventsTable.providerEventId, eventId),
-      ));
-    req.log.error({ err, eventId, eventType }, "Razorpay deposit webhook processing failed");
-    return res.status(500).json({ error: "Webhook processing failed" });
+  if (config.features.bullmqWebhookProcessingEnabled) {
+    await recordOutboxEvent({
+      topic: "webhook-processing",
+      eventType: "deposit_webhook.process",
+      aggregateType: "deposit_webhook_event",
+      aggregateId: eventId,
+      idempotencyKey: `deposit-webhook:razorpay:${eventId}`,
+      payload: { provider: "razorpay", providerEventId: eventId },
+    });
+    return res.json({ received: true, queued: true });
   }
 
-  return res.json({ received: true });
+  await processDepositWebhookEvent({ provider: "razorpay", providerEventId: eventId });
+  return res.json({ received: true, queued: false });
 });
 
 export default router;

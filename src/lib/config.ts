@@ -54,6 +54,11 @@ const envSchema = z
     CASH_FEATURES_ENABLED: z.enum(["true", "false"]).optional(),
     FEATURE_CASH_FEATURES: z.enum(["true", "false"]).optional(),
     FEATURE_COIN_ENTRY_CHALLENGES: z.enum(["true", "false"]).optional(),
+    REAL_MONEY_PRODUCTION_APPROVED: z.enum(["true", "false"]).optional(),
+    REAL_MONEY_LEGAL_APPROVED: z.enum(["true", "false"]).optional(),
+    REAL_MONEY_KYC_TAX_READY: z.enum(["true", "false"]).optional(),
+    REAL_MONEY_PROVIDER_SANDBOX_TESTED: z.enum(["true", "false"]).optional(),
+    REAL_MONEY_WITHDRAWAL_CONTROLS_READY: z.enum(["true", "false"]).optional(),
     STRIPE_SECRET_KEY: z.string().optional(),
     STRIPE_WEBHOOK_SECRET: z.string().optional(),
     RAZORPAY_KEY_ID: z.string().optional(),
@@ -127,6 +132,14 @@ const featureFlags = {
   allowTestRoutes: parseBoolean(rawEnv.ALLOW_TEST_ROUTES),
   allowDemoSeeds: parseBoolean(rawEnv.ALLOW_DEMO_SEEDS),
   mockProvidersEnabled: parseBoolean(rawEnv.MOCK_PROVIDERS_ENABLED),
+};
+
+const realMoneyReadiness = {
+  productionApproved: parseBoolean(rawEnv.REAL_MONEY_PRODUCTION_APPROVED),
+  legalApproved: parseBoolean(rawEnv.REAL_MONEY_LEGAL_APPROVED),
+  kycTaxReady: parseBoolean(rawEnv.REAL_MONEY_KYC_TAX_READY),
+  providerSandboxTested: parseBoolean(rawEnv.REAL_MONEY_PROVIDER_SANDBOX_TESTED),
+  withdrawalControlsReady: parseBoolean(rawEnv.REAL_MONEY_WITHDRAWAL_CONTROLS_READY),
 };
 
 const processRole = process.env.APP_PROCESS_ROLE?.trim()
@@ -204,6 +217,36 @@ if (isProduction) {
   } else if (!rawEnv.OBJECT_STORAGE_PUBLIC_BASE_URL.startsWith("https://")) {
     configErrors.push("OBJECT_STORAGE_PUBLIC_BASE_URL must use https:// in production");
   }
+
+  if (featureFlags.cashFeaturesEnabled) {
+    if (!realMoneyReadiness.productionApproved) {
+      configErrors.push("REAL_MONEY_PRODUCTION_APPROVED=true is required when cash features are enabled in production");
+    }
+    if (!realMoneyReadiness.legalApproved) {
+      configErrors.push("REAL_MONEY_LEGAL_APPROVED=true is required when cash features are enabled in production");
+    }
+    if (!realMoneyReadiness.kycTaxReady) {
+      configErrors.push("REAL_MONEY_KYC_TAX_READY=true is required when cash features are enabled in production");
+    }
+    if (!realMoneyReadiness.providerSandboxTested) {
+      configErrors.push("REAL_MONEY_PROVIDER_SANDBOX_TESTED=true is required when cash features are enabled in production");
+    }
+    if (!realMoneyReadiness.withdrawalControlsReady) {
+      configErrors.push("REAL_MONEY_WITHDRAWAL_CONTROLS_READY=true is required when cash features are enabled in production");
+    }
+    if (!featureFlags.bullmqWebhookProcessingEnabled) {
+      configErrors.push("ENABLE_BULLMQ_WEBHOOK_PROCESSING=true is required when cash features are enabled in production");
+    }
+    if (!featureFlags.runBackgroundJobs) {
+      configErrors.push("RUN_BACKGROUND_JOBS=true is required when cash features are enabled in production");
+    }
+    if (!rawEnv.STRIPE_WEBHOOK_SECRET?.trim()) {
+      configErrors.push("STRIPE_WEBHOOK_SECRET is required when cash features are enabled in production");
+    }
+    if (!rawEnv.RAZORPAY_WEBHOOK_SECRET?.trim()) {
+      configErrors.push("RAZORPAY_WEBHOOK_SECRET is required when cash features are enabled in production");
+    }
+  }
 }
 
 if (configErrors.length > 0) {
@@ -224,6 +267,7 @@ export const config = {
       : false,
   trustedProxyCidrs,
   features: featureFlags,
+  realMoneyReadiness,
   processRole,
   runtime: {
     requestTimeoutMs: 15_000,

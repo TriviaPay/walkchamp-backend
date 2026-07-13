@@ -1,15 +1,19 @@
-import { pgTable, text, integer, timestamp, pgEnum, uuid, jsonb } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, text, integer, timestamp, pgEnum, uuid, jsonb, uniqueIndex } from "drizzle-orm/pg-core";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 import { profilesTable } from "./profiles.js";
 
 export const walletTransactionTypeEnum = pgEnum("wallet_transaction_type", [
+  "deposit_credit",
   "race_entry_payment",
   "race_entry_wallet_debit",
   "race_entry_refund",
   "race_prize_pending",
   "race_prize_approved",
   "race_prize_paid",
+  "deposit_refund_debit",
+  "chargeback_debit",
   "withdrawal_requested",
   "withdrawal_approved",
   "withdrawal_rejected",
@@ -64,6 +68,8 @@ export const walletTransactionsTable = pgTable("wallet_transactions", {
   status: walletTransactionStatusEnum("status").notNull().default("pending"),
   description: text("description").notNull(),
   source: text("source"),
+  idempotencyKey: text("idempotency_key"),
+  depositTransactionId: uuid("deposit_transaction_id"),
   raceRoomId: uuid("race_room_id"),
   challengeId: uuid("challenge_id"),
   paymentId: uuid("payment_id"),
@@ -74,7 +80,14 @@ export const walletTransactionsTable = pgTable("wallet_transactions", {
   balanceAfterCents: integer("balance_after_cents"),
   metadata: jsonb("metadata"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
-});
+}, (table) => [
+  uniqueIndex("wallet_transactions_idempotency_key_unique_idx")
+    .on(table.idempotencyKey)
+    .where(sql`${table.idempotencyKey} IS NOT NULL`),
+  uniqueIndex("wallet_transactions_deposit_credit_unique_idx")
+    .on(table.depositTransactionId)
+    .where(sql`${table.depositTransactionId} IS NOT NULL AND ${table.transactionType}::text = 'deposit_credit'`),
+]);
 
 export const insertWalletSchema = createInsertSchema(walletsTable).omit({
   id: true,

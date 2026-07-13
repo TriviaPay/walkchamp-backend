@@ -7,6 +7,7 @@ import { config } from "./lib/config.js";
 import { startWorkerOwnedRecurringJobs } from "./lib/backgroundJobs.js";
 import { startOutboxDispatcher } from "./lib/outbox.js";
 import { processApprovedRefundJob } from "./lib/refundService.js";
+import { processDepositWebhookEvent } from "./lib/depositWebhookProcessor.js";
 
 async function reconcileAllCoinBalances() {
   const users = await db.select({ userId: coinBalancesTable.userId }).from(coinBalancesTable);
@@ -42,6 +43,16 @@ async function main() {
       if (!refundItemId) throw new Error("refund-processing job missing refundItemId");
       await processApprovedRefundJob({ refundItemId });
     }, { concurrency: 2 });
+    startQueueWorker("webhook-processing", async (job) => {
+      if (job.name !== "deposit_webhook.process") return;
+      const payload = job.data.payload as { provider?: unknown; providerEventId?: unknown } | undefined;
+      const provider = payload?.provider;
+      const providerEventId = payload?.providerEventId;
+      if ((provider !== "stripe" && provider !== "razorpay") || typeof providerEventId !== "string") {
+        throw new Error("webhook-processing job missing deposit webhook identity");
+      }
+      await processDepositWebhookEvent({ provider, providerEventId });
+    }, { concurrency: 4 });
   }
 
   await runIdempotentJob({

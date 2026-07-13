@@ -8,6 +8,7 @@ import {
   walletTransactionsTable,
   withdrawalsTable,
   notificationsTable,
+  operationalLocksTable,
 } from "../../db/src/schema/index.js";
 import { eq, and, desc, ilike, or, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger.js";
@@ -23,10 +24,62 @@ import {
   listRefunds,
   rejectRefund,
 } from "../lib/refundService.js";
+import { assertOperationalLockOpen, setOperationalLock, WALLET_LEDGER_ANOMALY_LOCK } from "../lib/operationalLocks.js";
 
 const router = Router();
 
 router.use("/admin", requireAuth, requireAdminRole);
+
+// ── Operational Locks ────────────────────────────────────────────────────────
+router.get("/admin/operational-locks", async (_req, res) => {
+  const locks = await db
+    .select()
+    .from(operationalLocksTable)
+    .orderBy(desc(operationalLocksTable.updatedAt));
+  return res.json({ locks });
+});
+
+const resolveOperationalLockSchema = z.object({
+  reason: z.string().min(5).max(500),
+});
+
+router.post("/admin/operational-locks/:key/resolve", async (req, res) => {
+  const key = String(req.params.key);
+  const parsed = resolveOperationalLockSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "reason is required" });
+
+  const [lock] = await db
+    .select()
+    .from(operationalLocksTable)
+    .where(eq(operationalLocksTable.key, key))
+    .limit(1);
+
+  if (!lock) return res.status(404).json({ error: "Operational lock not found" });
+  if (!lock.locked) return res.status(409).json({ error: "Operational lock is not active" });
+
+  await setOperationalLock({
+    key,
+    locked: false,
+    reason: parsed.data.reason,
+    metadata: {
+      previousReason: lock.reason,
+      previousMetadata: lock.metadata,
+      resolvedByAdminUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
+    },
+  });
+
+  void writeAuditLog({
+    actorUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
+    actorType: "admin",
+    action: "admin.operational_lock.resolve",
+    entityType: "operational_lock",
+    entityId: key,
+    reason: parsed.data.reason,
+    metadata: { previousReason: lock.reason, previousMetadata: lock.metadata },
+  });
+
+  return res.json({ ok: true });
+});
 
 // ── Refund Administration ────────────────────────────────────────────────────
 router.get("/admin/refunds", async (req, res) => {
@@ -333,6 +386,21 @@ router.get("/admin/withdrawals", requireCashFeaturesEnabled, async (req, res) =>
 router.post("/admin/withdrawals/:id/approve", requireCashFeaturesEnabled, async (req, res) => {
   const withdrawalId = String(req.params.id);
 
+  try {
+    await assertOperationalLockOpen(
+      WALLET_LEDGER_ANOMALY_LOCK,
+      "Withdrawal approvals are paused while wallet ledger reconciliation is under review.",
+    );
+  } catch (err) {
+    if (err instanceof Error && err.name === "OPERATIONAL_LOCK_ACTIVE") {
+      return res.status(503).json({
+        error: err.message,
+        code: "WITHDRAWAL_APPROVALS_PAUSED_LEDGER_REVIEW",
+      });
+    }
+    throw err;
+  }
+
   const [row] = await db
     .select()
     .from(withdrawalsTable)
@@ -367,29 +435,96 @@ router.post("/admin/withdrawals/:id/reject", requireCashFeaturesEnabled, async (
   const parsed = rejectSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "reason is required" });
 
-  const [row] = await db
-    .select()
-    .from(withdrawalsTable)
-    .where(eq(withdrawalsTable.id, withdrawalId))
-    .limit(1);
+  const result = await db.transaction(async (tx) => {
+    const [row] = await tx
+      .select()
+      .from(withdrawalsTable)
+      .where(eq(withdrawalsTable.id, withdrawalId))
+      .limit(1)
+      .for("update");
 
-  if (!row) return res.status(404).json({ error: "Withdrawal not found" });
-  if (row.status !== "pending") return res.status(409).json({ error: `Withdrawal is already ${row.status}` });
+    if (!row) return { status: "not_found" as const };
+    if (row.status !== "pending") return { status: "conflict" as const, withdrawal: row };
 
-  await db
-    .update(withdrawalsTable)
-    .set({ status: "rejected", updatedAt: new Date() })
-    .where(eq(withdrawalsTable.id, withdrawalId));
+    const [wallet] = await tx
+      .select()
+      .from(walletsTable)
+      .where(eq(walletsTable.userId, row.userId))
+      .limit(1)
+      .for("update");
 
-  // Return funds to user wallet (best-effort)
-  db.update(walletsTable)
-    .set({
-      availableBalanceCents: sql`available_balance_cents + ${row.amountCents}`,
-      withdrawableBalanceCents: sql`withdrawable_balance_cents + ${row.amountCents}`,
-      updatedAt: new Date(),
-    })
-    .where(eq(walletsTable.userId, row.userId))
-    .catch((err) => logger.error({ withdrawalId, err }, "Admin: failed to refund wallet on rejection"));
+    if (!wallet) return { status: "wallet_not_found" as const, withdrawal: row };
+
+    const beforeAvailable = wallet.availableBalanceCents;
+    const afterAvailable = beforeAvailable + row.amountCents;
+    const beforeWithdrawable = wallet.withdrawableBalanceCents;
+    const afterWithdrawable = beforeWithdrawable + row.amountCents;
+
+    await tx
+      .update(withdrawalsTable)
+      .set({
+        status: "rejected",
+        rejectedAt: new Date(),
+        reviewedAt: new Date(),
+        reviewedBy: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
+        reviewNotes: parsed.data.reason,
+        updatedAt: new Date(),
+      })
+      .where(eq(withdrawalsTable.id, withdrawalId));
+
+    await tx
+      .update(walletsTable)
+      .set({
+        availableBalanceCents: afterAvailable,
+        withdrawableBalanceCents: afterWithdrawable,
+        updatedAt: new Date(),
+      })
+      .where(eq(walletsTable.id, wallet.id));
+
+    await tx
+      .update(walletTransactionsTable)
+      .set({
+        status: "cancelled",
+        metadata: sql`coalesce(${walletTransactionsTable.metadata}, '{}'::jsonb) || ${JSON.stringify({
+          withdrawalRejectedAt: new Date().toISOString(),
+          rejectionReason: parsed.data.reason,
+        })}::jsonb`,
+      })
+      .where(and(
+        eq(walletTransactionsTable.withdrawalId, withdrawalId),
+        eq(walletTransactionsTable.transactionType, "withdrawal_requested"),
+      ));
+
+    await tx
+      .insert(walletTransactionsTable)
+      .values({
+        walletId: wallet.id,
+        userId: row.userId,
+        transactionType: "withdrawal_rejected",
+        amountCents: row.amountCents,
+        currency: wallet.currency,
+        status: "completed",
+        description: `Withdrawal rejected - funds restored`,
+        withdrawalId,
+        idempotencyKey: `withdrawal_rejected:${withdrawalId}`,
+        balanceBeforeCents: beforeAvailable,
+        balanceAfterCents: afterAvailable,
+        metadata: {
+          reason: parsed.data.reason,
+          withdrawableBeforeCents: beforeWithdrawable,
+          withdrawableAfterCents: afterWithdrawable,
+        },
+      })
+      .onConflictDoNothing();
+
+    return { status: "rejected" as const, withdrawal: row };
+  });
+
+  if (result.status === "not_found") return res.status(404).json({ error: "Withdrawal not found" });
+  if (result.status === "wallet_not_found") return res.status(409).json({ error: "Wallet not found for withdrawal." });
+  if (result.status === "conflict") return res.status(409).json({ error: `Withdrawal is already ${result.withdrawal.status}` });
+
+  const row = result.withdrawal;
 
   logger.info({ withdrawalId, userId: row.userId, reason: parsed.data.reason }, "Admin: withdrawal rejected");
   void writeAuditLog({

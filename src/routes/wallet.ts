@@ -10,6 +10,7 @@ import { eq, desc, sql, lt, and } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
+import { assertOperationalLockOpen, WALLET_LEDGER_ANOMALY_LOCK } from "../lib/operationalLocks.js";
 
 const router = Router();
 
@@ -18,6 +19,31 @@ router.use("/wallet", requireCashFeaturesEnabled);
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const MIN_WITHDRAWAL_CENTS = 500; // $5.00
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9._:-]{8,120}$/;
+
+class WithdrawalRequestError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+function getWithdrawalIdempotencyKey(
+  req: AuthenticatedRequest,
+  bodyKey?: string,
+): { key: string | null; error: string | null } {
+  const header = req.headers["idempotency-key"];
+  const headerKey = Array.isArray(header) ? header[0] : header;
+  const raw = (headerKey ?? bodyKey ?? "").trim();
+  if (!raw) return { key: null, error: "Withdrawal requests require an Idempotency-Key header." };
+  if (!IDEMPOTENCY_KEY_RE.test(raw)) {
+    return { key: null, error: "Idempotency key must be 8-120 characters using letters, numbers, '.', '_', ':', or '-'." };
+  }
+  return { key: raw, error: null };
+}
 
 // Get or create a wallet for the user, returns the wallet row.
 async function getOrCreateWallet(userId: string) {
@@ -41,9 +67,13 @@ function walletToDollars(wallet: typeof walletsTable.$inferSelect) {
   return {
     id: wallet.id,
     availableBalance: wallet.availableBalanceCents / 100,
+    availableBalanceMinor: wallet.availableBalanceCents,
     pendingBalance: wallet.pendingBalanceCents / 100,
+    heldBalanceMinor: wallet.pendingBalanceCents,
     withdrawableBalance: wallet.withdrawableBalanceCents / 100,
     totalEarned: wallet.totalEarnedCents / 100,
+    totalBalanceMinor: wallet.availableBalanceCents + wallet.pendingBalanceCents,
+    totalEarnedMinor: wallet.totalEarnedCents,
     currency: wallet.currency,
     updatedAt: wallet.updatedAt,
   };
@@ -53,6 +83,7 @@ function walletToDollars(wallet: typeof walletsTable.$inferSelect) {
 function mapTxType(type: string): "reward" | "withdrawal" | "bonus" | "referral" | "race_entry" | "prize" | "refund" {
   if (type.includes("prize") || type.includes("reward") || type === "sponsored_reward") return "reward";
   if (type.includes("withdrawal")) return "withdrawal";
+  if (type === "deposit_credit") return "bonus";
   if (type === "referral_credit") return "referral";
   if (type === "race_entry_refund") return "refund";
   if (type === "race_entry_payment" || type === "race_entry_wallet_debit") return "race_entry";
@@ -97,9 +128,13 @@ router.get("/wallet/summary", requireAuth, async (req, res) => {
   return res.json({
     success: true,
     balance: w.availableBalance,
+    availableBalanceMinor: w.availableBalanceMinor,
     pendingBalance: w.pendingBalance,
+    heldBalanceMinor: w.heldBalanceMinor,
     withdrawableBalance: w.withdrawableBalance,
     totalEarned: w.totalEarned,
+    totalBalanceMinor: w.totalBalanceMinor,
+    totalEarnedMinor: w.totalEarnedMinor,
     currency: w.currency,
     walletCurrency,
     availablePaymentProvider,
@@ -185,6 +220,7 @@ const withdrawSchema = z.object({
   amount: z.number().positive().finite(),
   payoutMethod: z.enum(["paypal", "bank_transfer", "upi", "gift_card"]),
   payoutDetails: z.record(z.string()),
+  idempotencyKey: z.string().optional(),
 });
 
 router.post("/wallet/withdraw", requireAuth, async (req, res) => {
@@ -194,8 +230,31 @@ router.post("/wallet/withdraw", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Invalid request body", details: parsed.error.issues });
   }
 
+  try {
+    await assertOperationalLockOpen(
+      WALLET_LEDGER_ANOMALY_LOCK,
+      "Withdrawals are temporarily paused while wallet ledger reconciliation is under review.",
+    );
+  } catch (err) {
+    if (err instanceof Error && err.name === "OPERATIONAL_LOCK_ACTIVE") {
+      return res.status(503).json({
+        error: err.message,
+        code: "WITHDRAWALS_PAUSED_LEDGER_REVIEW",
+      });
+    }
+    throw err;
+  }
+
   const { amount, payoutMethod, payoutDetails } = parsed.data;
   const amountCents = Math.round(amount * 100);
+  const idempotency = getWithdrawalIdempotencyKey(req as AuthenticatedRequest, parsed.data.idempotencyKey);
+  if (!idempotency.key) {
+    return res.status(400).json({
+      error: idempotency.error,
+      code: "IDEMPOTENCY_KEY_REQUIRED",
+    });
+  }
+  const withdrawalIdempotencyKey = `withdrawal:${userId}:${idempotency.key}`;
 
   if (amountCents < MIN_WITHDRAWAL_CENTS) {
     return res.status(400).json({ error: `Minimum withdrawal is $${MIN_WITHDRAWAL_CENTS / 100}.00` });
@@ -224,54 +283,130 @@ router.post("/wallet/withdraw", requireAuth, async (req, res) => {
     return res.status(403).json({ error: "Your account is under review and cannot withdraw at this time." });
   }
 
-  const wallet = await getOrCreateWallet(userId);
+  let reused = false;
+  let withdrawal: typeof withdrawalsTable.$inferSelect;
+  try {
+    const result = await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(withdrawalsTable)
+        .where(eq(withdrawalsTable.idempotencyKey, withdrawalIdempotencyKey))
+        .limit(1);
 
-  if (amountCents > wallet.withdrawableBalanceCents) {
-    return res.status(400).json({
-      error: `Insufficient withdrawable balance. Available: $${(wallet.withdrawableBalanceCents / 100).toFixed(2)}`,
+      if (existing) {
+        if (existing.userId !== userId || existing.amountCents !== amountCents || existing.payoutMethod !== payoutMethod) {
+          throw new WithdrawalRequestError(409, "IDEMPOTENCY_KEY_REUSED", "Idempotency key was already used for a different withdrawal request.");
+        }
+        return { withdrawal: existing, reused: true };
+      }
+
+      let [wallet] = await tx
+        .select()
+        .from(walletsTable)
+        .where(eq(walletsTable.userId, userId))
+        .limit(1)
+        .for("update");
+
+      if (!wallet) {
+        [wallet] = await tx
+          .insert(walletsTable)
+          .values({ userId })
+          .returning();
+      }
+
+      if (amountCents > wallet.withdrawableBalanceCents || amountCents > wallet.availableBalanceCents) {
+        throw new WithdrawalRequestError(
+          400,
+          "INSUFFICIENT_WITHDRAWABLE_BALANCE",
+          `Insufficient withdrawable balance. Available: $${(wallet.withdrawableBalanceCents / 100).toFixed(2)}`,
+        );
+      }
+
+      const [wd] = await tx
+        .insert(withdrawalsTable)
+        .values({
+          userId,
+          amountCents,
+          currency: wallet.currency,
+          payoutMethod,
+          payoutDetails,
+          idempotencyKey: withdrawalIdempotencyKey,
+        })
+        .onConflictDoNothing()
+        .returning();
+
+      if (!wd) {
+        const [conflicting] = await tx
+          .select()
+          .from(withdrawalsTable)
+          .where(eq(withdrawalsTable.idempotencyKey, withdrawalIdempotencyKey))
+          .limit(1);
+        if (!conflicting) {
+          throw new WithdrawalRequestError(409, "WITHDRAWAL_IDEMPOTENCY_CONFLICT", "Withdrawal idempotency conflict.");
+        }
+        return { withdrawal: conflicting, reused: true };
+      }
+
+      const beforeAvailable = wallet.availableBalanceCents;
+      const afterAvailable = beforeAvailable - amountCents;
+      const beforeWithdrawable = wallet.withdrawableBalanceCents;
+      const afterWithdrawable = beforeWithdrawable - amountCents;
+
+      const updatedWallet = await tx
+        .update(walletsTable)
+        .set({
+          availableBalanceCents: sql`${walletsTable.availableBalanceCents} - ${amountCents}`,
+          withdrawableBalanceCents: sql`${walletsTable.withdrawableBalanceCents} - ${amountCents}`,
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(walletsTable.id, wallet.id),
+          sql`${walletsTable.availableBalanceCents} >= ${amountCents}`,
+          sql`${walletsTable.withdrawableBalanceCents} >= ${amountCents}`,
+        ))
+        .returning({ id: walletsTable.id });
+
+      if (updatedWallet.length === 0) {
+        throw new WithdrawalRequestError(
+          400,
+          "INSUFFICIENT_WITHDRAWABLE_BALANCE",
+          "Insufficient withdrawable balance.",
+        );
+      }
+
+      await tx.insert(walletTransactionsTable).values({
+        walletId: wallet.id,
+        userId,
+        transactionType: "withdrawal_requested",
+        amountCents: -amountCents,
+        currency: wallet.currency,
+        status: "pending",
+        description: `Withdrawal via ${payoutMethod.replace("_", " ")} - pending admin review`,
+        withdrawalId: wd.id,
+        idempotencyKey: `withdrawal_requested:${wd.id}`,
+        balanceBeforeCents: beforeAvailable,
+        balanceAfterCents: afterAvailable,
+        metadata: {
+          withdrawalIdempotencyKey,
+          withdrawableBeforeCents: beforeWithdrawable,
+          withdrawableAfterCents: afterWithdrawable,
+        },
+      });
+
+      return { withdrawal: wd, reused: false };
     });
+    withdrawal = result.withdrawal;
+    reused = result.reused;
+  } catch (err) {
+    if (err instanceof WithdrawalRequestError) {
+      return res.status(err.statusCode).json({ error: err.message, code: err.code });
+    }
+    throw err;
   }
 
-  // Create withdrawal + deduct from withdrawable balance atomically
-  const [withdrawal] = await db.transaction(async (tx) => {
-    const [wd] = await tx
-      .insert(withdrawalsTable)
-      .values({
-        userId,
-        amountCents,
-        currency: wallet.currency,
-        payoutMethod,
-        payoutDetails,
-      })
-      .returning();
+  req.log.info({ withdrawalId: withdrawal.id, amountCents, payoutMethod, reused }, "withdrawal requested");
 
-    // Deduct from withdrawable balance
-    await tx
-      .update(walletsTable)
-      .set({
-        withdrawableBalanceCents: sql`${walletsTable.withdrawableBalanceCents} - ${amountCents}`,
-        updatedAt: new Date(),
-      })
-      .where(eq(walletsTable.id, wallet.id));
-
-    // Record ledger entry
-    await tx.insert(walletTransactionsTable).values({
-      walletId: wallet.id,
-      userId,
-      transactionType: "withdrawal_requested",
-      amountCents: -amountCents,
-      currency: wallet.currency,
-      status: "pending",
-      description: `Withdrawal via ${payoutMethod.replace("_", " ")} — pending admin review`,
-      withdrawalId: wd.id,
-    });
-
-    return [wd];
-  });
-
-  req.log.info({ withdrawalId: withdrawal.id, amountCents, payoutMethod }, "withdrawal requested");
-
-  return res.status(201).json({
+  return res.status(reused ? 200 : 201).json({
     withdrawal: {
       id: withdrawal.id,
       amount: withdrawal.amountCents / 100,

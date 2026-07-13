@@ -64,6 +64,13 @@
       "when": 1781986000000,
       "tag": "0008_group_daily_goal_notifications",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1781986600000,
+      "tag": "0009_wallet_payment_hardening",
+      "breakpoints": true
     }
   ]
 }

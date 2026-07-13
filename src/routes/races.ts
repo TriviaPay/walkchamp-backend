@@ -57,6 +57,7 @@ import {
   resolvePaymentProvider,
 } from "../lib/cashChallengeFees.js";
 import {
+  creditCashChallengePrizes,
   debitCashChallengeEntry,
   hasCompletedEntryPayment,
 } from "../lib/cashChallengePayments.js";
@@ -710,26 +711,41 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   // If results insertion fails for any reason, the race is still marked done so
   // cleanupOverdueRaces won't loop forever retrying a broken insert.
   try {
-    await db
-      .update(raceRoomsTable)
-      .set({
-        status: "completed",
-        completedAt: new Date(),
-        updatedAt: new Date(),
-        ...(!isSponsored && { prizePoolCents: totalPoolCents }),
-        winnersPoolCents,
-        platformFeeCents: platformFeeCentsVal,
-        rewardSplitJson: rewardSplitForRoom as unknown as null,
-        winnerCount: numWinners(uniqueParticipants.length),
-        unawardedAmountCents,
-        payoutFinalizedAt: new Date(),
-        ...(room.entryType === "coins_battle" && {
-          coinWinnersPool,
-          coinPlatformFee: coinPlatformFeeCoins,
-          rewardsProcessed: true,
-        }),
-      })
-      .where(and(eq(raceRoomsTable.id, raceId), eq(raceRoomsTable.status, "in_progress")));
+    await db.transaction(async (tx) => {
+      const payoutFinalizedAt = new Date();
+      const updated = await tx
+        .update(raceRoomsTable)
+        .set({
+          status: "completed",
+          completedAt: payoutFinalizedAt,
+          updatedAt: payoutFinalizedAt,
+          ...(!isSponsored && { prizePoolCents: totalPoolCents }),
+          winnersPoolCents,
+          platformFeeCents: platformFeeCentsVal,
+          rewardSplitJson: rewardSplitForRoom as unknown as null,
+          winnerCount: numWinners(uniqueParticipants.length),
+          unawardedAmountCents,
+          payoutFinalizedAt,
+          ...(room.entryType === "coins_battle" && {
+            coinWinnersPool,
+            coinPlatformFee: coinPlatformFeeCoins,
+            rewardsProcessed: true,
+          }),
+        })
+        .where(and(eq(raceRoomsTable.id, raceId), eq(raceRoomsTable.status, "in_progress")))
+        .returning({ id: raceRoomsTable.id });
+
+      if (updated.length === 0) return;
+
+      if (room.entryAmountCents > 0) {
+        await creditCashChallengePrizes(tx, {
+          raceRoomId: raceId,
+          payouts: resultRows
+            .filter((r) => r.eligibleForPrize && r.prizeCents > 0)
+            .map((r) => ({ userId: r.userId, rank: r.rank, prizeCents: r.prizeCents })),
+        });
+      }
+    });
   } catch (err) {
     logger.error({ raceId, err }, "autoCompleteRace: race_rooms status update failed");
     throw err;
