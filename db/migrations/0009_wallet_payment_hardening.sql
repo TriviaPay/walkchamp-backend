@@ -23,7 +23,7 @@ WHERE "idempotency_key" IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS "wallet_transactions_deposit_credit_unique_idx"
 ON "wallet_transactions" USING btree ("deposit_transaction_id")
 WHERE "deposit_transaction_id" IS NOT NULL
-  AND "transaction_type"::text = 'deposit_credit';
+  AND "transaction_type" = 'deposit_credit'::"public"."wallet_transaction_type";
 --> statement-breakpoint
 UPDATE "deposit_transactions"
 SET "status" = 'processing', "updated_at" = now()

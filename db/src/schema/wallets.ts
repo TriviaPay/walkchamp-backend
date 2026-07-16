@@ -86,7 +86,7 @@ export const walletTransactionsTable = pgTable("wallet_transactions", {
     .where(sql`${table.idempotencyKey} IS NOT NULL`),
   uniqueIndex("wallet_transactions_deposit_credit_unique_idx")
     .on(table.depositTransactionId)
-    .where(sql`${table.depositTransactionId} IS NOT NULL AND ${table.transactionType}::text = 'deposit_credit'`),
+    .where(sql`${table.depositTransactionId} IS NOT NULL AND ${table.transactionType} = 'deposit_credit'::wallet_transaction_type`),
 ]);
 
 export const insertWalletSchema = createInsertSchema(walletsTable).omit({
