@@ -195,6 +195,7 @@ describe("wallet payment hardening", () => {
     expect(config).toContain("REAL_MONEY_PROVIDER_SANDBOX_TESTED");
     expect(config).toContain("REAL_MONEY_WITHDRAWAL_CONTROLS_READY");
     expect(config).toContain("ENABLE_BULLMQ_WEBHOOK_PROCESSING=true is required when cash features are enabled in production");
+    expect(config).toContain("RUN_BACKGROUND_JOBS=true is required for worker when cash features are enabled in production");
     expect(config).toContain("STRIPE_WEBHOOK_SECRET is required when cash features are enabled in production");
     expect(config).toContain("RAZORPAY_WEBHOOK_SECRET is required when cash features are enabled in production");
   });

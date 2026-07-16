@@ -239,8 +239,8 @@ if (isProduction) {
     if (!featureFlags.bullmqWebhookProcessingEnabled) {
       configErrors.push("ENABLE_BULLMQ_WEBHOOK_PROCESSING=true is required when cash features are enabled in production");
     }
-    if (!featureFlags.runBackgroundJobs) {
-      configErrors.push("RUN_BACKGROUND_JOBS=true is required when cash features are enabled in production");
+    if (processRole === "worker" && !featureFlags.runBackgroundJobs) {
+      configErrors.push("RUN_BACKGROUND_JOBS=true is required for worker when cash features are enabled in production");
     }
     if (!rawEnv.STRIPE_WEBHOOK_SECRET?.trim()) {
       configErrors.push("STRIPE_WEBHOOK_SECRET is required when cash features are enabled in production");

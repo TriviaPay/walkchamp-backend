@@ -5,7 +5,7 @@ import {
   userTrackThemesTable,
   coinBalancesTable,
 } from "../../db/src/schema/index.js";
-import { eq, and, asc } from "drizzle-orm";
+import { eq, and, asc, ne } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { getCoinBalance, spendCoins } from "../lib/coinsService.js";
 import {
@@ -18,11 +18,12 @@ import { config } from "../lib/config.js";
 
 const router = Router();
 const THEME_OBJECT_EXTENSIONS = ["", ".png", ".jpg", ".jpeg", ".webp", ".gif"];
+const GLOBAL_DEFAULT_THEME_CODE = "bg";
 
 // ── Default themes seeded on first request ────────────────────────────────────
 const DEFAULT_THEMES = [
   { code: "bg",          name: "Neon Finish",      priceCoins: 0,    isDefault: true,  sortOrder: 0  },
-  { code: "daylightStadium", name: "Daylight Stadium", priceCoins: 0, isDefault: true,  sortOrder: 1  },
+  { code: "daylightStadium", name: "Daylight Stadium", priceCoins: 0, isDefault: false, sortOrder: 1  },
   { code: "bg1",         name: "Arcade Track",     priceCoins: 250,  isDefault: false, sortOrder: 2  },
   { code: "galaxy",      name: "Galaxy",           priceCoins: 500,  isDefault: false, sortOrder: 3  },
   { code: "forest",      name: "Forest",           priceCoins: 750,  isDefault: false, sortOrder: 4  },
@@ -60,29 +61,105 @@ const DEFAULT_THEMES = [
 ];
 
 let seeded = false;
+let seedThemesPromise: Promise<void> | null = null;
 
 async function seedThemesIfNeeded(): Promise<void> {
   if (seeded) return;
-  seeded = true; // set early to prevent concurrent calls
-  // Insert all themes; onConflictDoNothing safely skips already-existing rows
-  await db
-    .insert(raceTrackThemesTable)
-    .values(
-      DEFAULT_THEMES.map((t) => ({
-        code: t.code,
-        name: t.name,
-        priceCoins: t.priceCoins,
-        assetKey: t.code,
-        sortOrder: t.sortOrder,
-        isDefault: t.isDefault,
-        isActive: true,
-      })),
-    )
-    .onConflictDoNothing();
+  if (!seedThemesPromise) {
+    seedThemesPromise = (async () => {
+      // Insert all themes; onConflictDoNothing safely skips already-existing rows
+      await db
+        .insert(raceTrackThemesTable)
+        .values(
+          DEFAULT_THEMES.map((t) => ({
+            code: t.code,
+            name: t.name,
+            priceCoins: t.priceCoins,
+            assetKey: t.code,
+            sortOrder: t.sortOrder,
+            isDefault: t.isDefault,
+            isActive: true,
+          })),
+        )
+        .onConflictDoNothing();
+
+      // Keep exactly one global fallback default. Per-user defaults live in user_track_themes.
+      await db
+        .update(raceTrackThemesTable)
+        .set({ isDefault: false, updatedAt: new Date() })
+        .where(ne(raceTrackThemesTable.code, GLOBAL_DEFAULT_THEME_CODE));
+
+      await db
+        .update(raceTrackThemesTable)
+        .set({ isDefault: true, updatedAt: new Date() })
+        .where(eq(raceTrackThemesTable.code, GLOBAL_DEFAULT_THEME_CODE));
+
+      seeded = true;
+    })().catch((err: unknown) => {
+      seedThemesPromise = null;
+      throw err;
+    });
+  }
+
+  await seedThemesPromise;
 }
 
 function buildThemeImageUrl(code: string): string {
   return `/api/track-themes/${encodeURIComponent(code)}/image`;
+}
+
+function isThemeFreeForUser(theme: Pick<typeof raceTrackThemesTable.$inferSelect, "isDefault" | "priceCoins">): boolean {
+  return theme.isDefault || theme.priceCoins === 0;
+}
+
+async function userOwnsTheme(userId: string, themeCode: string): Promise<boolean> {
+  const [owned] = await db
+    .select({ id: userTrackThemesTable.id })
+    .from(userTrackThemesTable)
+    .where(and(eq(userTrackThemesTable.userId, userId), eq(userTrackThemesTable.themeCode, themeCode)))
+    .limit(1);
+
+  return !!owned;
+}
+
+export async function setUserDefaultTrackTheme(userId: string, themeCode: string): Promise<boolean> {
+  await seedThemesIfNeeded();
+
+  const [theme] = await db
+    .select()
+    .from(raceTrackThemesTable)
+    .where(and(eq(raceTrackThemesTable.code, themeCode), eq(raceTrackThemesTable.isActive, true)))
+    .limit(1);
+
+  if (!theme) return false;
+
+  if (!isThemeFreeForUser(theme) && !(await userOwnsTheme(userId, themeCode))) {
+    return false;
+  }
+
+  const now = new Date();
+  await db.transaction(async (tx) => {
+    await tx
+      .update(userTrackThemesTable)
+      .set({ isEquipped: false, updatedAt: now })
+      .where(eq(userTrackThemesTable.userId, userId));
+
+    await tx
+      .insert(userTrackThemesTable)
+      .values({
+        userId,
+        themeCode,
+        purchasePriceCoins: 0,
+        isEquipped: true,
+        updatedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: [userTrackThemesTable.userId, userTrackThemesTable.themeCode],
+        set: { isEquipped: true, updatedAt: now },
+      });
+  });
+
+  return true;
 }
 
 async function resolveThemeObjectKey(assetKey: string | null | undefined, themeCode: string): Promise<string | null> {
@@ -137,11 +214,15 @@ router.get("/track-themes", requireAuth, async (req, res) => {
 
     const ownedMap = new Map(ownedRows.map((r) => [r.themeCode, r]));
     const { currentBalance } = balanceData;
+    let selectedThemeCode = ownedRows.find((r) => r.isEquipped)?.themeCode ?? GLOBAL_DEFAULT_THEME_CODE;
+    const selectedTheme = allThemes.find((t) => t.code === selectedThemeCode);
+    if (!selectedTheme || (!isThemeFreeForUser(selectedTheme) && !ownedMap.has(selectedTheme.code))) {
+      selectedThemeCode = GLOBAL_DEFAULT_THEME_CODE;
+    }
 
     const themes = allThemes.map((t) => {
-      const owned = t.isDefault || ownedMap.has(t.code);
+      const owned = isThemeFreeForUser(t) || ownedMap.has(t.code);
       const locked = !owned;
-      const ownedRow = ownedMap.get(t.code);
       return {
         code: t.code,
         name: t.name,
@@ -149,7 +230,7 @@ router.get("/track-themes", requireAuth, async (req, res) => {
         isDefault: t.isDefault,
         owned,
         locked,
-        isEquipped: ownedRow?.isEquipped ?? t.isDefault,
+        isEquipped: owned ? t.code === selectedThemeCode : false,
         canPurchase: locked && currentBalance >= t.priceCoins,
         coinsNeeded: locked ? Math.max(0, t.priceCoins - currentBalance) : 0,
         assetKey: t.assetKey,
@@ -158,7 +239,7 @@ router.get("/track-themes", requireAuth, async (req, res) => {
       };
     });
 
-    return res.json({ coinBalance: currentBalance, themes });
+    return res.json({ coinBalance: currentBalance, selectedThemeCode, defaultThemeCode: GLOBAL_DEFAULT_THEME_CODE, themes });
   } catch (err) {
     req.log.error({ err }, "track-themes GET error");
     return res.status(500).json({ error: "Failed to fetch track themes" });
@@ -265,8 +346,8 @@ router.post("/track-themes/:code/equip", requireAuth, async (req, res) => {
 
     if (!theme) return res.status(404).json({ error: "Theme not found" });
 
-    // Must own or be default
-    if (!theme.isDefault) {
+    // Must own or be a free/default theme.
+    if (!isThemeFreeForUser(theme)) {
       const [owned] = await db
         .select()
         .from(userTrackThemesTable)
@@ -275,20 +356,8 @@ router.post("/track-themes/:code/equip", requireAuth, async (req, res) => {
       if (!owned) return res.status(403).json({ error: "Theme not owned" });
     }
 
-    // Unequip all, then equip selected
-    await db
-      .update(userTrackThemesTable)
-      .set({ isEquipped: false, updatedAt: new Date() })
-      .where(eq(userTrackThemesTable.userId, userId));
-
-    if (!theme.isDefault) {
-      await db
-        .update(userTrackThemesTable)
-        .set({ isEquipped: true, updatedAt: new Date() })
-        .where(
-          and(eq(userTrackThemesTable.userId, userId), eq(userTrackThemesTable.themeCode, code)),
-        );
-    }
+    const equipped = await setUserDefaultTrackTheme(userId, code);
+    if (!equipped) return res.status(403).json({ error: "Theme not owned" });
 
     return res.json({ success: true, equippedCode: code });
   } catch (err) {
@@ -349,7 +418,7 @@ export async function validateThemeOwnership(userId: string, themeCode: string):
       .limit(1);
 
     if (!theme || !theme.isActive) return false;
-    if (theme.isDefault) return true;
+    if (isThemeFreeForUser(theme)) return true;
 
     const [owned] = await db
       .select()

@@ -28,7 +28,7 @@ import { randomBytes } from "crypto";
 import { triggerEvent } from "../lib/pusher.js";
 import { logger } from "../lib/logger.js";
 import { config } from "../lib/config.js";
-import { validateThemeOwnership } from "./trackThemes.js";
+import { setUserDefaultTrackTheme, validateThemeOwnership } from "./trackThemes.js";
 import { grantCoinReward, getRaceWinRewardCode, grantVariableCoinReward } from "../lib/coinRewardService.js";
 import { evaluateAndNotify } from "./achievementHooks.js";
 import { requireAdminKey } from "../middleware/requireAdminKey.js";
@@ -1933,6 +1933,12 @@ router.post("/races/host", requireAuth, async (req, res) => {
     }
   }
 
+  try {
+    await setUserDefaultTrackTheme(userId, trackLayout);
+  } catch (err) {
+    req.log.warn({ err, userId, trackLayout }, "failed to save last used track theme");
+  }
+
   const paymentQuote =
     amountCents > 0
       ? formatQuoteForApi(
@@ -2555,6 +2561,12 @@ router.post("/races", requireAuth, async (req, res) => {
       inviteCode,
     })
     .returning();
+
+  try {
+    await setUserDefaultTrackTheme(userId, data.trackLayout);
+  } catch (err) {
+    req.log.warn({ err, userId, trackLayout: data.trackLayout }, "failed to save last used track theme");
+  }
 
   req.log.info({ raceId: room.id, entryType: room.entryType }, "race created");
   return res.status(201).json({ race: room });

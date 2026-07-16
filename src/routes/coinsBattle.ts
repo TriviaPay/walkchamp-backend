@@ -15,6 +15,7 @@ import { logger } from "../lib/logger.js";
 import { getCoinBalance } from "../lib/coinsService.js";
 import { requireFeatureEnabled } from "../middleware/requireFeatureEnabled.js";
 import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "../lib/raceIntegrity.js";
+import { setUserDefaultTrackTheme, validateThemeOwnership } from "./trackThemes.js";
 
 const router = Router();
 
@@ -78,6 +79,11 @@ router.post("/coins-battle/host", requireAuth, async (req, res) => {
 
   const { coinEntryAmount, maxPlayers, targetSteps, trackLayout, isPrivate } = parsed.data;
 
+  const ownsLayout = await validateThemeOwnership(userId, trackLayout);
+  if (!ownsLayout) {
+    return res.status(403).json({ error: "You must unlock this track before hosting a challenge with it." });
+  }
+
   const alreadyActive = await getActiveRaceForUser(userId);
   if (alreadyActive) {
     return res.status(409).json({
@@ -125,6 +131,12 @@ router.post("/coins-battle/host", requireAuth, async (req, res) => {
     .returning();
 
   logger.info({ raceId: room.id, userId, coinEntryAmount, maxPlayers }, "[CoinsBattle] room created (coins held until start)");
+
+  try {
+    await setUserDefaultTrackTheme(userId, trackLayout);
+  } catch (err) {
+    logger.warn({ err, userId, trackLayout }, "[CoinsBattle] failed to save last used track theme");
+  }
 
   triggerEvent("public-rooms-available", "room:created", {
     room_id: room.id,
