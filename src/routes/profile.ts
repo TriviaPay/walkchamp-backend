@@ -643,7 +643,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
       .then((r) => r[0] ?? null),
     db.select({ totalCashWonCents: sql<number>`COALESCE(SUM(${raceResultsTable.prizeCents}), 0)::int` })
       .from(raceResultsTable)
-      .innerJoin(raceRoomsTable, eq(raceResultsTable.raceRoomId, raceRoomsTable.id))
+      .innerJoin(raceRoomsTable, sql`${raceResultsTable.raceRoomId}::uuid = ${raceRoomsTable.id}`)
       .where(and(
         eq(raceResultsTable.userId, targetId),
         gt(raceRoomsTable.entryAmountCents, 0),
