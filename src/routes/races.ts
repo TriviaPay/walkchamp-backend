@@ -857,9 +857,21 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   // This is intentionally NOT in the same transaction as the results insert.
   // If results insertion fails for any reason, the race is still marked done so
   // cleanupOverdueRaces won't loop forever retrying a broken insert.
+  let markedCompleted = false;
   try {
     await db.transaction(async (tx) => {
       const payoutFinalizedAt = new Date();
+      const completionAllowedSql = MANUAL_COMPLETION_REASONS.has(endedReason)
+        ? sql`true`
+        : sql`(
+            ${raceRoomsTable.type} = 'sponsored'
+            OR ${raceRoomsTable.challengeDurationDays} <= 0
+            OR COALESCE(
+              ${raceRoomsTable.challengeEndAt},
+              ${raceRoomsTable.startedAt} + (${raceRoomsTable.challengeDurationDays} * interval '1 day'),
+              ${raceRoomsTable.scheduledStartAt} + (${raceRoomsTable.challengeDurationDays} * interval '1 day')
+            ) <= now()
+          )`;
       const updated = await tx
         .update(raceRoomsTable)
         .set({
@@ -879,10 +891,15 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
             rewardsProcessed: true,
           }),
         })
-        .where(and(eq(raceRoomsTable.id, raceId), eq(raceRoomsTable.status, "in_progress")))
+        .where(and(
+          eq(raceRoomsTable.id, raceId),
+          eq(raceRoomsTable.status, "in_progress"),
+          completionAllowedSql,
+        ))
         .returning({ id: raceRoomsTable.id });
 
       if (updated.length === 0) return;
+      markedCompleted = true;
 
       if (room.entryAmountCents > 0) {
         await creditCashChallengePrizes(tx, {
@@ -910,6 +927,20 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   } catch (err) {
     logger.error({ raceId, err }, "autoCompleteRace: race_rooms status update failed");
     throw err;
+  }
+
+  if (!markedCompleted) {
+    logger.warn(
+      {
+        raceId,
+        endedReason,
+        challengeDurationDays: room.challengeDurationDays,
+        challengeEndAt: deriveChallengeEndAt(room)?.toISOString() ?? null,
+        status: room.status,
+      },
+      "autoCompleteRace: completion update skipped; results were not written",
+    );
+    return;
   }
 
   // ── Step 2: Insert result rows (best-effort — race is already closed above) ──
