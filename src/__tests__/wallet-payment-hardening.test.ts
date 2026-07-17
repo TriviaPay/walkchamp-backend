@@ -114,6 +114,31 @@ describe("wallet payment hardening", () => {
     expect(webhookProcessor).toContain("payment.failed recorded without terminal deposit mutation");
   });
 
+  it("creates durable sponsored gift-card fulfillment records for winners", () => {
+    const giftCardSchema = readFileSync("db/src/schema/sponsoredGiftCards.ts", "utf8");
+    const migration = readFileSync("db/migrations/0011_sponsored_gift_card_awards.sql", "utf8");
+    const helper = readFileSync("src/lib/sponsoredGiftCards.ts", "utf8");
+    const sponsoredEventsRoute = readFileSync("src/routes/sponsoredEvents.ts", "utf8");
+    const racesRoute = readFileSync("src/routes/races.ts", "utf8");
+    const adminRoute = readFileSync("src/routes/admin.ts", "utf8");
+    const logger = readFileSync("src/lib/logger.ts", "utf8");
+
+    expect(giftCardSchema).toContain("sponsoredGiftCardAwardsTable");
+    expect(giftCardSchema).toContain("pending_fulfillment");
+    expect(giftCardSchema).toContain("fulfillmentCode");
+    expect(giftCardSchema).toContain("sponsored_gift_card_awards_room_user_uniq");
+    expect(migration).toContain("CREATE TABLE IF NOT EXISTS \"sponsored_gift_card_awards\"");
+    expect(helper).toContain("createPendingSponsoredGiftCardAwards");
+    expect(helper).toContain(".onConflictDoNothing()");
+    expect(sponsoredEventsRoute).toContain("source: \"sponsored_event_finalizer\"");
+    expect(racesRoute).toContain("source: \"race_auto_completion\"");
+    expect(adminRoute).toContain("/admin/sponsored-gift-card-awards");
+    expect(adminRoute).toContain("redactGiftCardAward");
+    expect(adminRoute).toContain("sponsored_gift_card_fulfilled");
+    expect(adminRoute).toContain("hasFulfillmentCode");
+    expect(logger).toContain("body.fulfillmentCode");
+  });
+
   it("records provider deposit reversals as separate debit ledger rows", () => {
     const webhookProcessor = readFileSync("src/lib/depositWebhookProcessor.ts", "utf8");
     const settlementService = readFileSync("src/lib/depositSettlement.ts", "utf8");

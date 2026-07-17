@@ -20,12 +20,14 @@ export const logger = pino({
     "body.cardNumber",
     "body.cvv",
     "body.clientSecret",
+    "body.fulfillmentCode",
     "*.authorization",
     "*.cookie",
     "*.secret",
     "*.token",
     "*.refreshToken",
     "*.accessToken",
+    "*.fulfillmentCode",
   ],
   ...(config.isProduction
     ? {}

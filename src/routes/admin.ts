@@ -9,6 +9,7 @@ import {
   withdrawalsTable,
   notificationsTable,
   operationalLocksTable,
+  sponsoredGiftCardAwardsTable,
 } from "../../db/src/schema/index.js";
 import { eq, and, desc, ilike, or, sql, inArray } from "drizzle-orm";
 import { logger } from "../lib/logger.js";
@@ -25,10 +26,233 @@ import {
   rejectRefund,
 } from "../lib/refundService.js";
 import { assertOperationalLockOpen, setOperationalLock, WALLET_LEDGER_ANOMALY_LOCK } from "../lib/operationalLocks.js";
+import { sendPushToUser } from "./push.js";
 
 const router = Router();
 
 router.use("/admin", requireAuth, requireAdminRole);
+
+function redactGiftCardAward<T extends { fulfillmentCode?: string | null }>(award: T): Omit<T, "fulfillmentCode"> & { hasFulfillmentCode: boolean } {
+  const { fulfillmentCode, ...safeAward } = award;
+  return {
+    ...safeAward,
+    hasFulfillmentCode: Boolean(fulfillmentCode),
+  };
+}
+
+// ── Sponsored Gift Card Fulfillment ───────────────────────────────────────────
+const giftCardAwardStatusSchema = z.enum(["pending_fulfillment", "fulfilled", "cancelled", "all"]).default("pending_fulfillment");
+
+router.get("/admin/sponsored-gift-card-awards", async (req, res) => {
+  const parsedStatus = giftCardAwardStatusSchema.safeParse(req.query.status ?? "pending_fulfillment");
+  if (!parsedStatus.success) return res.status(400).json({ error: "Invalid status" });
+
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const status = parsedStatus.data;
+
+  const query = db
+    .select({
+      award: sponsoredGiftCardAwardsTable,
+      userEmail: profilesTable.email,
+      username: profilesTable.username,
+      raceTitle: raceRoomsTable.title,
+      raceStatus: raceRoomsTable.status,
+      raceCompletedAt: raceRoomsTable.completedAt,
+    })
+    .from(sponsoredGiftCardAwardsTable)
+    .innerJoin(profilesTable, eq(sponsoredGiftCardAwardsTable.userId, profilesTable.id))
+    .innerJoin(raceRoomsTable, eq(sponsoredGiftCardAwardsTable.raceRoomId, raceRoomsTable.id))
+    .$dynamic();
+
+  const rows = await (status === "all"
+    ? query
+    : query.where(eq(sponsoredGiftCardAwardsTable.status, status)))
+    .orderBy(desc(sponsoredGiftCardAwardsTable.createdAt))
+    .limit(limit)
+    .offset(offset);
+
+  return res.json({
+    awards: rows.map((row) => ({
+      ...redactGiftCardAward(row.award),
+      userEmail: row.userEmail,
+      username: row.username,
+      raceTitle: row.raceTitle,
+      raceStatus: row.raceStatus,
+      raceCompletedAt: row.raceCompletedAt,
+    })),
+  });
+});
+
+router.get("/admin/sponsored-gift-card-awards/:id", async (req, res) => {
+  const awardId = String(req.params.id);
+  const [row] = await db
+    .select({
+      award: sponsoredGiftCardAwardsTable,
+      userEmail: profilesTable.email,
+      username: profilesTable.username,
+      raceTitle: raceRoomsTable.title,
+    })
+    .from(sponsoredGiftCardAwardsTable)
+    .innerJoin(profilesTable, eq(sponsoredGiftCardAwardsTable.userId, profilesTable.id))
+    .innerJoin(raceRoomsTable, eq(sponsoredGiftCardAwardsTable.raceRoomId, raceRoomsTable.id))
+    .where(eq(sponsoredGiftCardAwardsTable.id, awardId))
+    .limit(1);
+
+  if (!row) return res.status(404).json({ error: "Gift card award not found" });
+  return res.json({
+    award: {
+      ...redactGiftCardAward(row.award),
+      userEmail: row.userEmail,
+      username: row.username,
+      raceTitle: row.raceTitle,
+    },
+  });
+});
+
+const fulfillGiftCardAwardSchema = z.object({
+  fulfillmentReference: z.string().trim().min(1).max(200).optional(),
+  fulfillmentCode: z.string().trim().min(1).max(500).optional(),
+  fulfillmentNotes: z.string().trim().max(1000).optional(),
+  recipientEmail: z.string().trim().email().optional(),
+}).refine((value) => Boolean(value.fulfillmentReference || value.fulfillmentCode), {
+  message: "fulfillmentReference or fulfillmentCode is required",
+});
+
+router.post("/admin/sponsored-gift-card-awards/:id/fulfill", async (req, res) => {
+  const awardId = String(req.params.id);
+  const parsed = fulfillGiftCardAwardSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "Invalid request", details: parsed.error.issues });
+
+  const adminUserId = (req as unknown as AuthenticatedRequest).descopeUserId ?? null;
+  const fulfilledAt = new Date();
+  const [award] = await db
+    .update(sponsoredGiftCardAwardsTable)
+    .set({
+      status: "fulfilled",
+      ...(parsed.data.recipientEmail ? { recipientEmail: parsed.data.recipientEmail } : {}),
+      fulfillmentReference: parsed.data.fulfillmentReference,
+      fulfillmentCode: parsed.data.fulfillmentCode,
+      fulfillmentNotes: parsed.data.fulfillmentNotes,
+      fulfilledBy: adminUserId,
+      fulfilledAt,
+      updatedAt: fulfilledAt,
+    })
+    .where(and(
+      eq(sponsoredGiftCardAwardsTable.id, awardId),
+      eq(sponsoredGiftCardAwardsTable.status, "pending_fulfillment"),
+    ))
+    .returning();
+
+  if (!award) {
+    const [existing] = await db
+      .select()
+      .from(sponsoredGiftCardAwardsTable)
+      .where(eq(sponsoredGiftCardAwardsTable.id, awardId))
+      .limit(1);
+    if (!existing) return res.status(404).json({ error: "Gift card award not found" });
+    return res.status(409).json({ error: `Gift card award is already ${existing.status}` });
+  }
+
+  await db.insert(notificationsTable).values({
+    userId: award.userId,
+    type: "reward_approved",
+    title: "Gift card sent",
+    body: "Your sponsored event gift card has been fulfilled. Please check your email.",
+    data: {
+      type: "sponsored_gift_card_fulfilled",
+      awardId: award.id,
+      raceRoomId: award.raceRoomId,
+      prizeAmountCents: award.prizeAmountCents,
+      provider: award.provider,
+    },
+  });
+
+  void sendPushToUser(
+    award.userId,
+    "Gift card sent",
+    "Your sponsored event gift card has been fulfilled. Please check your email.",
+    {
+      type: "sponsored_gift_card_fulfilled",
+      award_id: award.id,
+      race_room_id: award.raceRoomId,
+    },
+    { category: "reward", dedupeKey: `sponsored_gift_card_fulfilled:${award.id}` },
+  );
+
+  logger.info({
+    awardId: award.id,
+    raceRoomId: award.raceRoomId,
+    userId: award.userId,
+    hasFulfillmentCode: Boolean(award.fulfillmentCode),
+  }, "Admin: sponsored gift card fulfilled");
+
+  void writeAuditLog({
+    actorUserId: adminUserId,
+    actorType: "admin",
+    action: "admin.sponsored_gift_card.fulfill",
+    entityType: "sponsored_gift_card_award",
+    entityId: award.id,
+    metadata: {
+      raceRoomId: award.raceRoomId,
+      userId: award.userId,
+      prizeAmountCents: award.prizeAmountCents,
+      hasFulfillmentCode: Boolean(award.fulfillmentCode),
+    },
+  });
+
+  return res.json({ award: redactGiftCardAward(award) });
+});
+
+const cancelGiftCardAwardSchema = z.object({
+  reason: z.string().trim().min(3).max(500),
+});
+
+router.post("/admin/sponsored-gift-card-awards/:id/cancel", async (req, res) => {
+  const awardId = String(req.params.id);
+  const parsed = cancelGiftCardAwardSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "reason is required" });
+
+  const adminUserId = (req as unknown as AuthenticatedRequest).descopeUserId ?? null;
+  const cancelledAt = new Date();
+  const [award] = await db
+    .update(sponsoredGiftCardAwardsTable)
+    .set({
+      status: "cancelled",
+      cancelledBy: adminUserId,
+      cancelledAt,
+      cancelReason: parsed.data.reason,
+      updatedAt: cancelledAt,
+    })
+    .where(and(
+      eq(sponsoredGiftCardAwardsTable.id, awardId),
+      eq(sponsoredGiftCardAwardsTable.status, "pending_fulfillment"),
+    ))
+    .returning();
+
+  if (!award) {
+    const [existing] = await db
+      .select()
+      .from(sponsoredGiftCardAwardsTable)
+      .where(eq(sponsoredGiftCardAwardsTable.id, awardId))
+      .limit(1);
+    if (!existing) return res.status(404).json({ error: "Gift card award not found" });
+    return res.status(409).json({ error: `Gift card award is already ${existing.status}` });
+  }
+
+  logger.info({ awardId: award.id, raceRoomId: award.raceRoomId, userId: award.userId }, "Admin: sponsored gift card cancelled");
+  void writeAuditLog({
+    actorUserId: adminUserId,
+    actorType: "admin",
+    action: "admin.sponsored_gift_card.cancel",
+    entityType: "sponsored_gift_card_award",
+    entityId: award.id,
+    reason: parsed.data.reason,
+    metadata: { raceRoomId: award.raceRoomId, userId: award.userId },
+  });
+
+  return res.json({ award: redactGiftCardAward(award) });
+});
 
 // ── Operational Locks ────────────────────────────────────────────────────────
 router.get("/admin/operational-locks", async (_req, res) => {

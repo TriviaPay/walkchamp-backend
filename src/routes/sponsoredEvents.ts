@@ -17,6 +17,7 @@ import { grantVariableCoinReward } from "../lib/coinRewardService.js";
 import { logger } from "../lib/logger.js";
 import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration, registerOrReviveScheduledRegistration } from "../lib/raceIntegrity.js";
 import { notifyPromotionalSponsoredEvent } from "../lib/pushNotificationService.js";
+import { createPendingSponsoredGiftCardAwards } from "../lib/sponsoredGiftCards.js";
 
 const router = Router();
 
@@ -345,6 +346,15 @@ async function finalizeSponsoredEvents(now: Date) {
         .slice(0, WINNER_COUNT)
         .map((p) => p.userId),
     );
+    await createPendingSponsoredGiftCardAwards({
+      raceRoomId: room.id,
+      winnerUserIds: [...winnerIds],
+      prizeAmountCents: PRIZE_PER_WINNER_CENTS,
+      metadata: {
+        eventTitle: room.title,
+        source: "sponsored_event_finalizer",
+      },
+    });
 
     // Non-winners: grant 100 consolation coins (idempotent)
     const nonWinners = parts.filter((p) => !winnerIds.has(p.userId));

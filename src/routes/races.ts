@@ -69,6 +69,7 @@ import {
   createRefundForRaceLeave,
 } from "../lib/refundService.js";
 import { buildTrackThemeMedia, TRACK_THEME_CODES, type TrackThemeMedia } from "../lib/trackThemeMedia.js";
+import { createPendingSponsoredGiftCardAwards } from "../lib/sponsoredGiftCards.js";
 
 const router = Router();
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -102,7 +103,15 @@ export async function recoverStaleRaces(): Promise<void> {
   await new Promise((r) => setTimeout(r, 2_000));
   try {
     const stale = await db
-      .select({ id: raceRoomsTable.id, type: raceRoomsTable.type, currentPlayers: raceRoomsTable.currentPlayers })
+      .select({
+        id: raceRoomsTable.id,
+        type: raceRoomsTable.type,
+        currentPlayers: raceRoomsTable.currentPlayers,
+        challengeDurationDays: raceRoomsTable.challengeDurationDays,
+        challengeEndAt: raceRoomsTable.challengeEndAt,
+        startedAt: raceRoomsTable.startedAt,
+        scheduledStartAt: raceRoomsTable.scheduledStartAt,
+      })
       .from(raceRoomsTable)
       .where(eq(raceRoomsTable.status, "in_progress"));
 
@@ -122,6 +131,14 @@ export async function recoverStaleRaces(): Promise<void> {
           autoCompleteRace(race.id, "all_forfeited").catch(() => {});
         }
         // If some participants are still active, leave the race to the 3-hour timer.
+        continue;
+      }
+      if (isDurationChallengeRoom(race)) {
+        const completion = canAutoCompleteDurationChallenge(race, "duration_expired");
+        if (completion.allowed) {
+          logger.info({ raceId: race.id, challengeEndAt: completion.challengeEndAt?.toISOString() ?? null }, "[recoverStaleRaces] duration expired — completing");
+          autoCompleteRace(race.id, "duration_expired").catch(() => {});
+        }
         continue;
       }
       // Complete any race where:
@@ -173,6 +190,7 @@ export async function cleanupOverdueRaces(): Promise<void> {
         currentPlayers: raceRoomsTable.currentPlayers,
         challengeDurationDays: raceRoomsTable.challengeDurationDays,
         challengeEndAt: raceRoomsTable.challengeEndAt,
+        scheduledStartAt: raceRoomsTable.scheduledStartAt,
       })
       .from(raceRoomsTable)
       .where(eq(raceRoomsTable.status, "in_progress"));
@@ -210,6 +228,16 @@ export async function cleanupOverdueRaces(): Promise<void> {
           logger.info({ raceId: race.id }, "[cleanupOverdueRaces] sponsored — all forfeited, completing");
           autoCompleteRace(race.id, "all_forfeited").catch((err) => {
             logger.error({ raceId: race.id, err }, "cleanupOverdueRaces: sponsored all_forfeited autoCompleteRace failed");
+          });
+        }
+        continue;
+      }
+      if (isDurationChallenge) {
+        const completion = canAutoCompleteDurationChallenge(race, "duration_expired");
+        if (completion.allowed) {
+          logger.info({ raceId: race.id, challengeEndAt: completion.challengeEndAt?.toISOString() ?? null }, "[cleanupOverdueRaces] duration expired — completing");
+          autoCompleteRace(race.id, "duration_expired").catch((err) => {
+            logger.error({ raceId: race.id, err }, "cleanupOverdueRaces: duration_expired autoCompleteRace failed");
           });
         }
         continue;
@@ -309,6 +337,24 @@ function buildChallengeTimeFields(room: Pick<typeof raceRoomsTable.$inferSelect,
     daysLeft,
     days_left: daysLeft,
   };
+}
+
+const MANUAL_COMPLETION_REASONS = new Set(["admin_force_complete", "manual_force_complete"]);
+
+function isDurationChallengeRoom(room: Pick<typeof raceRoomsTable.$inferSelect, "type" | "challengeDurationDays">): boolean {
+  return room.type !== "sponsored" && room.challengeDurationDays > 0;
+}
+
+function canAutoCompleteDurationChallenge(
+  room: Pick<typeof raceRoomsTable.$inferSelect, "type" | "challengeDurationDays" | "challengeEndAt" | "startedAt" | "scheduledStartAt">,
+  endedReason: string,
+): { allowed: boolean; challengeEndAt: Date | null } {
+  if (!isDurationChallengeRoom(room)) return { allowed: true, challengeEndAt: null };
+  if (MANUAL_COMPLETION_REASONS.has(endedReason)) return { allowed: true, challengeEndAt: deriveChallengeEndAt(room) };
+
+  const challengeEndAt = deriveChallengeEndAt(room);
+  if (!challengeEndAt) return { allowed: false, challengeEndAt: null };
+  return { allowed: Date.now() >= challengeEndAt.getTime(), challengeEndAt };
 }
 
 async function getTrackThemeMediaMap(codes: Array<string | null | undefined>): Promise<Map<string, TrackThemeMedia>> {
@@ -559,6 +605,21 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     .limit(1);
 
   if (!room || room.status !== "in_progress") return;
+
+  const durationCompletion = canAutoCompleteDurationChallenge(room, endedReason);
+  if (!durationCompletion.allowed) {
+    logger.warn(
+      {
+        raceId,
+        endedReason,
+        challengeDurationDays: room.challengeDurationDays,
+        challengeEndAt: durationCompletion.challengeEndAt?.toISOString() ?? null,
+        startedAt: room.startedAt?.toISOString() ?? null,
+      },
+      "autoCompleteRace: blocked early duration challenge completion",
+    );
+    return;
+  }
 
   logger.info({ raceId, endedReason }, "autoCompleteRace: starting completion");
 
@@ -829,6 +890,20 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
           payouts: resultRows
             .filter((r) => r.eligibleForPrize && r.prizeCents > 0)
             .map((r) => ({ userId: r.userId, rank: r.rank, prizeCents: r.prizeCents })),
+        });
+      }
+
+      if (isSponsored) {
+        await createPendingSponsoredGiftCardAwards({
+          database: tx,
+          raceRoomId: raceId,
+          awards: resultRows
+            .filter((r) => r.eligibleForPrize && r.prizeCents > 0)
+            .map((r) => ({ userId: r.userId, prizeAmountCents: r.prizeCents })),
+          metadata: {
+            eventTitle: room.title,
+            source: "race_auto_completion",
+          },
         });
       }
     });
@@ -3925,6 +4000,9 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
         targetSteps: raceRoomsTable.targetSteps,
         currentPlayers: raceRoomsTable.currentPlayers,
         type: raceRoomsTable.type,
+        challengeDurationDays: raceRoomsTable.challengeDurationDays,
+        challengeEndAt: raceRoomsTable.challengeEndAt,
+        scheduledStartAt: raceRoomsTable.scheduledStartAt,
       })
       .from(raceRoomsTable)
       .where(eq(raceRoomsTable.id, raceId))
@@ -4252,7 +4330,16 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
           finishedCount, winnersNeeded, playerCount,
         );
 
-        if (finishedCount >= winnersNeeded) {
+        const durationCompletion = room
+          ? canAutoCompleteDurationChallenge(room, "winners_finalized")
+          : { allowed: true, challengeEndAt: null };
+
+        if (finishedCount >= winnersNeeded && !durationCompletion.allowed) {
+          req.log.info(
+            { raceId, finishedCount, winnersNeeded, challengeEndAt: durationCompletion.challengeEndAt?.toISOString() ?? null },
+            "[RaceFinalize] duration challenge winner slots filled — waiting for challenge end",
+          );
+        } else if (finishedCount >= winnersNeeded) {
           req.log.info({ raceId, finishedCount, winnersNeeded }, "[RaceFinalize] all winner slots filled — triggering immediate finalization");
           autoCompleteRace(raceId, "winners_finalized").catch((err) => {
             req.log.error({ raceId, err }, "[RaceFinalize] early autoCompleteRace failed");
@@ -4425,7 +4512,9 @@ router.post("/races/:id/reconcile-steps", requireAuth, async (req, res) => {
 
 // ── POST /api/races/:id/force-complete (TESTING ONLY) ─────────────────────────
 // Immediately marks an in_progress race as completed, stores race_results, announces winners.
-if (process.env.NODE_ENV !== "production") {
+// This route is opt-in so a missing NODE_ENV cannot expose it in production.
+const testRaceRoutesEnabled = process.env.NODE_ENV === "test" || process.env.ENABLE_TEST_RACE_ROUTES === "true";
+if (testRaceRoutesEnabled) {
   router.post("/races/:id/force-complete", requireAuth, requireAdminKey, async (req, res) => {
     const userId = (req as AuthenticatedRequest).descopeUserId;
     const raceId = String(req.params.id);
@@ -4440,7 +4529,7 @@ if (process.env.NODE_ENV !== "production") {
     if (room.creatorId !== userId) return res.status(403).json({ error: "Only the host can force-complete." });
     if (room.status !== "in_progress") return res.status(409).json({ error: "Race is not in progress." });
 
-    await autoCompleteRace(raceId);
+    await autoCompleteRace(raceId, "manual_force_complete");
     req.log.info({ raceId, userId }, "race force-completed");
     return res.json({ success: true });
   });

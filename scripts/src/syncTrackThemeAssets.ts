@@ -5,8 +5,10 @@ import path from "node:path";
 type CliOptions = {
   allowOversize: boolean;
   apply: boolean;
+  assetVersion: number;
   reportPath: string | null;
   sourceDir: string;
+  updateDb: boolean;
 };
 
 type VariantReport = {
@@ -89,17 +91,25 @@ function parseArgs(argv: string[]): CliOptions {
   const options: CliOptions = {
     allowOversize: false,
     apply: false,
+    assetVersion: 1,
     reportPath: null,
     sourceDir: path.resolve(process.cwd(), "../walkchamp-frontend/assets/images"),
+    updateDb: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--apply") options.apply = true;
     else if (arg === "--allow-oversize") options.allowOversize = true;
+    else if (arg === "--asset-version") options.assetVersion = Number.parseInt(argv[++i] ?? "", 10);
     else if (arg === "--source-dir") options.sourceDir = path.resolve(argv[++i] ?? "");
     else if (arg === "--report") options.reportPath = path.resolve(argv[++i] ?? "");
+    else if (arg === "--update-db") options.updateDb = true;
     else throw new Error(`Unknown argument: ${arg}`);
+  }
+
+  if (!Number.isInteger(options.assetVersion) || options.assetVersion < 1) {
+    throw new Error("--asset-version must be a positive integer");
   }
 
   return options;
@@ -107,6 +117,15 @@ function parseArgs(argv: string[]): CliOptions {
 
 function sha256(buffer: Buffer): string {
   return crypto.createHash("sha256").update(buffer).digest("hex");
+}
+
+function databaseUrlFromEnv(): string | null {
+  return process.env.DATABASE_ADMIN_URL?.trim()
+    || process.env.NEON_DATABASE_ADMIN_URL?.trim()
+    || process.env.DATABASE_RUNTIME_URL?.trim()
+    || process.env.NEON_DATABASE_URL?.trim()
+    || process.env.DATABASE_URL?.trim()
+    || null;
 }
 
 async function main() {
@@ -157,7 +176,7 @@ async function main() {
         oversize.push({ code, variant, bytes: data.length, maxBytes: spec.maxBytes });
       }
 
-      const key = trackThemeObjectKey(code, variant as never, 1);
+      const key = trackThemeObjectKey(code, variant as never, options.assetVersion);
       let publicUrl: string | null = null;
       try {
         publicUrl = objectUrl(key);
@@ -177,9 +196,12 @@ async function main() {
         }
       }
 
+      const digest = sha256(data);
       let publicHeadStatus: number | null = null;
       if (options.apply && publicUrl) {
-        const publicHead = await fetch(publicUrl, { method: "HEAD" });
+        const verifyUrl = new URL(publicUrl);
+        verifyUrl.searchParams.set("verify", digest.slice(0, 16));
+        const publicHead = await fetch(verifyUrl, { method: "HEAD" });
         publicHeadStatus = publicHead.status;
         if (!publicHead.ok) {
           throw new Error(`Public URL verification failed for ${key}: HEAD ${publicHead.status}`);
@@ -196,7 +218,7 @@ async function main() {
         height: info.height,
         contentType: "image/webp",
         cacheControl: TRACK_THEME_ASSET_CACHE_CONTROL,
-        sha256: sha256(data),
+        sha256: digest,
         uploaded: options.apply,
       });
     }
@@ -208,8 +230,32 @@ async function main() {
     throw new Error(`Generated assets exceed byte targets: ${JSON.stringify(oversize, null, 2)}`);
   }
 
+  if (options.updateDb) {
+    if (!options.apply) throw new Error("--update-db requires --apply");
+    const databaseUrl = databaseUrlFromEnv();
+    if (!databaseUrl) throw new Error("No database URL configured for --update-db");
+    const { Client } = await import("pg");
+    const client = new Client({ connectionString: databaseUrl });
+    await client.connect();
+    try {
+      const result = await client.query(
+        `update race_track_themes
+            set asset_version = $1, updated_at = now()
+          where code = any($2::text[])`,
+        [options.assetVersion, TRACK_THEME_CODES],
+      );
+      if (result.rowCount !== TRACK_THEME_CODES.length) {
+        throw new Error(`Expected to update ${TRACK_THEME_CODES.length} theme rows, updated ${result.rowCount}`);
+      }
+    } finally {
+      await client.end();
+    }
+  }
+
   const report = {
     applied: options.apply,
+    assetVersion: options.assetVersion,
+    dbUpdated: options.updateDb,
     sourceDir: options.sourceDir,
     generatedAt: new Date().toISOString(),
     themeCount: reports.length,

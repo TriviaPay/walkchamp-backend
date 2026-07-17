@@ -299,24 +299,16 @@ async function startScheduledRoom(roomId: string): Promise<void> {
 async function finalizeDurationRoom(roomId: string): Promise<void> {
   try {
     const [room] = await db
-      .select()
+      .select({ id: raceRoomsTable.id, status: raceRoomsTable.status, challengeEndAt: raceRoomsTable.challengeEndAt })
       .from(raceRoomsTable)
       .where(eq(raceRoomsTable.id, roomId))
       .limit(1);
 
     if (!room || room.status !== "in_progress") return;
 
-    await db
-      .update(raceRoomsTable)
-      .set({ status: "completed", completedAt: new Date(), updatedAt: new Date() })
-      .where(eq(raceRoomsTable.id, roomId));
-
-    logger.info({ roomId }, "[ScheduleRoomJob] challengeEnded");
-
-    triggerEvent(`public-live-race-${roomId}`, "race:finished", {
-      room_id: roomId,
-      reason: "duration_expired",
-    }).catch(() => {});
+    // Duration races must go through the race finalizer so standings, results,
+    // payouts, and realtime finish events are all produced consistently.
+    logger.info({ roomId, challengeEndAt: room.challengeEndAt?.toISOString() ?? null }, "[ScheduleRoomJob] duration due; race finalizer will complete");
   } catch (err) {
     logger.error({ err, roomId }, "[ScheduleRoomJob] error finalizing duration room");
   }

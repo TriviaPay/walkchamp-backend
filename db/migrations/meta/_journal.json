@@ -78,6 +78,13 @@
       "when": 1781987200000,
       "tag": "0010_track_theme_asset_version",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1781987800000,
+      "tag": "0011_sponsored_gift_card_awards",
+      "breakpoints": true
     }
   ]
 }
