@@ -1,6 +1,9 @@
 type PaymentProvider = "stripe" | "razorpay";
 
 const ALLOWED_ENTRY_AMOUNTS_CENTS = new Set([300, 500, 1000, 1500, 2000, 2500]);
+export const CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY = "CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY";
+export const CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY_MESSAGE =
+  "Cash challenges are not available for INR/Razorpay wallets yet.";
 
 export function isAllowedEntryAmountCents(amountCents: number): boolean {
   return ALLOWED_ENTRY_AMOUNTS_CENTS.has(amountCents);
@@ -8,6 +11,18 @@ export function isAllowedEntryAmountCents(amountCents: number): boolean {
 
 export function resolvePaymentProvider(countryCode?: string | null): PaymentProvider {
   return countryCode === "IN" ? "razorpay" : "stripe";
+}
+
+export function isCashChallengeUnsupportedForCountry(countryCode?: string | null): boolean {
+  return countryCode?.trim().toUpperCase() === "IN";
+}
+
+export function cashChallengeUnsupportedForCurrencyBody() {
+  return {
+    success: false,
+    code: CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY,
+    error: CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY_MESSAGE,
+  };
 }
 
 export function calcEntryPoolCents(entryFeeCents: number, numberOfPlayers: number): number {

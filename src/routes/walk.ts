@@ -11,6 +11,9 @@ import { evaluateStepMilestones } from "../lib/coinsService.js";
 import { evaluateAndNotify } from "./achievementHooks.js";
 import { notifyFriendsOnDailyGoal } from "../lib/friendActivityService.js";
 import { notifyGroupsOnDailyGoalCompletion } from "../lib/pushNotificationService.js";
+import { getChallengeCardsForUser, getRoomCountsSummary } from "./races.js";
+import { getSponsoredEventsForUser } from "./sponsoredEvents.js";
+import { getTrackThemeSummaryForUser } from "./trackThemes.js";
 
 const router = Router();
 
@@ -65,40 +68,33 @@ function localDateStr(raw: unknown): string {
   return new Date().toISOString().split("T")[0];
 }
 
-// ── GET /api/walk/today ───────────────────────────────────────────────────────
-// Returns today's step total, goal progress, distance, calories, and profile summary.
-router.get("/walk/today", requireAuth, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
-  const today = localDateStr(req.query.localDate);
-
-  const [row] = await db
-    .select()
-    .from(stepDailyTotalsTable)
-    .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, today)))
-    .limit(1);
-
-  const [profile] = await db
-    .select({
-      username: profilesTable.username,
-      totalSteps: profilesTable.totalSteps,
-      currentRank: profilesTable.currentRank,
-      currentStreak: profilesTable.currentStreak,
-      avatarColor: profilesTable.avatarColor,
-      level: profilesTable.level,
-      countryFlag: profilesTable.countryFlag,
-    })
-    .from(profilesTable)
-    .where(eq(profilesTable.id, userId))
-    .limit(1);
+async function buildWalkTodayPayload(userId: string, today: string) {
+  const [[row], [profile], goalData] = await Promise.all([
+    db
+      .select()
+      .from(stepDailyTotalsTable)
+      .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, today)))
+      .limit(1),
+    db
+      .select({
+        username: profilesTable.username,
+        totalSteps: profilesTable.totalSteps,
+        currentRank: profilesTable.currentRank,
+        currentStreak: profilesTable.currentStreak,
+        avatarColor: profilesTable.avatarColor,
+        level: profilesTable.level,
+        countryFlag: profilesTable.countryFlag,
+      })
+      .from(profilesTable)
+      .where(eq(profilesTable.id, userId))
+      .limit(1),
+    getUserGoalAndUnit(userId),
+  ]);
 
   const steps = row?.steps ?? 0;
-
-  // Always use the user's saved preference goal so Walk tab and Walking History stay in sync.
-  const { goal: userGoal } = await getUserGoalAndUnit(userId);
-  const goal = userGoal;
+  const goal = goalData.goal;
 
   // Guard against stale/tiny stored distances (e.g. 6 m for 330 steps).
-  // Require stored value to be at least 10% of step-derived estimate, and not absurdly large.
   const expectedDist = Math.round(steps * 0.762);
   const storedDist = row?.distanceMeters ?? 0;
   const distanceMeters = storedDist > 0
@@ -108,13 +104,10 @@ router.get("/walk/today", requireAuth, async (req, res) => {
     : expectedDist;
 
   const calories = row?.caloriesBurned ?? Math.round(steps * 0.04);
-
-  // Active minutes: use stored value, or derive from steps as fallback.
   const activeMinutes = row?.activeMinutes && row.activeMinutes > 0
     ? Math.max(row.activeMinutes, Math.ceil(steps / 120))
     : Math.ceil(steps / 120);
 
-  // Daily rank: count users with more steps today, +1 = my rank.
   const [rankRow] = await db
     .select({ countAbove: sql<number>`COUNT(*)::int` })
     .from(stepDailyTotalsTable)
@@ -124,7 +117,7 @@ router.get("/walk/today", requireAuth, async (req, res) => {
     ));
   const dailyRank = steps > 0 ? (rankRow?.countAbove ?? 0) + 1 : null;
 
-  return res.json({
+  return {
     today: {
       steps,
       goal,
@@ -135,7 +128,49 @@ router.get("/walk/today", requireAuth, async (req, res) => {
       dailyRank,
     },
     profile: profile ?? null,
+  };
+}
+
+// ── GET /api/walk/bootstrap ──────────────────────────────────────────────────
+// Aggregated Walk-screen read: today/rank, challenge cards, room counts,
+// sponsored card, and theme summary in one authenticated request.
+router.get("/walk/bootstrap", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const today = localDateStr(req.query.localDate);
+
+  const [walk, challenges, roomCounts, sponsored, themeSummary] = await Promise.all([
+    buildWalkTodayPayload(userId, today),
+    getChallengeCardsForUser(userId),
+    getRoomCountsSummary(),
+    getSponsoredEventsForUser(userId, "card", { includeCoinBalance: false }),
+    getTrackThemeSummaryForUser(userId),
+  ]);
+
+  return res.json({
+    success: true,
+    ...walk,
+    challenges,
+    roomCounts,
+    sponsoredEvent: "card" in sponsored ? sponsored.card : null,
+    sponsoredCoinBalance: themeSummary.coinBalance,
+    themeSummary: {
+      coinBalance: themeSummary.coinBalance,
+      selectedThemeCode: themeSummary.selectedThemeCode,
+      defaultThemeCode: themeSummary.defaultThemeCode,
+      ownedCount: themeSummary.ownedCount,
+      totalCount: themeSummary.totalCount,
+      equippedTheme: themeSummary.equippedTheme,
+    },
   });
+});
+
+// ── GET /api/walk/today ───────────────────────────────────────────────────────
+// Returns today's step total, goal progress, distance, calories, and profile summary.
+router.get("/walk/today", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const today = localDateStr(req.query.localDate);
+
+  return res.json(await buildWalkTodayPayload(userId, today));
 });
 
 // ── POST /api/walk/steps ──────────────────────────────────────────────────────
@@ -162,6 +197,8 @@ const submitStepsSchema = z.object({
     .optional(),
   /** Client's local calendar date (YYYY-M-D). Avoids UTC midnight boundary issues. */
   localDate: z.string().regex(/^\d{4}-\d{1,2}-\d{1,2}$/).optional(),
+  /** Opt-in cheaper response when absolute total has not increased. */
+  shortUnchanged: z.boolean().optional(),
 });
 
 router.post("/walk/steps", requireAuth, async (req, res) => {
@@ -177,7 +214,12 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   // Read previous step total BEFORE the upsert — needed for goal-crossing detection.
   // If the row does not yet exist for today, previousSteps = 0.
   const [prevStepRow] = await db
-    .select({ steps: stepDailyTotalsTable.steps })
+    .select({
+      steps: stepDailyTotalsTable.steps,
+      distanceMeters: stepDailyTotalsTable.distanceMeters,
+      caloriesBurned: stepDailyTotalsTable.caloriesBurned,
+      activeMinutes: stepDailyTotalsTable.activeMinutes,
+    })
     .from(stepDailyTotalsTable)
     .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, today)))
     .limit(1);
@@ -199,6 +241,20 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
     : (parsed.data.caloriesBurned ?? Math.round(steps * 0.04));
   // activeMinutes is always absolute (total today) — use GREATEST to only ever move up.
   const activeMinutes = parsed.data.activeMinutes ?? Math.ceil(totalSteps / 120);
+
+  const absoluteMetricsUnchanged = !!prevStepRow
+    && totalSteps <= previousSteps
+    && totalDistMeters <= prevStepRow.distanceMeters
+    && totalCals <= prevStepRow.caloriesBurned
+    && activeMinutes <= prevStepRow.activeMinutes;
+
+  if (parsed.data.shortUnchanged === true && usingAbsolute && absoluteMetricsUnchanged) {
+    return res.json({
+      submitted: 0,
+      unchanged: true,
+      today: { steps: previousSteps },
+    });
+  }
 
   // Delta values for the session log (always the session delta regardless of absolute mode)
   const deltaDistMeters = parsed.data.distanceMeters ?? Math.round(steps * 0.762);

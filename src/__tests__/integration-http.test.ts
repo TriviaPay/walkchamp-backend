@@ -27,7 +27,7 @@ function loadDotEnvFile(filePath: string) {
   }
 }
 
-async function waitForHealthy(baseUrl: string, timeoutMs = 15_000) {
+async function waitForHealthy(baseUrl: string, diagnostics: () => string, timeoutMs = 15_000) {
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
@@ -41,7 +41,7 @@ async function waitForHealthy(baseUrl: string, timeoutMs = 15_000) {
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
 
-  throw new Error(`Timed out waiting for ${baseUrl}/api/healthz`);
+  throw new Error(`Timed out waiting for ${baseUrl}/api/healthz\n${diagnostics()}`);
 }
 
 let serverProcess: ChildProcessWithoutNullStreams | null = null;
@@ -91,17 +91,22 @@ beforeAll(async () => {
   });
 
   let stderr = "";
+  let stdout = "";
+  const diagnostics = () => `stdout:\n${stdout}\nstderr:\n${stderr}`;
+  serverProcess.stdout.on("data", (chunk) => {
+    stdout += chunk.toString();
+  });
   serverProcess.stderr.on("data", (chunk) => {
     stderr += chunk.toString();
   });
 
   serverProcess.on("exit", (code) => {
     if (code && code !== 0) {
-      throw new Error(`Integration server exited early with code ${code}\n${stderr}`);
+      throw new Error(`Integration server exited early with code ${code}\n${diagnostics()}`);
     }
   });
 
-  await waitForHealthy(baseUrl);
+  await waitForHealthy(baseUrl, diagnostics);
 }, 30_000);
 
 afterAll(async () => {

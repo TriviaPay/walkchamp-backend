@@ -27,6 +27,10 @@ import {
   type DbTx,
 } from "./raceIntegrity.js";
 import { logger } from "./logger.js";
+import {
+  CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY,
+  CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY_MESSAGE,
+} from "./cashChallengeFees.js";
 
 export type RefundItemStatus =
   | "requested"
@@ -1064,6 +1068,35 @@ export async function reconcileProviderRefund(input: {
   if (!item) return { reconciled: false };
   const entity = input.eventPayload.entity as Record<string, unknown> | undefined;
   const providerStatus = String(input.eventPayload.status ?? entity?.status ?? "");
+  const eventAmount = input.eventPayload.amount ?? entity?.amount;
+  const eventCurrency = input.eventPayload.currency ?? entity?.currency;
+  const eventPaymentId = input.provider === "razorpay"
+    ? input.eventPayload.payment_id ?? entity?.payment_id
+    : input.eventPayload.payment_intent ?? entity?.payment_intent;
+
+  const bindingMismatch =
+    (typeof eventAmount === "number" && eventAmount !== item.approvedAmount)
+    || (typeof eventCurrency === "string" && eventCurrency.trim().toLowerCase() !== item.currency.trim().toLowerCase())
+    || (typeof eventPaymentId === "string" && item.providerPaymentId && eventPaymentId !== item.providerPaymentId);
+
+  if (bindingMismatch) {
+    logger.warn(
+      {
+        provider: input.provider,
+        providerRefundId: input.providerRefundId,
+        refundItemId: item.id,
+        eventAmount: typeof eventAmount === "number" ? eventAmount : null,
+        approvedAmount: item.approvedAmount,
+        eventCurrency: typeof eventCurrency === "string" ? eventCurrency : null,
+        itemCurrency: item.currency,
+        eventPaymentId: typeof eventPaymentId === "string" ? eventPaymentId : null,
+        itemProviderPaymentId: item.providerPaymentId,
+      },
+      "[RefundService] provider refund webhook binding mismatch",
+    );
+    return { reconciled: false, reason: "provider_refund_binding_mismatch" };
+  }
+
   let status: RefundItemStatus = "provider_pending";
   if (input.provider === "stripe") {
     status = providerStatus === "succeeded" ? "succeeded" : providerStatus === "failed" ? "failed_terminal" : "provider_pending";
@@ -1205,7 +1238,8 @@ export async function debitWalletForCashChallenge(tx: DbTx, input: {
   if (wallet.currency.toLowerCase() !== "usd") {
     return {
       ok: false as const,
-      error: "Cash challenges currently require a USD wallet.",
+      code: CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY,
+      error: CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY_MESSAGE,
       balanceCents: wallet.availableBalanceCents,
     };
   }

@@ -20,6 +20,7 @@ import {
   scheduledRoomRegistrationsTable,
   coinBalancesTable,
   cashChallengeConsentsTable,
+  raceTrackThemesTable,
 } from "../../db/src/schema/index.js";
 import { eq, and, desc, asc, sql, ne, inArray, or, notExists } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
@@ -52,8 +53,10 @@ import {
   buildRewardSplitCents as buildCashRewardSplitCents,
   calcEntryPoolCents,
   calcPerPlayerFees,
+  cashChallengeUnsupportedForCurrencyBody,
   formatQuoteForApi,
   isAllowedEntryAmountCents,
+  isCashChallengeUnsupportedForCountry,
   resolvePaymentProvider,
 } from "../lib/cashChallengeFees.js";
 import {
@@ -65,8 +68,19 @@ import {
   createRefundBatchForRaceCancellation,
   createRefundForRaceLeave,
 } from "../lib/refundService.js";
+import { buildTrackThemeMedia, TRACK_THEME_CODES, type TrackThemeMedia } from "../lib/trackThemeMedia.js";
 
 const router = Router();
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+class PaidJoinRollback extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly body: Record<string, string>,
+  ) {
+    super(String(body.error ?? "Paid join failed."));
+  }
+}
 
 // ── In-memory spectator tracking (resets on server restart) ──────────────────
 const spectatorSeen = new Map<string, Map<string, number>>();
@@ -146,22 +160,36 @@ export async function recoverStaleRaces(): Promise<void> {
 
 // ── Periodic safety net: complete races where all participants are done ────────
 // Called every 15s from app.ts. Completes races where everyone has finished or
-// forfeited. Also force-completes any race stuck for >30 minutes (safety net).
+// forfeited. Also force-completes non-duration races stuck for >30 minutes
+// (safety net). Duration challenges run until challengeEndAt.
 export async function cleanupOverdueRaces(): Promise<void> {
   try {
     const SAFETY_TIMEOUT_MS = 30 * 60_000; // 30-minute hard cap for stuck races
     const stale = await db
-      .select({ id: raceRoomsTable.id, startedAt: raceRoomsTable.startedAt, type: raceRoomsTable.type, currentPlayers: raceRoomsTable.currentPlayers })
+      .select({
+        id: raceRoomsTable.id,
+        startedAt: raceRoomsTable.startedAt,
+        type: raceRoomsTable.type,
+        currentPlayers: raceRoomsTable.currentPlayers,
+        challengeDurationDays: raceRoomsTable.challengeDurationDays,
+        challengeEndAt: raceRoomsTable.challengeEndAt,
+      })
       .from(raceRoomsTable)
       .where(eq(raceRoomsTable.status, "in_progress"));
     for (const race of stale) {
       const isSponsored = race.type === "sponsored";
-      // Sponsored events run for exactly 3 hours; regular races have a 30-min safety cap
+      const isDurationChallenge = !isSponsored && race.challengeDurationDays > 0;
+      // Sponsored events run for exactly 3 hours; duration challenges end at
+      // challengeEndAt; only non-duration regular races have a 30-min safety cap.
       if (race.startedAt) {
         const elapsed = Date.now() - race.startedAt.getTime();
-        const timeoutMs = isSponsored ? 3 * 60 * 60_000 : SAFETY_TIMEOUT_MS;
+        const timeoutMs = isSponsored
+          ? 3 * 60 * 60_000
+          : isDurationChallenge
+            ? null
+            : SAFETY_TIMEOUT_MS;
         const reason = isSponsored ? "sponsored_duration_expired" : "safety_timeout";
-        if (elapsed >= timeoutMs) {
+        if (timeoutMs !== null && elapsed >= timeoutMs) {
           autoCompleteRace(race.id, reason).catch((err) => {
             logger.error({ raceId: race.id, elapsedMs: elapsed, err }, `cleanupOverdueRaces: ${reason} autoCompleteRace failed`);
           });
@@ -251,6 +279,64 @@ function entryTypeLabel(entryType: string): string {
     paid_usd: "USD Entry",
   };
   return map[entryType] ?? entryType;
+}
+
+function deriveChallengeEndAt(room: Pick<typeof raceRoomsTable.$inferSelect, "challengeEndAt" | "challengeDurationDays" | "startedAt" | "scheduledStartAt">): Date | null {
+  if (room.challengeEndAt) return room.challengeEndAt;
+  if (room.challengeDurationDays <= 0) return null;
+
+  const start = room.startedAt ?? room.scheduledStartAt;
+  if (!start) return null;
+  return new Date(start.getTime() + room.challengeDurationDays * MS_PER_DAY);
+}
+
+function buildChallengeTimeFields(room: Pick<typeof raceRoomsTable.$inferSelect, "challengeEndAt" | "challengeDurationDays" | "startedAt" | "scheduledStartAt">) {
+  const challengeEndAt = deriveChallengeEndAt(room);
+  const timeLeftSeconds = challengeEndAt
+    ? Math.max(0, Math.floor((challengeEndAt.getTime() - Date.now()) / 1000))
+    : null;
+  const daysLeft = timeLeftSeconds === null ? null : Math.ceil(timeLeftSeconds / 86400);
+
+  return {
+    startedAt: room.startedAt?.toISOString() ?? null,
+    started_at: room.startedAt?.toISOString() ?? null,
+    challengeDurationDays: room.challengeDurationDays,
+    challenge_duration_days: room.challengeDurationDays,
+    challengeEndAt: challengeEndAt?.toISOString() ?? null,
+    challenge_end_at: challengeEndAt?.toISOString() ?? null,
+    timeLeftSeconds,
+    time_left_seconds: timeLeftSeconds,
+    daysLeft,
+    days_left: daysLeft,
+  };
+}
+
+async function getTrackThemeMediaMap(codes: Array<string | null | undefined>): Promise<Map<string, TrackThemeMedia>> {
+  const normalizedCodes = [...new Set(codes.map((code) => code?.trim()).filter((code): code is string => !!code))];
+  const mediaMap = new Map<string, TrackThemeMedia>();
+  if (normalizedCodes.length === 0) return mediaMap;
+
+  const themes = await db
+    .select({
+      code: raceTrackThemesTable.code,
+      assetVersion: raceTrackThemesTable.assetVersion,
+    })
+    .from(raceTrackThemesTable)
+    .where(inArray(raceTrackThemesTable.code, normalizedCodes));
+
+  const versionByCode = new Map(themes.map((theme) => [theme.code, theme.assetVersion]));
+  for (const code of normalizedCodes) {
+    mediaMap.set(code, buildTrackThemeMedia(code, versionByCode.get(code)));
+  }
+  return mediaMap;
+}
+
+function trackThemeForCode(
+  code: string | null | undefined,
+  mediaMap: Map<string, TrackThemeMedia>,
+): TrackThemeMedia {
+  const normalizedCode = code?.trim() || "bg";
+  return mediaMap.get(normalizedCode) ?? buildTrackThemeMedia(normalizedCode);
 }
 
 /** Allowed entry amounts in cents for paid USD challenges: $3, $5, $10, $15, $20, $25. */
@@ -925,6 +1011,7 @@ async function getActiveRaceForUser(userId: string) {
       entryType: raceRoomsTable.entryType,
       entryAmountCents: raceRoomsTable.entryAmountCents,
       targetSteps: raceRoomsTable.targetSteps,
+      trackLayout: raceRoomsTable.trackLayout,
       creatorId: raceRoomsTable.creatorId,
       currentPlayers: raceRoomsTable.currentPlayers,
       startedAt: raceRoomsTable.startedAt,
@@ -946,7 +1033,11 @@ async function getActiveRaceForUser(userId: string) {
   return row ?? null;
 }
 
-function activeRacePayload(row: NonNullable<Awaited<ReturnType<typeof getActiveRaceForUser>>>, userId: string) {
+function activeRacePayload(
+  row: NonNullable<Awaited<ReturnType<typeof getActiveRaceForUser>>>,
+  userId: string,
+  trackTheme: TrackThemeMedia = buildTrackThemeMedia(row.trackLayout ?? "bg"),
+) {
   return {
     room_id: row.roomId,
     room_status: row.roomStatus,
@@ -956,6 +1047,9 @@ function activeRacePayload(row: NonNullable<Awaited<ReturnType<typeof getActiveR
     current_user_role: row.creatorId === userId ? "host" : "participant",
     can_leave: true,
     next_screen: row.roomStatus === "in_progress" ? "race_track" : "waiting_room",
+    track_layout: row.trackLayout ?? "bg",
+    trackLayout: row.trackLayout ?? "bg",
+    trackTheme,
     // Step restoration data — lets the client restore progress after app close/reopen.
     started_at: row.startedAt?.toISOString() ?? null,
     participant_current_steps: row.participantCurrentSteps ?? 0,
@@ -971,10 +1065,11 @@ router.get("/races/current-active", requireAuth, async (req, res) => {
   if (!active) {
     return res.json({ success: true, has_active_race: false, active_race: null });
   }
+  const mediaMap = await getTrackThemeMediaMap([active.trackLayout]);
   return res.json({
     success: true,
     has_active_race: true,
-    active_race: activeRacePayload(active, userId),
+    active_race: activeRacePayload(active, userId, trackThemeForCode(active.trackLayout, mediaMap)),
   });
 });
 
@@ -983,8 +1078,7 @@ router.get("/races/current-active", requireAuth, async (req, res) => {
 // Status values: host_available | join_available | user_hosting_waiting |
 //   user_joined_waiting | user_hosting_active | user_joined_active |
 //   active_other | finished
-router.get("/challenges/available", requireAuth, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
+export async function getChallengeCardsForUser(userId: string) {
   const entryTypes = ["free", "paid_1", "paid_3", "paid_5", "coins_battle"] as const;
 
   // ── Housekeeping: auto-cancel abandoned solo waiting rooms ──────────────────
@@ -1185,12 +1279,10 @@ router.get("/challenges/available", requireAuth, async (req, res) => {
     }),
   );
 
-  return res.json({ challenges });
-});
+  return challenges;
+}
 
-// ── GET /api/rooms/counts ─────────────────────────────────────────────────────
-// Lightweight endpoint — returns joinable/registerable room counts for the badge.
-router.get("/rooms/counts", requireAuth, async (req, res) => {
+export async function getRoomCountsSummary() {
   const now = new Date();
   const [currentRows, upcomingRows] = await Promise.all([
     db
@@ -1216,11 +1308,23 @@ router.get("/rooms/counts", requireAuth, async (req, res) => {
   ]);
   const currentRoomsCount  = currentRows[0]?.count  ?? 0;
   const upcomingRoomsCount = upcomingRows[0]?.count ?? 0;
-  return res.json({
+  return {
     currentRoomsCount,
     upcomingRoomsCount,
     totalRoomsCount: currentRoomsCount + upcomingRoomsCount,
-  });
+  };
+}
+
+router.get("/challenges/available", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const challenges = await getChallengeCardsForUser(userId);
+  return res.json({ challenges });
+});
+
+// ── GET /api/rooms/counts ─────────────────────────────────────────────────────
+// Lightweight endpoint — returns joinable/registerable room counts for the badge.
+router.get("/rooms/counts", requireAuth, async (req, res) => {
+  return res.json(await getRoomCountsSummary());
 });
 
 // ── GET /api/rooms/available ──────────────────────────────────────────────────
@@ -1282,37 +1386,44 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
       : [];
 
     const registeredSet = new Set(registrations.map((r) => r.raceRoomId));
+    const trackThemeMediaMap = await getTrackThemeMediaMap(upcoming.map((r) => r.trackLayout));
 
     const TRACK_NAMES2: Record<string, string> = {
       bg: "Neon Finish", bg1: "Arcade Track", bg2: "Night City",
       bg3: "Speed Zone", bg4: "Solar Sprint", bg5: "Ice Run",
     };
 
-    const formatted = upcoming.map((r) => ({
-      room_id: r.id,
-      status: "scheduled",
-      challenge_type: r.entryType,
-      entry_fee: r.entryAmountCents / 100,
-      coin_entry_amount: r.coinEntryAmount ?? 0,
-      title: r.title,
-      target_steps: r.targetSteps,
-      max_players: r.maxPlayers,
-      registered_count: r.registeredCount,
-      scheduled_start_at: r.scheduledStartAt?.toISOString() ?? null,
-      challenge_duration_days: r.challengeDurationDays,
-      challenge_end_at: r.challengeEndAt?.toISOString() ?? null,
-      selected_track_theme_id: r.trackLayout,
-      theme_name: TRACK_NAMES2[r.trackLayout] ?? r.trackLayout,
-      is_private: r.isPrivate,
-      requires_code: r.isPrivate,
-      host_user_id: r.creatorId,
-      host_username: r.hostUsername,
-      host_avatar_color: r.hostAvatarColor,
-      host_avatar_url: r.hostAvatarUrl ?? null,
-      host_country_flag: r.hostCountryFlag ?? null,
-      current_user_registered: registeredSet.has(r.id),
-      eligible_to_register: !registeredSet.has(r.id) && r.registeredCount < r.maxPlayers,
-    }));
+    const formatted = upcoming.map((r) => {
+      const trackTheme = trackThemeForCode(r.trackLayout, trackThemeMediaMap);
+      return {
+        room_id: r.id,
+        status: "scheduled",
+        challenge_type: r.entryType,
+        entry_fee: r.entryAmountCents / 100,
+        coin_entry_amount: r.coinEntryAmount ?? 0,
+        title: r.title,
+        target_steps: r.targetSteps,
+        max_players: r.maxPlayers,
+        registered_count: r.registeredCount,
+        scheduled_start_at: r.scheduledStartAt?.toISOString() ?? null,
+        challenge_duration_days: r.challengeDurationDays,
+        challenge_end_at: r.challengeEndAt?.toISOString() ?? null,
+        selected_track_theme_id: r.trackLayout,
+        theme_name: TRACK_NAMES2[r.trackLayout] ?? r.trackLayout,
+        trackTheme,
+        imageSet: trackTheme.imageSet,
+        trackThemeImageSet: trackTheme.imageSet,
+        is_private: r.isPrivate,
+        requires_code: r.isPrivate,
+        host_user_id: r.creatorId,
+        host_username: r.hostUsername,
+        host_avatar_color: r.hostAvatarColor,
+        host_avatar_url: r.hostAvatarUrl ?? null,
+        host_country_flag: r.hostCountryFlag ?? null,
+        current_user_registered: registeredSet.has(r.id),
+        eligible_to_register: !registeredSet.has(r.id) && r.registeredCount < r.maxPlayers,
+      };
+    });
 
     return res.json({ success: true, rooms: formatted });
   }
@@ -1430,45 +1541,52 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
     return `Created ${createdAt.toLocaleDateString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`;
   }
 
-  const formatted = rooms.map((r) => ({
-    room_id: r.id,
-    status: "waiting",
-    challenge_type: r.entryType,
-    entry_fee: r.entryAmountCents / 100,
-    currency: "USD",
-    title: r.title,
-    target_steps: r.targetSteps,
-    max_players: r.maxPlayers,
-    current_players: r.currentPlayers,
-    available_slots: r.maxPlayers - r.currentPlayers,
-    reward_pool: r.prizePoolCents / 100,
-    coin_entry_amount: r.coinEntryAmount ?? 0,
-    reward_label: r.entryType === "coins_battle"
-      ? `${(r.coinEntryAmount ?? 0).toLocaleString()} coins`
-      : r.entryAmountCents === 0
-        ? "Coins & badges"
-        : `$${(r.prizePoolCents / 100).toFixed(2)}`,
-    host_user_id: r.creatorId,
-    host_username: r.hostUsername,
-    host_avatar_color: r.hostAvatarColor,
-    host_avatar_url: r.hostAvatarUrl ?? null,
-    host_country_flag: r.hostCountryFlag ?? null,
-    country_code: r.countryCode ?? null,
-    country_label: r.countryCode ?? "Any Country",
-    race_type: r.type,
-    team_a_country: r.teamACountry ?? null,
-    team_a_country_code: r.teamACountryCode ?? null,
-    team_b_country: r.teamBCountry ?? null,
-    team_b_country_code: r.teamBCountryCode ?? null,
-    theme_code: r.trackLayout,
-    theme_name: TRACK_NAMES[r.trackLayout] ?? r.trackLayout,
-    is_private: r.isPrivate,
-    requires_code: r.isPrivate,
-    created_at: r.createdAt,
-    created_ago_label: createdAgoLabel(r.createdAt),
-    joinable: true,
-    join_block_reason: null,
-  }));
+  const trackThemeMediaMap = await getTrackThemeMediaMap(rooms.map((r) => r.trackLayout));
+  const formatted = rooms.map((r) => {
+    const trackTheme = trackThemeForCode(r.trackLayout, trackThemeMediaMap);
+    return {
+      room_id: r.id,
+      status: "waiting",
+      challenge_type: r.entryType,
+      entry_fee: r.entryAmountCents / 100,
+      currency: "USD",
+      title: r.title,
+      target_steps: r.targetSteps,
+      max_players: r.maxPlayers,
+      current_players: r.currentPlayers,
+      available_slots: r.maxPlayers - r.currentPlayers,
+      reward_pool: r.prizePoolCents / 100,
+      coin_entry_amount: r.coinEntryAmount ?? 0,
+      reward_label: r.entryType === "coins_battle"
+        ? `${(r.coinEntryAmount ?? 0).toLocaleString()} coins`
+        : r.entryAmountCents === 0
+          ? "Coins & badges"
+          : `$${(r.prizePoolCents / 100).toFixed(2)}`,
+      host_user_id: r.creatorId,
+      host_username: r.hostUsername,
+      host_avatar_color: r.hostAvatarColor,
+      host_avatar_url: r.hostAvatarUrl ?? null,
+      host_country_flag: r.hostCountryFlag ?? null,
+      country_code: r.countryCode ?? null,
+      country_label: r.countryCode ?? "Any Country",
+      race_type: r.type,
+      team_a_country: r.teamACountry ?? null,
+      team_a_country_code: r.teamACountryCode ?? null,
+      team_b_country: r.teamBCountry ?? null,
+      team_b_country_code: r.teamBCountryCode ?? null,
+      theme_code: r.trackLayout,
+      theme_name: TRACK_NAMES[r.trackLayout] ?? r.trackLayout,
+      trackTheme,
+      imageSet: trackTheme.imageSet,
+      trackThemeImageSet: trackTheme.imageSet,
+      is_private: r.isPrivate,
+      requires_code: r.isPrivate,
+      created_at: r.createdAt,
+      created_ago_label: createdAgoLabel(r.createdAt),
+      joinable: true,
+      join_block_reason: null,
+    };
+  });
 
   req.log.info({ filter, total: counts.total, publicRoomCount, privateRoomCount, userId }, "[AvailableRooms] fetched");
   return res.json({
@@ -1613,6 +1731,7 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
       maxPlayers: raceRoomsTable.maxPlayers,
       currentPlayers: raceRoomsTable.currentPlayers,
       status: raceRoomsTable.status,
+      trackLayout: raceRoomsTable.trackLayout,
       creatorId: raceRoomsTable.creatorId,
       startedAt: raceRoomsTable.startedAt,
       createdAt: raceRoomsTable.createdAt,
@@ -1633,27 +1752,24 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
   if (rows.length === 0) return res.json({ race: null });
 
   const row = rows[0];
+  const mediaMap = await getTrackThemeMediaMap([row.trackLayout]);
+  const trackTheme = trackThemeForCode(row.trackLayout, mediaMap);
   return res.json({
     race: {
       ...row,
       isHost: row.creatorId === userId,
       entryType: entryTypeLabel(row.entryType),
       entryAmountDollars: row.entryAmountCents / 100,
+      trackTheme,
+      imageSet: trackTheme.imageSet,
+      trackThemeImageSet: trackTheme.imageSet,
     },
   });
 });
 
 // ── POST /api/races/host ──────────────────────────────────────────────────────
 // Creates a new race room and joins the creator as host participant.
-const VALID_TRACK_LAYOUTS = [
-  "bg", "bg1", "galaxy", "daylightStadium", "forest", "city",
-  "lava", "ice", "candy", "farm", "underwater", "musicfest",
-  "barbie", "desert", "gold", "nightforest", "skykingdom",
-  "rain", "storm", "mountain", "waterfall", "webcity",
-  "bridge", "newyork", "pirateisland", "paradise", "musicfest2",
-  // new shop tracks (added with the 7-skin expansion)
-  "chocolate", "fireworks", "moon", "rainbow_road", "runway", "toy_race", "water_park",
-] as const;
+const VALID_TRACK_LAYOUTS = TRACK_THEME_CODES;
 const hostRaceSchema = z.object({
   entryType: z.enum(["free", "paid_1", "paid_3", "paid_5", "paid_usd", "coins_battle"]),
   maxPlayers: z.number().int().min(2).max(10),
@@ -1689,13 +1805,27 @@ router.get("/races/cash-challenge/payment-quote", requireAuth, async (req, res) 
     });
   }
 
+  const [profileForQuote] = await db
+    .select({ countryCode: profilesTable.countryCode })
+    .from(profilesTable)
+    .where(eq(profilesTable.id, userId))
+    .limit(1);
+  const effectiveCountryCode = profileForQuote?.countryCode ?? countryCode;
+  if (isCashChallengeUnsupportedForCountry(effectiveCountryCode)) {
+    req.log.info(
+      { userId, countryCode: effectiveCountryCode },
+      "[CashChallenge] INR/Razorpay quote blocked until multi-currency support ships",
+    );
+    return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());
+  }
+
   const [wallet] = await db
     .select({ availableBalanceCents: walletsTable.availableBalanceCents })
     .from(walletsTable)
     .where(eq(walletsTable.userId, userId))
     .limit(1);
 
-  const provider = resolvePaymentProvider(countryCode);
+  const provider = resolvePaymentProvider(effectiveCountryCode);
   const quote = buildCashChallengeQuote({
     entryFeeCents,
     numberOfPlayers,
@@ -1786,6 +1916,13 @@ router.post("/races/host", requireAuth, async (req, res) => {
     if (!profile.isAdult) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
     if (!profile.paidRaceEnabled) return res.status(403).json({ error: "Paid challenges are not available for your account." });
     if (profile.accountStatus !== "active") return res.status(403).json({ error: "Your account is under review." });
+    if (isCashChallengeUnsupportedForCountry(profile.countryCode)) {
+      req.log.info(
+        { userId, countryCode: profile.countryCode },
+        "[CashChallenge] INR/Razorpay host blocked until multi-currency support ships",
+      );
+      return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());
+    }
   }
 
   const titleMap: Record<string, string> = {
@@ -1992,11 +2129,33 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
       );
 
     if (participants.length > 0) {
+      const participantProfiles = await db
+        .select({ userId: profilesTable.id, countryCode: profilesTable.countryCode })
+        .from(profilesTable)
+        .where(inArray(profilesTable.id, participants.map((p) => p.userId)));
+      const unsupportedParticipant = participantProfiles.find((profile) =>
+        isCashChallengeUnsupportedForCountry(profile.countryCode)
+      );
+      if (unsupportedParticipant) {
+        req.log.warn(
+          { raceId, userId: unsupportedParticipant.userId, countryCode: unsupportedParticipant.countryCode },
+          "[CashChallenge] INR/Razorpay race start participant debit blocked until multi-currency support ships",
+        );
+        return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());
+      }
+
       const [hostProfile] = await db
         .select({ countryCode: profilesTable.countryCode })
         .from(profilesTable)
         .where(eq(profilesTable.id, room.creatorId))
         .limit(1);
+      if (isCashChallengeUnsupportedForCountry(hostProfile?.countryCode)) {
+        req.log.warn(
+          { raceId, hostUserId: room.creatorId, countryCode: hostProfile?.countryCode },
+          "[CashChallenge] INR/Razorpay race start debit blocked until multi-currency support ships",
+        );
+        return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());
+      }
       const provider = resolvePaymentProvider(hostProfile?.countryCode);
 
       await db.transaction(async (tx) => {
@@ -2080,9 +2239,17 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
     }
   }
 
+  const startedAt = new Date();
+  const challengeEndAt = deriveChallengeEndAt({ ...room, startedAt });
+
   const [updated] = await db
     .update(raceRoomsTable)
-    .set({ status: "in_progress", startedAt: new Date(), updatedAt: new Date() })
+    .set({
+      status: "in_progress",
+      startedAt,
+      ...(challengeEndAt ? { challengeEndAt } : {}),
+      updatedAt: startedAt,
+    })
     .where(eq(raceRoomsTable.id, raceId))
     .returning();
 
@@ -2334,6 +2501,7 @@ router.get("/races", requireAuth, async (req, res) => {
     .orderBy(orderByClause)
     .limit(limitNum)
     .offset(offsetNum);
+  const trackThemeMediaMap = await getTrackThemeMediaMap(rows.map((room) => room.trackLayout));
 
   // Attach top-3 participants for each race
   const racesWithPlayers = await Promise.all(
@@ -2424,6 +2592,8 @@ router.get("/races", requireAuth, async (req, res) => {
       const prizeTiers = splits.map((s) => parseFloat(((winnersPoolCents / 100) * s).toFixed(2)));
       const rewardSplit = buildRewardSplit(room.entryAmountCents, room.currentPlayers);
       const winnerCount = numWinners(room.currentPlayers);
+      const trackTheme = trackThemeForCode(room.trackLayout, trackThemeMediaMap);
+      const challengeTime = buildChallengeTimeFields(room);
 
       return {
         id: room.id,
@@ -2446,11 +2616,14 @@ router.get("/races", requireAuth, async (req, res) => {
         isPrivate: room.isPrivate,
         inviteCode: room.isPrivate ? room.inviteCode : null,
         countryCode: room.countryCode,
-        startedAt: room.startedAt,
+        ...challengeTime,
         completedAt: room.completedAt,
         createdAt: room.createdAt,
         creatorId: room.creatorId,
         trackLayout: room.trackLayout ?? "bg",
+        trackTheme,
+        imageSet: trackTheme.imageSet,
+        trackThemeImageSet: trackTheme.imageSet,
         coin_entry_amount: room.coinEntryAmount ?? 0,
         players,
       };
@@ -2719,6 +2892,13 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   if (!profile.isAdult) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
   if (!profile.paidRaceEnabled) return res.status(403).json({ error: "Paid challenges are not available for your account." });
   if (profile.accountStatus !== "active") return res.status(403).json({ error: "Your account is under review." });
+  if (isCashChallengeUnsupportedForCountry(profile.countryCode)) {
+    req.log.info(
+      { userId, raceId, countryCode: profile.countryCode },
+      "[CashChallenge] INR/Razorpay paid join blocked until multi-currency support ships",
+    );
+    return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());
+  }
 
   // Wallet check — require total payable (entry + processing + platform service fees)
   const [wallet] = await db.select().from(walletsTable).where(eq(walletsTable.userId, userId)).limit(1);
@@ -2750,63 +2930,70 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   let joinErrorStatus: number | null = null;
   let joinErrorBody: Record<string, string> | null = null;
 
-  await db.transaction(async (tx) => {
-    lockedRoom = await lockRaceRoom(tx, raceId);
-    if (!lockedRoom) {
-      joinErrorStatus = 404;
-      joinErrorBody = { error: "Race not found." };
-      return;
-    }
-    if (lockedRoom.status !== "open" && lockedRoom.status !== "full") {
-      joinErrorStatus = 409;
-      joinErrorBody = { error: "Race is no longer open to join." };
-      return;
-    }
-    if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
-      joinErrorStatus = 409;
-      joinErrorBody = { error: "Race is full." };
-      return;
-    }
+  try {
+    await db.transaction(async (tx) => {
+      lockedRoom = await lockRaceRoom(tx, raceId);
+      if (!lockedRoom) {
+        joinErrorStatus = 404;
+        joinErrorBody = { error: "Race not found." };
+        return;
+      }
+      if (lockedRoom.status !== "open" && lockedRoom.status !== "full") {
+        joinErrorStatus = 409;
+        joinErrorBody = { error: "Race is no longer open to join." };
+        return;
+      }
+      if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
+        joinErrorStatus = 409;
+        joinErrorBody = { error: "Race is full." };
+        return;
+      }
 
-    const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: raceId, userId });
-    if (participantResult.reason === "blocked") {
-      joinErrorStatus = 409;
-      joinErrorBody = { error: "You cannot rejoin this race." };
-      return;
-    }
-    if (participantResult.reason === "already_joined") {
-      joinErrorStatus = 409;
-      joinErrorBody = { error: "You are already in this race." };
-      return;
-    }
+      const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: raceId, userId });
+      if (participantResult.reason === "blocked") {
+        joinErrorStatus = 409;
+        joinErrorBody = { error: "You cannot rejoin this race." };
+        return;
+      }
+      if (participantResult.reason === "already_joined") {
+        joinErrorStatus = 409;
+        joinErrorBody = { error: "You are already in this race." };
+        return;
+      }
 
-    participant = participantResult.participant;
-    const newPlayerCount = lockedRoom.currentPlayers + 1;
-    await tx
-      .update(raceRoomsTable)
-      .set({
-        currentPlayers: newPlayerCount,
-        status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers),
-        updatedAt: new Date(),
-      })
-      .where(eq(raceRoomsTable.id, lockedRoom.id));
+      participant = participantResult.participant;
+      const newPlayerCount = lockedRoom.currentPlayers + 1;
+      await tx
+        .update(raceRoomsTable)
+        .set({
+          currentPlayers: newPlayerCount,
+          status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers),
+          updatedAt: new Date(),
+        })
+        .where(eq(raceRoomsTable.id, lockedRoom.id));
 
-    const debit = await debitCashChallengeEntry(tx, {
-      userId,
-      raceRoomId: raceId,
-      entryFeeCents: lockedRoom.entryAmountCents,
-      paymentProvider: provider,
-      description: `Cash challenge join: ${lockedRoom.title}`,
+      const debit = await debitCashChallengeEntry(tx, {
+        userId,
+        raceRoomId: raceId,
+        entryFeeCents: lockedRoom.entryAmountCents,
+        paymentProvider: provider,
+        description: `Cash challenge join: ${lockedRoom.title}`,
+      });
+      if (!debit.ok) {
+        throw new PaidJoinRollback(402, { error: debit.error });
+      }
+
+      joinedCurrentPlayers = newPlayerCount;
+      lockedRoom = { ...lockedRoom, currentPlayers: newPlayerCount, status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers) };
     });
-    if (!debit.ok) {
-      joinErrorStatus = 402;
-      joinErrorBody = { error: debit.error };
-      return;
+  } catch (err) {
+    if (err instanceof PaidJoinRollback) {
+      joinErrorStatus = err.statusCode;
+      joinErrorBody = err.body;
+    } else {
+      throw err;
     }
-
-    joinedCurrentPlayers = newPlayerCount;
-    lockedRoom = { ...lockedRoom, currentPlayers: newPlayerCount, status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers) };
-  });
+  }
 
   if (joinErrorStatus !== null && joinErrorBody) {
     return res.status(joinErrorStatus).json(joinErrorBody);
@@ -2951,6 +3138,7 @@ router.get("/races/by-code/:code", requireAuth, async (req, res) => {
       maxPlayers: raceRoomsTable.maxPlayers,
       currentPlayers: raceRoomsTable.currentPlayers,
       targetSteps: raceRoomsTable.targetSteps,
+      trackLayout: raceRoomsTable.trackLayout,
       isPrivate: raceRoomsTable.isPrivate,
       inviteCode: raceRoomsTable.inviteCode,
       creatorId: raceRoomsTable.creatorId,
@@ -2967,7 +3155,17 @@ router.get("/races/by-code/:code", requireAuth, async (req, res) => {
     return res.status(409).json({ error: "This room is full." });
   }
 
-  return res.json({ raceId: room.id, room });
+  const mediaMap = await getTrackThemeMediaMap([room.trackLayout]);
+  const trackTheme = trackThemeForCode(room.trackLayout, mediaMap);
+  return res.json({
+    raceId: room.id,
+    room: {
+      ...room,
+      trackTheme,
+      imageSet: trackTheme.imageSet,
+      trackThemeImageSet: trackTheme.imageSet,
+    },
+  });
 });
 
 // ── POST /api/races/join-with-code ────────────────────────────────────────────
@@ -3083,6 +3281,22 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
     });
   }
 
+  let joinerProfile: typeof profilesTable.$inferSelect | null = null;
+  if (room.entryAmountCents > 0) {
+    const [profile] = await db.select().from(profilesTable).where(eq(profilesTable.id, userId)).limit(1);
+    joinerProfile = profile ?? null;
+    if (!joinerProfile || !joinerProfile.isAdult || !joinerProfile.paidRaceEnabled || joinerProfile.accountStatus !== "active") {
+      return res.status(403).json({ success: false, error: "Paid challenges are not available for your account." });
+    }
+    if (isCashChallengeUnsupportedForCountry(joinerProfile.countryCode)) {
+      req.log.info(
+        { userId, raceId: room.id, countryCode: joinerProfile.countryCode },
+        "[CashChallenge] INR/Razorpay private paid join blocked until multi-currency support ships",
+      );
+      return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());
+    }
+  }
+
   // Cash challenge consent enforcement — must be accepted before join
   const rulesVersion = (acceptedRulesVersion as string | undefined) ?? "2026-06";
   if (room.entryAmountCents > 0 && !acceptedCashChallengeConsent) {
@@ -3104,10 +3318,6 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
         error: "Cash challenges are disabled for this build.",
       });
     }
-    const [profile] = await db.select().from(profilesTable).where(eq(profilesTable.id, userId)).limit(1);
-    if (!profile || !profile.isAdult || !profile.paidRaceEnabled || profile.accountStatus !== "active") {
-      return res.status(403).json({ success: false, error: "Paid challenges are not available for your account." });
-    }
     const [wallet] = await db.select().from(walletsTable).where(eq(walletsTable.userId, userId)).limit(1);
     const balance = wallet?.availableBalanceCents ?? 0;
     if (balance < room.entryAmountCents) {
@@ -3117,63 +3327,88 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
       });
     }
   }
+  const privatePaidProvider = room.entryAmountCents > 0
+    ? resolvePaymentProvider(joinerProfile?.countryCode)
+    : "stripe";
 
   let lockedRoom: typeof raceRoomsTable.$inferSelect | null = null;
   let joinedCurrentPlayers = room.currentPlayers;
   let joinErrorStatus: number | null = null;
   let joinErrorBody: Record<string, string | boolean> | null = null;
 
-  await db.transaction(async (tx) => {
-    lockedRoom = await lockRaceRoom(tx, room.id);
-    if (!lockedRoom) {
-      joinErrorStatus = 404;
-      joinErrorBody = { success: false, error: "Invalid room code." };
-      return;
-    }
-    if (lockedRoom.status === "completed" || lockedRoom.status === "cancelled") {
-      joinErrorStatus = 409;
-      joinErrorBody = { success: false, code: "ROOM_CODE_EXPIRED", error: "This room code has expired." };
-      return;
-    }
-    if (lockedRoom.status === "in_progress") {
-      joinErrorStatus = 409;
-      joinErrorBody = { success: false, code: "RACE_ALREADY_STARTED", error: "This race has already started." };
-      return;
-    }
-    if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
-      joinErrorStatus = 409;
-      joinErrorBody = { success: false, code: "ROOM_FULL", error: "This room is full." };
-      return;
-    }
+  try {
+    await db.transaction(async (tx) => {
+      lockedRoom = await lockRaceRoom(tx, room.id);
+      if (!lockedRoom) {
+        joinErrorStatus = 404;
+        joinErrorBody = { success: false, error: "Invalid room code." };
+        return;
+      }
+      if (lockedRoom.status === "completed" || lockedRoom.status === "cancelled") {
+        joinErrorStatus = 409;
+        joinErrorBody = { success: false, code: "ROOM_CODE_EXPIRED", error: "This room code has expired." };
+        return;
+      }
+      if (lockedRoom.status === "in_progress") {
+        joinErrorStatus = 409;
+        joinErrorBody = { success: false, code: "RACE_ALREADY_STARTED", error: "This race has already started." };
+        return;
+      }
+      if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
+        joinErrorStatus = 409;
+        joinErrorBody = { success: false, code: "ROOM_FULL", error: "This room is full." };
+        return;
+      }
 
-    const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: lockedRoom.id, userId });
-    if (participantResult.reason === "blocked") {
-      joinErrorStatus = 409;
-      joinErrorBody = { success: false, code: "RACE_ALREADY_FORFEITED", error: "You already quit this race and cannot rejoin while it is active." };
-      return;
-    }
-    if (participantResult.reason === "already_joined") {
-      joinErrorStatus = 409;
-      joinErrorBody = { success: false, error: "You are already in this race." };
-      return;
-    }
+      const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: lockedRoom.id, userId });
+      if (participantResult.reason === "blocked") {
+        joinErrorStatus = 409;
+        joinErrorBody = { success: false, code: "RACE_ALREADY_FORFEITED", error: "You already quit this race and cannot rejoin while it is active." };
+        return;
+      }
+      if (participantResult.reason === "already_joined") {
+        joinErrorStatus = 409;
+        joinErrorBody = { success: false, error: "You are already in this race." };
+        return;
+      }
 
-    const newPlayerCount = lockedRoom.currentPlayers + 1;
-    await tx.update(raceRoomsTable)
-      .set({
+      if (lockedRoom.entryAmountCents > 0) {
+        const debit = await debitCashChallengeEntry(tx, {
+          userId,
+          raceRoomId: lockedRoom.id,
+          entryFeeCents: lockedRoom.entryAmountCents,
+          paymentProvider: privatePaidProvider,
+          description: `Cash challenge private join: ${lockedRoom.title}`,
+        });
+        if (!debit.ok) {
+          throw new PaidJoinRollback(402, { error: debit.error });
+        }
+      }
+
+      const newPlayerCount = lockedRoom.currentPlayers + 1;
+      await tx.update(raceRoomsTable)
+        .set({
+          currentPlayers: newPlayerCount,
+          status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers),
+          updatedAt: new Date(),
+        })
+        .where(eq(raceRoomsTable.id, lockedRoom.id));
+      joinedCurrentPlayers = newPlayerCount;
+
+      lockedRoom = {
+        ...lockedRoom,
         currentPlayers: newPlayerCount,
         status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers),
-        updatedAt: new Date(),
-      })
-      .where(eq(raceRoomsTable.id, lockedRoom.id));
-    joinedCurrentPlayers = newPlayerCount;
-
-    lockedRoom = {
-      ...lockedRoom,
-      currentPlayers: newPlayerCount,
-      status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers),
-    };
-  });
+      };
+    });
+  } catch (err) {
+    if (err instanceof PaidJoinRollback) {
+      joinErrorStatus = err.statusCode;
+      joinErrorBody = { success: false, ...err.body };
+    } else {
+      throw err;
+    }
+  }
 
   if (joinErrorStatus !== null && joinErrorBody) {
     return res.status(joinErrorStatus).json(joinErrorBody);
@@ -3583,10 +3818,17 @@ router.get("/races/:id", requireAuth, async (req, res) => {
     ? participantRows.reduce((sum, p) => sum + p.prizeCents, 0) / 100
     : 0;
   const unawardedAmount = room.unawardedAmountCents / 100;
+  const mediaMap = await getTrackThemeMediaMap([room.trackLayout]);
+  const trackTheme = trackThemeForCode(room.trackLayout, mediaMap);
+  const challengeTime = buildChallengeTimeFields(room);
 
   return res.json({
     race: {
       ...room,
+      ...challengeTime,
+      trackTheme,
+      imageSet: trackTheme.imageSet,
+      trackThemeImageSet: trackTheme.imageSet,
       entryAmountDollars: room.entryAmountCents / 100,
       prizePool: prizeTotal / 100,
       winnersPool: winnersPoolCents / 100,

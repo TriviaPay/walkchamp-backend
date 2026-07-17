@@ -70,6 +70,7 @@ export const raceTrackThemesTable = pgTable("race_track_themes", {
   description: text("description"),
   priceCoins: integer("price_coins").notNull().default(0),
   assetKey: text("asset_key"),
+  assetVersion: integer("asset_version").notNull().default(1),
   sortOrder: integer("sort_order").notNull().default(0),
   isDefault: boolean("is_default").notNull().default(false),
   isActive: boolean("is_active").notNull().default(true),

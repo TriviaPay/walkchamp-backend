@@ -30,4 +30,14 @@ describe("refundService state helpers", () => {
     expect(paymentsRoute).not.toContain("refundReason");
     expect(racesRoute).not.toContain("/races/:id/refund-entry");
   });
+
+  it("requires provider refund webhook binding checks before status mutation", () => {
+    const refundService = readFileSync("src/lib/refundService.ts", "utf8");
+
+    expect(refundService).toContain("provider_refund_binding_mismatch");
+    expect(refundService).toContain("typeof eventAmount === \"number\" && eventAmount !== item.approvedAmount");
+    expect(refundService).toContain("eventCurrency === \"string\"");
+    expect(refundService).toContain("eventPaymentId === \"string\"");
+    expect(refundService).toContain("[RefundService] provider refund webhook binding mismatch");
+  });
 });

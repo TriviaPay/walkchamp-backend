@@ -135,6 +135,13 @@ async function updateDepositState(
     return;
   }
 
+  if (status === "requires_review") {
+    logger.warn(
+      { depositId, provider: state.provider, providerOrderId: state.providerOrderId, providerPaymentId: state.providerPaymentId ?? null, reason },
+      "[PaymentBackend] deposit moved to requires_review",
+    );
+  }
+
   await tx
     .update(depositTransactionsTable)
     .set({
@@ -536,6 +543,150 @@ async function fetchRazorpayPayment(paymentId: string): Promise<RazorpayPaymentE
   }).fetch(paymentId);
 }
 
+async function captureRazorpayAuthorizedPayment(input: {
+  depositId: string;
+  orderId: string;
+  payment: RazorpayPaymentEntity;
+}): Promise<
+  | { ok: true; payment: RazorpayPaymentEntity }
+  | { ok: false; result: DepositSettlementResult }
+> {
+  const state = providerStateFromRazorpayPayment(input.payment, input.orderId);
+  const [deposit] = await db
+    .select()
+    .from(depositTransactionsTable)
+    .where(eq(depositTransactionsTable.id, input.depositId))
+    .limit(1);
+
+  if (!deposit) {
+    return { ok: false, result: validationFailure("deposit_not_found", "not_found") };
+  }
+  if (deposit.status === "succeeded") {
+    return { ok: true, payment: input.payment };
+  }
+
+  const providerCurrency = normalizeCurrency(input.payment.currency);
+  const depositCurrency = normalizeCurrency(deposit.currency);
+  const metadataDepositTransactionId =
+    typeof input.payment.notes?.depositTransactionId === "string"
+      ? input.payment.notes.depositTransactionId
+      : null;
+  const metadataUserId =
+    typeof input.payment.notes?.userId === "string"
+      ? input.payment.notes.userId
+      : null;
+
+  const captureBlockReason =
+    deposit.provider !== "razorpay"
+      ? "capture_provider_mismatch"
+      : deposit.providerOrderId !== (input.payment.order_id ?? input.orderId)
+        ? "capture_order_mismatch"
+        : metadataDepositTransactionId && metadataDepositTransactionId !== deposit.id
+          ? "capture_metadata_deposit_mismatch"
+          : metadataUserId && metadataUserId !== deposit.userId
+            ? "capture_metadata_user_mismatch"
+            : input.payment.amount !== deposit.amountMinorUnits
+              ? "capture_amount_mismatch"
+              : !providerCurrency || providerCurrency !== depositCurrency
+                ? "capture_currency_mismatch"
+                : !input.payment.id
+                  ? "capture_missing_payment_id"
+                  : null;
+
+  if (captureBlockReason) {
+    logger.warn(
+      {
+        depositId: deposit.id,
+        orderId: input.orderId,
+        paymentId: input.payment.id ?? null,
+        reason: captureBlockReason,
+      },
+      "[PaymentBackend] razorpay capture blocked before provider call",
+    );
+    await db.transaction(async (tx) => {
+      await updateDepositState(tx, deposit.id, "requires_review", captureBlockReason, state);
+    });
+    return { ok: false, result: validationFailure(captureBlockReason) };
+  }
+
+  const paymentId = input.payment.id;
+  const amount = input.payment.amount;
+  const currency = input.payment.currency;
+  if (!paymentId || typeof amount !== "number" || !currency) {
+    return { ok: false, result: validationFailure("capture_missing_required_payment_fields") };
+  }
+  logger.info(
+    { depositId: deposit.id, orderId: input.orderId, paymentId, amount, currency },
+    "[PaymentBackend] razorpay capture attempt",
+  );
+
+  try {
+    const captured = await (getRazorpay().payments as unknown as {
+      capture: (paymentId: string, amount: number | string, currency: string) => Promise<RazorpayPaymentEntity>;
+    }).capture(paymentId, amount, currency);
+
+    logger.info(
+      { depositId: deposit.id, orderId: input.orderId, paymentId, status: captured.status },
+      "[PaymentBackend] razorpay capture completed",
+    );
+    await db
+      .update(depositTransactionsTable)
+      .set({
+        metadata: mergeMetadata(deposit.metadata, {
+          razorpayCapture: {
+            paymentId,
+            status: captured.status ?? null,
+            capturedAt: new Date().toISOString(),
+          },
+        }),
+        updatedAt: new Date(),
+      })
+      .where(eq(depositTransactionsTable.id, deposit.id));
+    return { ok: true, payment: captured };
+  } catch (err) {
+    logger.error(
+      { err, depositId: deposit.id, orderId: input.orderId, paymentId },
+      "[PaymentBackend] razorpay capture failed",
+    );
+
+    try {
+      const refetched = await fetchRazorpayPayment(paymentId);
+      if (refetched.status === "captured") {
+        logger.info(
+          { depositId: deposit.id, orderId: input.orderId, paymentId },
+          "[PaymentBackend] razorpay capture race resolved by refetch",
+        );
+        return { ok: true, payment: refetched };
+      }
+    } catch (refetchErr) {
+      logger.warn(
+        { err: refetchErr, depositId: deposit.id, orderId: input.orderId, paymentId },
+        "[PaymentBackend] razorpay capture refetch failed",
+      );
+    }
+
+    await db.transaction(async (tx) => {
+      await updateDepositState(tx, deposit.id, "processing", "razorpay_capture_failed", {
+        ...state,
+        raw: {
+          ...(state.raw ?? {}),
+          captureFailedAt: new Date().toISOString(),
+          captureFailure: err instanceof Error ? err.message : "Unknown Razorpay capture failure",
+        },
+      });
+    });
+    return {
+      ok: false,
+      result: {
+        ok: true,
+        settled: false,
+        status: "processing",
+        reason: "razorpay_capture_failed",
+      },
+    };
+  }
+}
+
 async function fetchFirstCapturedPaymentForOrder(orderId: string): Promise<RazorpayPaymentEntity | null> {
   const result = await (getRazorpay().orders as unknown as {
     fetchPayments: (id: string) => Promise<{ items?: RazorpayPaymentEntity[] }>;
@@ -548,7 +699,7 @@ export async function settleRazorpayPayment(input: {
   orderId: string;
   paymentId?: string | null;
 }) {
-  const payment = input.paymentId
+  let payment = input.paymentId
     ? await fetchRazorpayPayment(input.paymentId)
     : await fetchFirstCapturedPaymentForOrder(input.orderId);
 
@@ -569,6 +720,18 @@ export async function settleRazorpayPayment(input: {
       );
       return { ok: true, settled: false, status: "processing", reason: "razorpay_payment_not_available" };
     });
+  }
+
+  if (payment.status === "authorized") {
+    const captureResult = await captureRazorpayAuthorizedPayment({
+      depositId: input.depositId,
+      orderId: input.orderId,
+      payment,
+    });
+    if (!captureResult.ok) {
+      return captureResult.result;
+    }
+    payment = captureResult.payment;
   }
 
   return settleDepositOnce(input.depositId, providerStateFromRazorpayPayment(payment, input.orderId));

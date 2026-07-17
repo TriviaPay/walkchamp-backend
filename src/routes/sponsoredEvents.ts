@@ -154,7 +154,10 @@ async function autoFillSchedule(): Promise<void> {
 
   if (created > 0) {
     logger.info({ created }, "[SponsoredEventsJob] autoFill: new events created");
-    triggerEvent(PUSHER_CHANNEL, "sponsored_event.created", { created }).catch(() => {});
+    triggerEvent(PUSHER_CHANNEL, "sponsored_event.created", {
+      created,
+      invalidate: ["walk_bootstrap", "sponsored_events"],
+    }).catch(() => {});
   }
 }
 
@@ -276,7 +279,10 @@ async function processSponsuredEvents() {
           .where(eq(raceRoomsTable.id, room.id));
       });
 
-      triggerEvent(PUSHER_CHANNEL, "sponsored_event.started", { room_id: room.id }).catch(() => {});
+      triggerEvent(PUSHER_CHANNEL, "sponsored_event.started", {
+        room_id: room.id,
+        invalidate: ["walk_bootstrap", "sponsored_events"],
+      }).catch(() => {});
       for (const uid of paidUserIds) {
         sendPushToUser(
           uid,
@@ -366,7 +372,10 @@ async function finalizeSponsoredEvents(now: Date) {
 
     // Broadcast race finished
     triggerEvent("public-presence", "race:finished", { room_id: room.id }).catch(() => {});
-    triggerEvent(PUSHER_CHANNEL, "sponsored_event.completed", { room_id: room.id }).catch(() => {});
+    triggerEvent(PUSHER_CHANNEL, "sponsored_event.completed", {
+      room_id: room.id,
+      invalidate: ["walk_bootstrap", "sponsored_events"],
+    }).catch(() => {});
 
     // Push notifications
     const prizeDisplay = `$${(PRIZE_PER_WINNER_CENTS / 100).toFixed(0)}`;
@@ -411,59 +420,71 @@ export function startSponsoredEventsJob(): void {
   setTimeout(() => { processSponsuredEvents().catch(() => {}); }, 5_000);
 }
 
-// ── GET /api/sponsored-events ──────────────────────────────────────────────────
-router.get("/sponsored-events", requireAuth, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
-  req.log.info({ userId }, "[SponsoredEvents] fetch events");
+type SponsoredEventsMode = "full" | "card";
+type SponsoredEventsOptions = { includeCoinBalance?: boolean };
 
-  try {
-    const now = new Date();
+function sponsoredEventRealtimePayload(roomId: string, registeredCount: number, maxSlots: number) {
+  return {
+    room_id: roomId,
+    registered_count: registeredCount,
+    max_slots: maxSlots,
+    invalidate: ["walk_bootstrap", "sponsored_events"],
+  };
+}
 
-    // Show: scheduled (future), in_progress, completed/cancelled within last 48h
-    const cutoff = new Date(now.getTime() - 48 * 60 * 60 * 1000);
-    const rooms = await db
-      .select()
-      .from(raceRoomsTable)
-      .where(
-        and(
-          eq(raceRoomsTable.type, "sponsored"),
-          eq(raceRoomsTable.scheduleType, "scheduled"),
-          or(
-            and(
-              eq(raceRoomsTable.status, "scheduled"),
-              gt(raceRoomsTable.scheduledStartAt, now),
-            ),
-            eq(raceRoomsTable.status, "in_progress"),
-            and(
-              or(eq(raceRoomsTable.status, "completed"), eq(raceRoomsTable.status, "cancelled")),
-              gte(raceRoomsTable.scheduledStartAt, cutoff),
-            ),
+export async function getSponsoredEventsForUser(
+  userId: string,
+  mode: SponsoredEventsMode = "full",
+  options: SponsoredEventsOptions = {},
+) {
+  const now = new Date();
+
+  // Show: scheduled (future), in_progress, completed/cancelled within last 48h
+  const cutoff = new Date(now.getTime() - 48 * 60 * 60 * 1000);
+  const rooms = await db
+    .select()
+    .from(raceRoomsTable)
+    .where(
+      and(
+        eq(raceRoomsTable.type, "sponsored"),
+        eq(raceRoomsTable.scheduleType, "scheduled"),
+        or(
+          and(
+            eq(raceRoomsTable.status, "scheduled"),
+            gt(raceRoomsTable.scheduledStartAt, now),
+          ),
+          eq(raceRoomsTable.status, "in_progress"),
+          and(
+            or(eq(raceRoomsTable.status, "completed"), eq(raceRoomsTable.status, "cancelled")),
+            gte(raceRoomsTable.scheduledStartAt, cutoff),
           ),
         ),
-      )
-      .orderBy(raceRoomsTable.scheduledStartAt);
+      ),
+    )
+    .orderBy(raceRoomsTable.scheduledStartAt);
 
-    const roomIds = rooms.map((r) => r.id);
+  const roomIds = rooms.map((r) => r.id);
 
-    // Derive a badge label from total steps (mirrors leaderboard logic without needing a rank)
-    function stepsBadge(totalSteps: number): string {
-      if (totalSteps >= 500_000) return "Global Champion";
-      if (totalSteps >= 200_000) return "Elite Walker";
-      if (totalSteps >= 100_000) return "Daily Champion";
-      if (totalSteps >= 50_000)  return "Fast Walker";
-      if (totalSteps >= 10_000)  return "Beginner Walker";
-      return "Walker";
-    }
+  // Derive a badge label from total steps (mirrors leaderboard logic without needing a rank)
+  function stepsBadge(totalSteps: number): string {
+    if (totalSteps >= 500_000) return "Global Champion";
+    if (totalSteps >= 200_000) return "Elite Walker";
+    if (totalSteps >= 100_000) return "Daily Champion";
+    if (totalSteps >= 50_000)  return "Fast Walker";
+    if (totalSteps >= 10_000)  return "Beginner Walker";
+    return "Walker";
+  }
 
-    // Fetch all registrations + profiles for all rooms in one query
-    type RegRow = {
-      raceRoomId: string; regUserId: string;
-      username: string; avatarUrl: string | null;
-      avatarColor: string; countryFlag: string | null; totalSteps: number;
-    };
-    let allRegs: RegRow[] = [];
-    let myRegRoomIds = new Set<string>();
-    if (roomIds.length > 0) {
+  // Fetch all registrations + profiles for all rooms in one query for the full list.
+  type RegRow = {
+    raceRoomId: string; regUserId: string;
+    username: string; avatarUrl: string | null;
+    avatarColor: string; countryFlag: string | null; totalSteps: number;
+  };
+  let allRegs: RegRow[] = [];
+  let myRegRoomIds = new Set<string>();
+  if (roomIds.length > 0) {
+    if (mode === "full") {
       const regsWithProfile = await db
         .select({
           raceRoomId: scheduledRoomRegistrationsTable.raceRoomId,
@@ -487,95 +508,136 @@ router.get("/sponsored-events", requireAuth, async (req, res) => {
       myRegRoomIds = new Set(
         allRegs.filter((r) => r.regUserId === userId).map((r) => r.raceRoomId),
       );
-    }
-
-    // Get coin balance
-    const balance = await getCoinBalance(userId);
-    req.log.info({ userId, balance: balance.currentBalance }, "[SponsoredEvents] coin balance");
-
-    // Build registrants map keyed by roomId
-    const registrantsMap = new Map<string, Array<{
-      userId: string; username: string; avatarUrl: string | null;
-      avatarColor: string; countryFlag: string | null; badge: string;
-    }>>();
-    for (const reg of allRegs) {
-      if (!registrantsMap.has(reg.raceRoomId)) registrantsMap.set(reg.raceRoomId, []);
-      registrantsMap.get(reg.raceRoomId)!.push({
-        userId: reg.regUserId,
-        username: reg.username,
-        avatarUrl: reg.avatarUrl,
-        avatarColor: reg.avatarColor ?? "#00E676",
-        countryFlag: reg.countryFlag,
-        badge: stepsBadge(reg.totalSteps ?? 0),
-      });
-    }
-
-    const RACE_DURATION_MS = 3 * 60 * 60 * 1000; // 3 hours
-    const JOIN_WINDOW_MS  = 10 * 60 * 1000;       // 10 min join window before race
-
-    // Fetch active participant rows for the current user (racing status)
-    const myActiveRoomIds = new Set<string>();
-    if (roomIds.length > 0) {
-      const myParts = await db
-        .select({ raceRoomId: raceParticipantsTable.raceRoomId })
-        .from(raceParticipantsTable)
+    } else {
+      const myRegs = await db
+        .select({ raceRoomId: scheduledRoomRegistrationsTable.raceRoomId })
+        .from(scheduledRoomRegistrationsTable)
         .where(
           and(
-            eq(raceParticipantsTable.userId, userId),
-            inArray(raceParticipantsTable.raceRoomId, roomIds),
-            inArray(raceParticipantsTable.status, ["joined", "active"]),
+            eq(scheduledRoomRegistrationsTable.userId, userId),
+            inArray(scheduledRoomRegistrationsTable.raceRoomId, roomIds),
+            inArray(scheduledRoomRegistrationsTable.status, ["registered", "active"]),
           ),
         );
-      myParts.forEach((p) => myActiveRoomIds.add(p.raceRoomId));
+      myRegRoomIds = new Set(myRegs.map((r) => r.raceRoomId));
     }
+  }
 
-    const events = rooms.map((r) => {
-      // Compute when the race ends (3 hours from start / scheduled start)
-      const endsAtDate = r.status === "in_progress" && r.startedAt
-        ? new Date(r.startedAt.getTime() + RACE_DURATION_MS)
-        : r.scheduledStartAt
-          ? new Date(r.scheduledStartAt.getTime() + RACE_DURATION_MS)
-          : null;
+  // Get coin balance unless the caller already has it from another Walk aggregate branch.
+  const coinBalance = options.includeCoinBalance === false
+    ? null
+    : (await getCoinBalance(userId)).currentBalance;
 
-      // Join window is open during the 10 minutes before scheduled start
-      const joinWindowOpen = r.status === "scheduled" &&
-        r.scheduledStartAt !== null &&
-        now.getTime() >= (r.scheduledStartAt.getTime() - JOIN_WINDOW_MS) &&
-        now.getTime() < r.scheduledStartAt.getTime();
-      const registrationOpen = r.status === "scheduled" &&
-        r.scheduledStartAt !== null &&
-        now.getTime() < r.scheduledStartAt.getTime();
-
-      return {
-        id: r.id,
-        title: r.title,
-        status: r.status,
-        scheduledStartAt: r.scheduledStartAt?.toISOString() ?? null,
-        startedAt: r.startedAt?.toISOString() ?? null,
-        endsAt: endsAtDate?.toISOString() ?? null,
-        targetSteps: r.targetSteps,
-        maxSlots: r.maxPlayers,
-        registeredCount: r.registeredCount,
-        prizePoolCents: r.prizePoolCents,
-        prizePerWinnerCents: PRIZE_PER_WINNER_CENTS,
-        winnerCount: WINNER_COUNT,
-        entryCoinFee: ENTRY_COINS,
-        isRegistered: myRegRoomIds.has(r.id),
-        isActive: myActiveRoomIds.has(r.id),
-        joinWindowOpen,
-        isFull: r.registeredCount >= r.maxPlayers,
-        canRegister:
-          !myRegRoomIds.has(r.id) &&
-          r.registeredCount < r.maxPlayers &&
-          registrationOpen,
-        registeredUsers: (registrantsMap.get(r.id) ?? []) as Array<{
-          userId: string; username: string; avatarUrl: string | null;
-          avatarColor: string; countryFlag: string | null; badge: string;
-        }>,
-      };
+  // Build registrants map keyed by roomId
+  const registrantsMap = new Map<string, Array<{
+    userId: string; username: string; avatarUrl: string | null;
+    avatarColor: string; countryFlag: string | null; badge: string;
+  }>>();
+  for (const reg of allRegs) {
+    if (!registrantsMap.has(reg.raceRoomId)) registrantsMap.set(reg.raceRoomId, []);
+    registrantsMap.get(reg.raceRoomId)!.push({
+      userId: reg.regUserId,
+      username: reg.username,
+      avatarUrl: reg.avatarUrl,
+      avatarColor: reg.avatarColor ?? "#00E676",
+      countryFlag: reg.countryFlag,
+      badge: stepsBadge(reg.totalSteps ?? 0),
     });
+  }
 
-    return res.json({ success: true, events, coinBalance: balance.currentBalance });
+  const RACE_DURATION_MS = 3 * 60 * 60 * 1000; // 3 hours
+  const JOIN_WINDOW_MS  = 10 * 60 * 1000;       // 10 min join window before race
+
+  // Fetch active participant rows for the current user (racing status)
+  const myActiveRoomIds = new Set<string>();
+  if (roomIds.length > 0) {
+    const myParts = await db
+      .select({ raceRoomId: raceParticipantsTable.raceRoomId })
+      .from(raceParticipantsTable)
+      .where(
+        and(
+          eq(raceParticipantsTable.userId, userId),
+          inArray(raceParticipantsTable.raceRoomId, roomIds),
+          inArray(raceParticipantsTable.status, ["joined", "active"]),
+        ),
+      );
+    myParts.forEach((p) => myActiveRoomIds.add(p.raceRoomId));
+  }
+
+  const events = rooms.map((r) => {
+    // Compute when the race ends (3 hours from start / scheduled start)
+    const endsAtDate = r.status === "in_progress" && r.startedAt
+      ? new Date(r.startedAt.getTime() + RACE_DURATION_MS)
+      : r.scheduledStartAt
+        ? new Date(r.scheduledStartAt.getTime() + RACE_DURATION_MS)
+        : null;
+
+    // Join window is open during the 10 minutes before scheduled start
+    const joinWindowOpen = r.status === "scheduled" &&
+      r.scheduledStartAt !== null &&
+      now.getTime() >= (r.scheduledStartAt.getTime() - JOIN_WINDOW_MS) &&
+      now.getTime() < r.scheduledStartAt.getTime();
+    const registrationOpen = r.status === "scheduled" &&
+      r.scheduledStartAt !== null &&
+      now.getTime() < r.scheduledStartAt.getTime();
+
+    const event = {
+      id: r.id,
+      title: r.title,
+      status: r.status,
+      scheduledStartAt: r.scheduledStartAt?.toISOString() ?? null,
+      startedAt: r.startedAt?.toISOString() ?? null,
+      endsAt: endsAtDate?.toISOString() ?? null,
+      targetSteps: r.targetSteps,
+      maxSlots: r.maxPlayers,
+      registeredCount: r.registeredCount,
+      prizePoolCents: r.prizePoolCents,
+      prizePerWinnerCents: PRIZE_PER_WINNER_CENTS,
+      winnerCount: WINNER_COUNT,
+      entryCoinFee: ENTRY_COINS,
+      isRegistered: myRegRoomIds.has(r.id),
+      isActive: myActiveRoomIds.has(r.id),
+      joinWindowOpen,
+      isFull: r.registeredCount >= r.maxPlayers,
+      canRegister:
+        !myRegRoomIds.has(r.id) &&
+        r.registeredCount < r.maxPlayers &&
+        registrationOpen,
+    };
+
+    if (mode === "card") return event;
+    return {
+      ...event,
+      registeredUsers: (registrantsMap.get(r.id) ?? []) as Array<{
+        userId: string; username: string; avatarUrl: string | null;
+        avatarColor: string; countryFlag: string | null; badge: string;
+      }>,
+    };
+  });
+
+  if (mode === "card") {
+    const card =
+      events.find((e) => e.isActive) ??
+      events.find((e) => e.isRegistered && e.status !== "completed" && e.status !== "cancelled") ??
+      events.find((e) => e.status === "in_progress") ??
+      events.find((e) => e.status === "scheduled") ??
+      null;
+    return { success: true, card, coinBalance };
+  }
+
+  return { success: true, events, coinBalance };
+}
+
+// ── GET /api/sponsored-events ──────────────────────────────────────────────────
+router.get("/sponsored-events", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const mode = req.query.mode === "card" || req.query.view === "card" ? "card" : "full";
+  req.log.info({ userId, mode }, "[SponsoredEvents] fetch events");
+
+  try {
+    const payload = await getSponsoredEventsForUser(userId, mode);
+    req.log.info({ userId, balance: payload.coinBalance }, "[SponsoredEvents] coin balance");
+    return res.json(payload);
   } catch (err) {
     req.log.error({ err }, "[SponsoredEvents] fetch failed");
     return res.status(500).json({ error: "Failed to fetch sponsored events" });
@@ -652,7 +714,10 @@ router.post("/sponsored-events/generate-weekend", requireAuth, requireAdminKey, 
       req.log.info({ inviteCode, startAt }, "[SponsoredEventsJob] generated weekend events");
     }
 
-    triggerEvent(PUSHER_CHANNEL, "sponsored_event.created", { created }).catch(() => {});
+    triggerEvent(PUSHER_CHANNEL, "sponsored_event.created", {
+      created,
+      invalidate: ["walk_bootstrap", "sponsored_events"],
+    }).catch(() => {});
 
     return res.json({ success: true, created, skipped });
   } catch (err) {
@@ -757,10 +822,15 @@ router.post("/sponsored-events/:roomId/register", requireAuth, async (req, res) 
     req.log.info({ userId, roomId }, "[SponsoredEvents] registered — coins deducted immediately");
 
     // Broadcast slot update
-    triggerEvent(PUSHER_CHANNEL, "sponsored_event.registration_updated", {
+    triggerEvent(
+      PUSHER_CHANNEL,
+      "sponsored_event.registration_updated",
+      sponsoredEventRealtimePayload(roomId, result.newCount, result.room.maxPlayers),
+    ).catch(() => {});
+
+    triggerEvent(`private-user-${userId}`, "walk.bootstrap_invalidated", {
+      reason: "sponsored_event_registered",
       room_id: roomId,
-      registered_count: result.newCount,
-      max_slots: result.room.maxPlayers,
     }).catch(() => {});
 
     triggerEvent(`private-user-${userId}`, "wallet.updated", {
@@ -843,10 +913,15 @@ router.post("/sponsored-events/:roomId/cancel-registration", requireAuth, async 
       return res.status(result.status).json(result.body);
     }
 
-    triggerEvent(PUSHER_CHANNEL, "sponsored_event.registration_updated", {
+    triggerEvent(
+      PUSHER_CHANNEL,
+      "sponsored_event.registration_updated",
+      sponsoredEventRealtimePayload(roomId, result.newCount, result.room.maxPlayers),
+    ).catch(() => {});
+
+    triggerEvent(`private-user-${userId}`, "walk.bootstrap_invalidated", {
+      reason: "sponsored_event_cancelled",
       room_id: roomId,
-      registered_count: result.newCount,
-      max_slots: result.room.maxPlayers,
     }).catch(() => {});
 
     triggerEvent(`private-user-${userId}`, "wallet.updated", {
@@ -962,11 +1037,17 @@ router.post("/sponsored-events/:roomId/steps/sync", requireAuth, async (req, res
       })
       .where(and(eq(raceParticipantsTable.raceRoomId, roomId), eq(raceParticipantsTable.userId, userId)));
 
-    triggerEvent(`public-live-race-${roomId}`, "participant.progress.updated", {
-      userId,
-      steps: newProgress,
-      finished: justFinished,
-    }).catch(() => {});
+    if (newProgress !== participant.currentSteps || justFinished) {
+      triggerEvent(`public-live-race-${roomId}`, "participant.progress.updated", {
+        userId,
+        steps: newProgress,
+        finished: justFinished,
+      }).catch(() => {});
+      triggerEvent(`private-user-${userId}`, "walk.bootstrap_invalidated", {
+        reason: "sponsored_progress_updated",
+        room_id: roomId,
+      }).catch(() => {});
+    }
 
     req.log.info({ roomId, userId, newProgress, justFinished }, "[SponsoredStepSync] synced");
     return res.json({

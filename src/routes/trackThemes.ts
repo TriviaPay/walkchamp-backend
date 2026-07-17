@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { db } from "../../db/src/index.js";
 import {
   raceTrackThemesTable,
@@ -15,6 +15,8 @@ import {
 } from "../lib/objectStorage.js";
 import { proxyStoredObjectResponse } from "../lib/objectMediaProxy.js";
 import { config } from "../lib/config.js";
+import { triggerEvent } from "../lib/pusher.js";
+import { buildTrackThemeMedia } from "../lib/trackThemeMedia.js";
 
 const router = Router();
 const THEME_OBJECT_EXTENSIONS = ["", ".png", ".jpg", ".jpeg", ".webp", ".gif"];
@@ -104,8 +106,30 @@ async function seedThemesIfNeeded(): Promise<void> {
   await seedThemesPromise;
 }
 
-function buildThemeImageUrl(code: string): string {
-  return `/api/track-themes/${encodeURIComponent(code)}/image`;
+function buildThemePayload<T extends {
+  code: string;
+  assetVersion?: number | null;
+}>(theme: T) {
+  const media = buildTrackThemeMedia(theme.code, theme.assetVersion);
+  return {
+    ...theme,
+    assetVersion: media.assetVersion,
+    width: media.width,
+    height: media.height,
+    imageSet: media.imageSet,
+    imageUrl: media.imageUrl,
+  };
+}
+
+function setThemeCatalogCacheHeaders(res: Response) {
+  res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=3600");
+  res.setHeader("Cloudflare-CDN-Cache-Control", "public, max-age=300, stale-while-revalidate=3600");
+  res.setHeader("CDN-Cache-Control", "public, max-age=300, stale-while-revalidate=3600");
+  res.setHeader("Surrogate-Control", "max-age=300");
+}
+
+function isThemeCatalogRequest(req: Request): boolean {
+  return req.query.scope === "catalog" || req.query.static === "1";
 }
 
 function isThemeFreeForUser(theme: Pick<typeof raceTrackThemesTable.$inferSelect, "isDefault" | "priceCoins">): boolean {
@@ -191,55 +215,103 @@ async function resolveThemeObjectKey(assetKey: string | null | undefined, themeC
   return null;
 }
 
+export async function getTrackThemeCatalog() {
+  await seedThemesIfNeeded();
+
+  const allThemes = await db
+    .select()
+    .from(raceTrackThemesTable)
+    .where(eq(raceTrackThemesTable.isActive, true))
+    .orderBy(asc(raceTrackThemesTable.sortOrder));
+
+  return {
+    defaultThemeCode: GLOBAL_DEFAULT_THEME_CODE,
+    themes: allThemes.map((t) => buildThemePayload({
+      code: t.code,
+      name: t.name,
+      priceCoins: t.priceCoins,
+      isDefault: t.isDefault,
+      assetKey: t.assetKey,
+      assetVersion: t.assetVersion,
+      sortOrder: t.sortOrder,
+    })),
+  };
+}
+
+export async function getTrackThemeSummaryForUser(userId: string) {
+  await seedThemesIfNeeded();
+
+  const [allThemes, ownedRows, balanceData] = await Promise.all([
+    db
+      .select()
+      .from(raceTrackThemesTable)
+      .where(eq(raceTrackThemesTable.isActive, true))
+      .orderBy(asc(raceTrackThemesTable.sortOrder)),
+    db
+      .select()
+      .from(userTrackThemesTable)
+      .where(eq(userTrackThemesTable.userId, userId)),
+    getCoinBalance(userId),
+  ]);
+
+  const ownedMap = new Map(ownedRows.map((r) => [r.themeCode, r]));
+  const { currentBalance } = balanceData;
+  let selectedThemeCode = ownedRows.find((r) => r.isEquipped)?.themeCode ?? GLOBAL_DEFAULT_THEME_CODE;
+  const selectedTheme = allThemes.find((t) => t.code === selectedThemeCode);
+  if (!selectedTheme || (!isThemeFreeForUser(selectedTheme) && !ownedMap.has(selectedTheme.code))) {
+    selectedThemeCode = GLOBAL_DEFAULT_THEME_CODE;
+  }
+
+  const themes = allThemes.map((t) => {
+    const owned = isThemeFreeForUser(t) || ownedMap.has(t.code);
+    const locked = !owned;
+    return buildThemePayload({
+      code: t.code,
+      name: t.name,
+      priceCoins: t.priceCoins,
+      isDefault: t.isDefault,
+      owned,
+      locked,
+      isEquipped: owned ? t.code === selectedThemeCode : false,
+      canPurchase: locked && currentBalance >= t.priceCoins,
+      coinsNeeded: locked ? Math.max(0, t.priceCoins - currentBalance) : 0,
+      assetKey: t.assetKey,
+      assetVersion: t.assetVersion,
+      sortOrder: t.sortOrder,
+    });
+  });
+
+  return {
+    coinBalance: currentBalance,
+    selectedThemeCode,
+    defaultThemeCode: GLOBAL_DEFAULT_THEME_CODE,
+    ownedCount: themes.filter((t) => t.owned).length,
+    totalCount: themes.length,
+    equippedTheme: themes.find((t) => t.isEquipped) ?? null,
+    themes,
+  };
+}
+
 // ── GET /api/track-themes ─────────────────────────────────────────────────────
 // Returns all active themes with user ownership state + current coin balance.
-router.get("/track-themes", requireAuth, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
-
+router.get("/track-themes", (req, res, next) => {
+  if (isThemeCatalogRequest(req)) return next();
+  return requireAuth(req, res, next);
+}, async (req, res) => {
   try {
-    await seedThemesIfNeeded();
-
-    const [allThemes, ownedRows, balanceData] = await Promise.all([
-      db
-        .select()
-        .from(raceTrackThemesTable)
-        .where(eq(raceTrackThemesTable.isActive, true))
-        .orderBy(asc(raceTrackThemesTable.sortOrder)),
-      db
-        .select()
-        .from(userTrackThemesTable)
-        .where(eq(userTrackThemesTable.userId, userId)),
-      getCoinBalance(userId),
-    ]);
-
-    const ownedMap = new Map(ownedRows.map((r) => [r.themeCode, r]));
-    const { currentBalance } = balanceData;
-    let selectedThemeCode = ownedRows.find((r) => r.isEquipped)?.themeCode ?? GLOBAL_DEFAULT_THEME_CODE;
-    const selectedTheme = allThemes.find((t) => t.code === selectedThemeCode);
-    if (!selectedTheme || (!isThemeFreeForUser(selectedTheme) && !ownedMap.has(selectedTheme.code))) {
-      selectedThemeCode = GLOBAL_DEFAULT_THEME_CODE;
+    if (isThemeCatalogRequest(req)) {
+      setThemeCatalogCacheHeaders(res);
+      return res.json(await getTrackThemeCatalog());
     }
 
-    const themes = allThemes.map((t) => {
-      const owned = isThemeFreeForUser(t) || ownedMap.has(t.code);
-      const locked = !owned;
-      return {
-        code: t.code,
-        name: t.name,
-        priceCoins: t.priceCoins,
-        isDefault: t.isDefault,
-        owned,
-        locked,
-        isEquipped: owned ? t.code === selectedThemeCode : false,
-        canPurchase: locked && currentBalance >= t.priceCoins,
-        coinsNeeded: locked ? Math.max(0, t.priceCoins - currentBalance) : 0,
-        assetKey: t.assetKey,
-        imageUrl: buildThemeImageUrl(t.code),
-        sortOrder: t.sortOrder,
-      };
+    const userId = (req as AuthenticatedRequest).descopeUserId;
+    const summary = await getTrackThemeSummaryForUser(userId);
+    return res.json({
+      coinBalance: summary.coinBalance,
+      selectedThemeCode: summary.selectedThemeCode,
+      defaultThemeCode: summary.defaultThemeCode,
+      themes: summary.themes,
     });
-
-    return res.json({ coinBalance: currentBalance, selectedThemeCode, defaultThemeCode: GLOBAL_DEFAULT_THEME_CODE, themes });
   } catch (err) {
     req.log.error({ err }, "track-themes GET error");
     return res.status(500).json({ error: "Failed to fetch track themes" });
@@ -305,11 +377,16 @@ router.post("/track-themes/:code/purchase", requireAuth, async (req, res) => {
 
     req.log.info({ userId, themeCode: code, price: theme.priceCoins }, "track theme purchased");
 
+    triggerEvent(`private-user-${userId}`, "walk.bootstrap_invalidated", {
+      reason: "theme_purchased",
+      themeCode: code,
+    }).catch(() => {});
+
     return res.json({
       success: true,
       message: "Theme unlocked",
       coinBalance: spend.newBalance,
-      theme: {
+      theme: buildThemePayload({
         code: theme.code,
         name: theme.name,
         priceCoins: theme.priceCoins,
@@ -320,9 +397,9 @@ router.post("/track-themes/:code/purchase", requireAuth, async (req, res) => {
         canPurchase: false,
         coinsNeeded: 0,
         assetKey: theme.assetKey,
-        imageUrl: buildThemeImageUrl(theme.code),
+        assetVersion: theme.assetVersion,
         sortOrder: theme.sortOrder,
-      },
+      }),
     });
   } catch (err) {
     req.log.error({ err }, "track-themes purchase error");
@@ -358,6 +435,11 @@ router.post("/track-themes/:code/equip", requireAuth, async (req, res) => {
 
     const equipped = await setUserDefaultTrackTheme(userId, code);
     if (!equipped) return res.status(403).json({ error: "Theme not owned" });
+
+    triggerEvent(`private-user-${userId}`, "walk.bootstrap_invalidated", {
+      reason: "theme_equipped",
+      themeCode: code,
+    }).catch(() => {});
 
     return res.json({ success: true, equippedCode: code });
   } catch (err) {

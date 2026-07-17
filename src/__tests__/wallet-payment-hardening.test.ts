@@ -50,7 +50,44 @@ describe("wallet payment hardening", () => {
     expect(cashChallengePayments).toContain("transactionType: \"race_prize_paid\"");
     expect(cashChallengePayments).toContain("Cash challenge prize requires USD wallet");
     expect(refundService).toContain("idempotencyKey: input.idempotencyKey");
-    expect(refundService).toContain("Cash challenges currently require a USD wallet.");
+    expect(refundService).toContain("CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY");
+  });
+
+  it("hardens Razorpay checkout signatures, create-order idempotency, and manual capture", () => {
+    const depositRoute = readFileSync("src/routes/deposit.ts", "utf8");
+    const settlementService = readFileSync("src/lib/depositSettlement.ts", "utf8");
+    const security = readFileSync("src/lib/razorpaySecurity.ts", "utf8");
+
+    expect(security).toContain("timingSafeEqual");
+    expect(depositRoute).toContain("verifyRazorpayCheckoutSignature");
+    expect(depositRoute).toContain("verifyRazorpaySignature");
+    expect(depositRoute).toContain("legacy create-order without stable idempotency key");
+    expect(depositRoute).toContain("razorpay_deposit:${userId}:${clientKey}");
+    expect(depositRoute).toContain("IDEMPOTENCY_KEY_CONFLICT");
+    expect(depositRoute).toContain("IDEMPOTENCY_KEY_TERMINAL");
+    expect(depositRoute).toContain("ORDER_CREATION_IN_PROGRESS");
+    expect(depositRoute).toContain("status: \"order_creating\"");
+    expect(depositRoute).toContain("router.post(\"/wallet/deposit/razorpay/verify\"");
+    expect(settlementService).toContain("captureRazorpayAuthorizedPayment");
+    expect(settlementService).toContain("payment.status === \"authorized\"");
+    expect(settlementService).toContain(".capture(paymentId, amount, currency)");
+    expect(settlementService).toContain("razorpay_capture_failed");
+  });
+
+  it("blocks INR/Razorpay cash challenges until multi-currency wallet support ships", () => {
+    const fees = readFileSync("src/lib/cashChallengeFees.ts", "utf8");
+    const racesRoute = readFileSync("src/routes/races.ts", "utf8");
+
+    expect(fees).toContain("CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY");
+    expect(fees).toContain("isCashChallengeUnsupportedForCountry");
+    expect(racesRoute).toContain("[CashChallenge] INR/Razorpay quote blocked");
+    expect(racesRoute).toContain("[CashChallenge] INR/Razorpay host blocked");
+    expect(racesRoute).toContain("[CashChallenge] INR/Razorpay paid join blocked");
+    expect(racesRoute).toContain("[CashChallenge] INR/Razorpay private paid join blocked");
+    expect(racesRoute).toContain("[CashChallenge] INR/Razorpay race start debit blocked");
+    expect(racesRoute).toContain("const effectiveCountryCode = profileForQuote?.countryCode ?? countryCode");
+    expect(racesRoute).toContain("class PaidJoinRollback");
+    expect(racesRoute).toContain("throw new PaidJoinRollback(402");
   });
 
   it("does not create default USD wallets for provider-specific deposits", () => {

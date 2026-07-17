@@ -246,6 +246,14 @@ router.post("/presence/offline", requireAuth, async (req, res) => {
     .update(userPresenceTable)
     .set({ status: "offline" })
     .where(eq(userPresenceTable.userId, userId));
+
+  computeCounts()
+    .then(({ online, walking, racing }) => {
+      const counts = { online, walking, racing, spectating: 0 };
+      return triggerEvent("public-presence", "presence:summary_updated", { counts });
+    })
+    .catch(() => {});
+
   return res.json({ ok: true });
 });
 

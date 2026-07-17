@@ -15,7 +15,8 @@
  *  - Enable Stripe webhook in production.
  */
 
-import { Router } from "express";
+import { Router, type Request } from "express";
+import type { Logger } from "pino";
 import { db } from "../../db/src/index.js";
 import {
   depositTransactionsTable,
@@ -26,7 +27,7 @@ import {
 import { eq, and, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { createHash, createHmac } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
 import { config } from "../lib/config.js";
 import { recordOutboxEvent } from "../lib/outbox.js";
@@ -36,6 +37,10 @@ import {
   getStripe,
   settleRazorpayPayment,
 } from "../lib/depositSettlement.js";
+import {
+  verifyRazorpayCheckoutSignature,
+  verifyRazorpaySignature,
+} from "../lib/razorpaySecurity.js";
 
 const router = Router();
 
@@ -50,6 +55,7 @@ const MIN_STRIPE_CENTS = 100;
 const MAX_STRIPE_CENTS = 50000;
 const MIN_RAZORPAY_PAISE = 1000;
 const MAX_RAZORPAY_PAISE = 5000000;
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,160}$/;
 
 function getBaseUrl(): string {
   const appBase = config.appBaseUrl;
@@ -65,6 +71,13 @@ function getBaseUrl(): string {
  */
 function appDoneUrl(status: "success" | "processing" | "failed" | "cancelled", transactionId: string): string {
   return `${getBaseUrl()}/api/wallet/deposit/done?status=${status}&transaction_id=${encodeURIComponent(transactionId)}`;
+}
+
+function mergeMetadata(existing: unknown, patch: Record<string, unknown>) {
+  return {
+    ...((existing as Record<string, unknown> | null) ?? {}),
+    ...patch,
+  };
 }
 
 type StripeClient = ReturnType<typeof getStripe>;
@@ -347,7 +360,34 @@ router.get("/wallet/deposit/stripe/return", async (req, res) => {
 
 const razorpayCreateSchema = z.object({
   amountPaise: z.number().int().min(MIN_RAZORPAY_PAISE).max(MAX_RAZORPAY_PAISE),
+  idempotencyKey: z.string().trim().optional(),
 });
+
+class RazorpayCreateOrderHttpError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    public readonly body: Record<string, unknown>,
+  ) {
+    super(String(body.error ?? "Razorpay create-order failed."));
+  }
+}
+
+function getClientIdempotencyKey(req: Request, bodyKey?: string | null) {
+  const headerValue = req.headers["idempotency-key"];
+  const headerKey = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+  return (headerKey ?? bodyKey ?? "").trim();
+}
+
+function validateClientIdempotencyKey(rawKey: string) {
+  if (!IDEMPOTENCY_KEY_PATTERN.test(rawKey)) {
+    return null;
+  }
+  return rawKey;
+}
+
+function buildRazorpayIdempotencyKey(userId: string, clientKey: string) {
+  return `razorpay_deposit:${userId}:${clientKey}`;
+}
 
 /**
  * POST /api/wallet/deposit/razorpay/create-order
@@ -372,6 +412,14 @@ router.post("/wallet/deposit/razorpay/create-order", requireAuth, async (req, re
     });
   }
 
+  const rawClientIdempotencyKey = getClientIdempotencyKey(req, parsed.data.idempotencyKey);
+  const clientIdempotencyKey = validateClientIdempotencyKey(rawClientIdempotencyKey)
+    ?? `legacy:${randomUUID()}`;
+  const clientProvidedIdempotencyKey = Boolean(validateClientIdempotencyKey(rawClientIdempotencyKey));
+  if (!clientProvidedIdempotencyKey) {
+    req.log.warn({ userId }, "[PaymentBackend] razorpay: legacy create-order without stable idempotency key");
+  }
+
   let razorpay: ReturnType<typeof getRazorpay>;
   try {
     razorpay = getRazorpay();
@@ -382,6 +430,7 @@ router.post("/wallet/deposit/razorpay/create-order", requireAuth, async (req, re
   const { amountPaise } = parsed.data;
   const baseUrl = getBaseUrl();
   const walletCreditCents = amountPaise;
+  const idempotencyKey = buildRazorpayIdempotencyKey(userId, clientIdempotencyKey);
   const walletResult = await getOrCreateWalletForCurrency(userId, "inr");
 
   if (walletResult.mismatch) {
@@ -390,48 +439,188 @@ router.post("/wallet/deposit/razorpay/create-order", requireAuth, async (req, re
   }
 
   let depositTx: typeof depositTransactionsTable.$inferSelect;
+  let reusedIdempotentOrder = false;
+  let shouldCreateProviderOrder = false;
   try {
-    const [row] = await db
-      .insert(depositTransactionsTable)
-      .values({
-        userId,
-        provider: "razorpay",
-        status: "processing",
-        amountMinorUnits: amountPaise,
-        currency: "INR",
-        walletCreditCents,
-      })
-      .returning();
-    depositTx = row;
+    const reservation = await db.transaction(async (tx) => {
+      const [inserted] = await tx
+        .insert(depositTransactionsTable)
+        .values({
+          userId,
+          provider: "razorpay",
+          status: "order_creating",
+          amountMinorUnits: amountPaise,
+          currency: "INR",
+          walletCreditCents,
+          idempotencyKey,
+          metadata: {
+            clientIdempotencyKey,
+            clientProvidedIdempotencyKey,
+            idempotencyFirstSeenAt: new Date().toISOString(),
+          },
+        })
+        .onConflictDoNothing()
+        .returning();
+
+      const row = inserted ?? (await tx
+        .select()
+        .from(depositTransactionsTable)
+        .where(eq(depositTransactionsTable.idempotencyKey, idempotencyKey))
+        .for("update")
+        .limit(1))[0];
+
+      if (!row) {
+        throw new RazorpayCreateOrderHttpError(500, { error: "Failed to reserve payment record." });
+      }
+
+      const rowCurrency = row.currency.trim().toUpperCase();
+      if (row.userId !== userId || row.provider !== "razorpay" || row.amountMinorUnits !== amountPaise || rowCurrency !== "INR") {
+        req.log.warn(
+          { userId, txId: row.id, requestedAmountPaise: amountPaise, existingAmountPaise: row.amountMinorUnits },
+          "[PaymentBackend] razorpay: idempotency key conflict",
+        );
+        throw new RazorpayCreateOrderHttpError(409, {
+          code: "IDEMPOTENCY_KEY_CONFLICT",
+          error: "This idempotency key was already used for a different Razorpay deposit.",
+        });
+      }
+
+      if (row.providerOrderId) {
+        if (row.status === "failed" || row.status === "cancelled") {
+          req.log.warn(
+            { userId, txId: row.id, orderId: row.providerOrderId, status: row.status },
+            "[PaymentBackend] razorpay: terminal idempotency key reused",
+          );
+          throw new RazorpayCreateOrderHttpError(409, {
+            code: "IDEMPOTENCY_KEY_TERMINAL",
+            error: "This payment attempt is already terminal. Start a new payment attempt.",
+          });
+        }
+        reusedIdempotentOrder = true;
+        req.log.info({ userId, txId: row.id, orderId: row.providerOrderId }, "[PaymentBackend] razorpay: idempotent order reused");
+        return { depositTx: row, shouldCreateProviderOrder: false };
+      }
+
+      if (row.status === "order_creating" && !inserted) {
+        req.log.info({ userId, txId: row.id }, "[PaymentBackend] razorpay: idempotent order still being created");
+        throw new RazorpayCreateOrderHttpError(409, {
+          code: "ORDER_CREATION_IN_PROGRESS",
+          error: "This payment order is still being prepared. Retry with the same idempotency key shortly.",
+        });
+      }
+
+      let reservedRow = row;
+      if (row.status !== "order_creating") {
+        const [updated] = await tx
+          .update(depositTransactionsTable)
+          .set({
+            status: "order_creating",
+            failureReason: null,
+            metadata: mergeMetadata(row.metadata, {
+              idempotencyRetryAt: new Date().toISOString(),
+              previousStatus: row.status,
+            }),
+            updatedAt: new Date(),
+          })
+          .where(eq(depositTransactionsTable.id, row.id))
+          .returning();
+        reservedRow = updated ?? row;
+      }
+
+      return { depositTx: reservedRow, shouldCreateProviderOrder: true };
+    });
+    depositTx = reservation.depositTx;
+    shouldCreateProviderOrder = reservation.shouldCreateProviderOrder;
   } catch (err) {
-    req.log.error({ err, userId, amountPaise }, "[PaymentBackend] razorpay: DB insert failed");
+    if (err instanceof RazorpayCreateOrderHttpError) {
+      return res.status(err.statusCode).json(err.body);
+    }
+    req.log.error({ err, userId, amountPaise }, "[PaymentBackend] razorpay: idempotent create-order reservation failed");
     return res.status(500).json({ error: "Failed to create payment record." });
   }
 
-  let order: { id: string; amount: number; currency: string };
-  try {
-    order = await (razorpay.orders as unknown as { create: (opts: unknown) => Promise<typeof order> }).create({
-      amount: amountPaise,
-      currency: "INR",
-      receipt: `wc_dep_${depositTx.id.replace(/-/g, "").slice(0, 20)}`,
-      partial_payment: false,
-      notes: { depositTransactionId: depositTx.id, userId },
-    });
-  } catch (err) {
-    req.log.error({ err, depositTxId: depositTx.id }, "[PaymentBackend] razorpay: create-order API failed");
-    await db.update(depositTransactionsTable)
-      .set({ status: "failed", failureReason: "razorpay_api_error", updatedAt: new Date() })
-      .where(eq(depositTransactionsTable.id, depositTx.id))
-      .catch(() => {});
-    return res.status(502).json({ error: "Failed to create Razorpay order. Please try again." });
+  if (shouldCreateProviderOrder) {
+    let order: { id: string; amount: number; currency: string };
+    try {
+      order = await (razorpay.orders as unknown as { create: (opts: unknown) => Promise<typeof order> }).create({
+        amount: amountPaise,
+        currency: "INR",
+        receipt: `wc_dep_${depositTx.id.replace(/-/g, "").slice(0, 20)}`,
+        partial_payment: false,
+        notes: { depositTransactionId: depositTx.id, userId },
+      });
+    } catch (err) {
+      req.log.error({ err, depositTxId: depositTx.id }, "[PaymentBackend] razorpay: create-order API failed");
+      await db.update(depositTransactionsTable)
+        .set({
+          status: "failed",
+          failureReason: "razorpay_api_error",
+          metadata: mergeMetadata(depositTx.metadata, {
+            razorpayOrderCreateFailedAt: new Date().toISOString(),
+          }),
+          updatedAt: new Date(),
+        })
+        .where(eq(depositTransactionsTable.id, depositTx.id))
+        .catch(() => {});
+      return res.status(502).json({ error: "Failed to create Razorpay order. Please try again." });
+    }
+
+    let updated: typeof depositTransactionsTable.$inferSelect | undefined;
+    try {
+      [updated] = await db.transaction(async (tx) =>
+        tx
+          .update(depositTransactionsTable)
+          .set({
+            providerOrderId: order.id,
+            status: "processing",
+            metadata: mergeMetadata(depositTx.metadata, {
+              razorpayOrderCreatedAt: new Date().toISOString(),
+              razorpayOrderAmount: order.amount,
+              razorpayOrderCurrency: order.currency,
+            }),
+            updatedAt: new Date(),
+          })
+          .where(and(
+            eq(depositTransactionsTable.id, depositTx.id),
+            eq(depositTransactionsTable.status, "order_creating"),
+          ))
+          .returning()
+      );
+    } catch (err) {
+      req.log.error({ err, txId: depositTx.id, orderId: order.id }, "[PaymentBackend] razorpay: provider order created but DB binding update errored");
+    }
+
+    if (!updated) {
+      req.log.error({ txId: depositTx.id, orderId: order.id }, "[PaymentBackend] razorpay: provider order created but DB binding failed");
+      await db
+        .update(depositTransactionsTable)
+        .set({
+          providerOrderId: order.id,
+          status: "requires_review",
+          failureReason: "razorpay_order_binding_failed",
+          metadata: mergeMetadata(depositTx.metadata, {
+            razorpayOrderCreatedAt: new Date().toISOString(),
+            razorpayOrderAmount: order.amount,
+            razorpayOrderCurrency: order.currency,
+            bindingFailedAt: new Date().toISOString(),
+          }),
+          updatedAt: new Date(),
+        })
+        .where(eq(depositTransactionsTable.id, depositTx.id))
+        .catch(() => {});
+      return res.status(500).json({
+        code: "RAZORPAY_ORDER_BINDING_FAILED",
+        error: "Payment order was created but could not be linked. Please contact support before retrying.",
+      });
+    }
+
+    depositTx = updated;
   }
 
-  await db
-    .update(depositTransactionsTable)
-    .set({ providerOrderId: order.id, status: "processing", updatedAt: new Date() })
-    .where(eq(depositTransactionsTable.id, depositTx.id));
-
-  req.log.info({ orderId: order.id, txId: depositTx.id, amountPaise }, "[PaymentBackend] razorpay: order created");
+  req.log.info(
+    { orderId: depositTx.providerOrderId, txId: depositTx.id, amountPaise, reused: reusedIdempotentOrder },
+    "[PaymentBackend] razorpay: order ready",
+  );
 
   const checkoutUrl = `${baseUrl}/api/wallet/deposit/razorpay/checkout?tid=${depositTx.id}`;
 
@@ -525,13 +714,25 @@ router.get("/wallet/deposit/razorpay/checkout", async (req, res) => {
         order_id: ${JSON.stringify(depositTx.providerOrderId)},
         handler: function(response) {
           // Payment succeeded — server verifies signature and credits wallet,
-          // then redirects here to the HTTPS done page.
-          var url = verifyUrl
-            + '?razorpay_payment_id=' + encodeURIComponent(response.razorpay_payment_id)
-            + '&razorpay_order_id='   + encodeURIComponent(response.razorpay_order_id)
-            + '&razorpay_signature='  + encodeURIComponent(response.razorpay_signature)
-            + '&transaction_id='      + encodeURIComponent(tid);
-          window.location.href = url;
+          // then the page moves to the HTTPS done page.
+          fetch(verifyUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              razorpay_payment_id: response.razorpay_payment_id,
+              razorpay_order_id: response.razorpay_order_id,
+              razorpay_signature: response.razorpay_signature,
+              transaction_id: tid
+            })
+          })
+            .then(function(r) { return r.json(); })
+            .then(function(result) {
+              var status = result && result.status ? result.status : 'processing';
+              window.location.href = doneBase + '?status=' + encodeURIComponent(status) + '&transaction_id=' + encodeURIComponent(tid);
+            })
+            .catch(function() {
+              window.location.href = doneBase + '?status=processing&transaction_id=' + encodeURIComponent(tid);
+            });
         },
         prefill: { name: 'WalkChamp User' },
         theme: { color: '#00b4ff' },
@@ -562,40 +763,40 @@ router.get("/wallet/deposit/razorpay/checkout", async (req, res) => {
 </html>`);
 });
 
-/**
- * GET /api/wallet/deposit/razorpay/verify
- *
- * Called by the checkout page via window.location.href after Razorpay payment.
- * Verifies HMAC-SHA256 signature, credits wallet idempotently, then redirects
- * to the app deep link (success or failed).
- * WebBrowser.openAuthSessionAsync() intercepts the deep link — no "screen does not exist".
- */
-router.get("/wallet/deposit/razorpay/verify", async (req, res) => {
-  const { razorpay_payment_id, razorpay_order_id, razorpay_signature, transaction_id } =
-    req.query as Record<string, string>;
+const razorpayVerifySchema = z.object({
+  razorpay_payment_id: z.string().min(1),
+  razorpay_order_id: z.string().min(1),
+  razorpay_signature: z.string().min(1),
+  transaction_id: z.string().min(1),
+});
 
-  const missing = ["razorpay_payment_id", "razorpay_order_id", "razorpay_signature", "transaction_id"]
-    .filter((k) => !(req.query as Record<string, string>)[k]);
-
-  if (missing.length > 0) {
-    req.log.warn({ missing }, "[PaymentBackend] razorpay verify: missing params");
-    return res.redirect(appDoneUrl("failed", transaction_id ?? ""));
-  }
+async function verifyAndSettleRazorpayCallback(
+  input: z.infer<typeof razorpayVerifySchema>,
+  log: Pick<Logger, "warn" | "info" | "error">,
+): Promise<{ status: "success" | "processing" | "failed"; transactionId: string }> {
+  const {
+    razorpay_payment_id,
+    razorpay_order_id,
+    razorpay_signature,
+    transaction_id,
+  } = input;
 
   try {
-    const keySecret = config.payments.razorpayKeySecret ?? "";
-    const expectedSignature = createHmac("sha256", keySecret)
-      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-      .digest("hex");
+    const signatureValid = verifyRazorpayCheckoutSignature({
+      secret: config.payments.razorpayKeySecret,
+      orderId: razorpay_order_id,
+      paymentId: razorpay_payment_id,
+      signature: razorpay_signature,
+    });
 
-    if (razorpay_signature !== expectedSignature) {
-      req.log.warn({ transaction_id, razorpay_payment_id }, "[PaymentBackend] razorpay verify: signature mismatch");
+    if (!signatureValid) {
+      log.warn({ transaction_id, razorpay_payment_id }, "[PaymentBackend] razorpay verify: signature mismatch");
       await markDepositReturnObserved(transaction_id, {
         returnSeenAt: new Date().toISOString(),
         returnDisplayStatus: "failed",
         razorpayCallbackSignatureVerified: false,
       });
-      return res.redirect(appDoneUrl("failed", transaction_id));
+      return { status: "failed", transactionId: transaction_id };
     }
 
     const [depositTx] = await db
@@ -605,19 +806,19 @@ router.get("/wallet/deposit/razorpay/verify", async (req, res) => {
       .limit(1);
 
     if (!depositTx) {
-      req.log.warn({ transaction_id }, "[PaymentBackend] razorpay verify: transaction not found");
-      return res.redirect(appDoneUrl("failed", transaction_id));
+      log.warn({ transaction_id }, "[PaymentBackend] razorpay verify: transaction not found");
+      return { status: "failed", transactionId: transaction_id };
     }
 
     if (depositTx.providerOrderId !== razorpay_order_id) {
-      req.log.warn({ transaction_id, razorpay_order_id }, "[PaymentBackend] razorpay verify: order_id mismatch");
+      log.warn({ transaction_id, razorpay_order_id }, "[PaymentBackend] razorpay verify: order_id mismatch");
       await markDepositReturnObserved(transaction_id, {
         returnSeenAt: new Date().toISOString(),
         returnDisplayStatus: "failed",
         razorpayCallbackSignatureVerified: true,
         razorpayOrderIdVerified: false,
       });
-      return res.redirect(appDoneUrl("failed", transaction_id));
+      return { status: "failed", transactionId: transaction_id };
     }
 
     await markDepositReturnObserved(transaction_id, {
@@ -634,22 +835,49 @@ router.get("/wallet/deposit/razorpay/verify", async (req, res) => {
     });
 
     if (settlement.status === "succeeded") {
-      req.log.info({ txId: transaction_id, settled: settlement.settled }, "[PaymentBackend] razorpay verify: settled from fetched provider state");
-      return res.redirect(appDoneUrl("success", transaction_id));
+      log.info({ txId: transaction_id, settled: settlement.settled }, "[PaymentBackend] razorpay verify: settled from fetched provider state");
+      return { status: "success", transactionId: transaction_id };
     }
 
-    return res.redirect(appDoneUrl(settlement.status === "processing" ? "processing" : "failed", transaction_id));
+    return {
+      status: settlement.status === "processing" ? "processing" : "failed",
+      transactionId: transaction_id,
+    };
   } catch (err) {
-    req.log.error({ err }, "[PaymentBackend] razorpay verify: exception");
-    if (transaction_id) {
-      await db
-        .update(depositTransactionsTable)
-        .set({ status: "settlement_error", failureReason: "razorpay_verify_settlement_error", updatedAt: new Date() })
-        .where(and(eq(depositTransactionsTable.id, transaction_id), ne(depositTransactionsTable.status, "succeeded")))
-        .catch(() => {});
-    }
-    return res.redirect(appDoneUrl("processing", transaction_id ?? ""));
+    log.error({ err }, "[PaymentBackend] razorpay verify: exception");
+    await db
+      .update(depositTransactionsTable)
+      .set({ status: "settlement_error", failureReason: "razorpay_verify_settlement_error", updatedAt: new Date() })
+      .where(and(eq(depositTransactionsTable.id, transaction_id), ne(depositTransactionsTable.status, "succeeded")))
+      .catch(() => {});
+    return { status: "processing", transactionId: transaction_id };
   }
+}
+
+router.post("/wallet/deposit/razorpay/verify", async (req, res) => {
+  const parsed = razorpayVerifySchema.safeParse(req.body);
+  if (!parsed.success) {
+    req.log.warn({ issues: parsed.error.issues }, "[PaymentBackend] razorpay verify: invalid body");
+    return res.status(400).json({ status: "failed", error: "Invalid Razorpay verification payload." });
+  }
+
+  const result = await verifyAndSettleRazorpayCallback(parsed.data, req.log);
+  return res.json({ success: result.status === "success", status: result.status, transactionId: result.transactionId });
+});
+
+/**
+ * Legacy GET compatibility for older hosted checkout pages.
+ */
+router.get("/wallet/deposit/razorpay/verify", async (req, res) => {
+  const parsed = razorpayVerifySchema.safeParse(req.query);
+  if (!parsed.success) {
+    const transactionId = typeof req.query.transaction_id === "string" ? req.query.transaction_id : "";
+    req.log.warn({ issues: parsed.error.issues }, "[PaymentBackend] razorpay verify: invalid query");
+    return res.redirect(appDoneUrl("failed", transactionId));
+  }
+
+  const result = await verifyAndSettleRazorpayCallback(parsed.data, req.log);
+  return res.redirect(appDoneUrl(result.status, result.transactionId));
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -985,11 +1213,11 @@ router.post("/webhooks/razorpay", async (req, res) => {
     return res.json({ received: true, warning: "webhook_disabled_no_secret" });
   }
 
-  const signature = req.headers["x-razorpay-signature"] as string;
+  const signatureHeader = req.headers["x-razorpay-signature"];
+  const signature = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
   const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
-  const expected = createHmac("sha256", webhookSecret).update(rawBody).digest("hex");
 
-  if (!signature || signature !== expected) {
+  if (!verifyRazorpaySignature({ secret: webhookSecret, payload: rawBody, signature })) {
     return res.status(400).json({ error: "Invalid webhook signature" });
   }
 
@@ -1004,6 +1232,13 @@ router.post("/webhooks/razorpay", async (req, res) => {
   const bodyEventId = typeof body.id === "string" && body.id.trim() ? body.id.trim() : null;
   const eventId = headerEventId ?? bodyEventId ?? `rzp-${createHash("sha256").update(rawBody).digest("hex").slice(0, 32)}`;
 
+  if (!headerEventId) {
+    req.log.warn(
+      { eventType, eventId, hasBodyEventId: Boolean(bodyEventId) },
+      "[PaymentBackend] razorpay webhook missing x-razorpay-event-id; using fallback id",
+    );
+  }
+
   req.log.info({ eventType, eventId }, "[PaymentBackend] razorpay webhook received");
 
   const [existing] = await db
@@ -1016,6 +1251,7 @@ router.post("/webhooks/razorpay", async (req, res) => {
     .limit(1);
 
   if (existing?.processed) {
+    req.log.info({ eventType, eventId }, "[PaymentBackend] razorpay webhook duplicate ignored");
     await db
       .update(depositWebhookEventsTable)
       .set({ processingStatus: "ignored_duplicate", failureReason: null })
