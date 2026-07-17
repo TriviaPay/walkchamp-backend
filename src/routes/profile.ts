@@ -610,7 +610,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
 
   if (!p) return res.status(404).json({ error: "User not found" });
 
-  const [raceRows, titleRow, friendRow, reqRow, coinRow] = await Promise.all([
+  const [raceRows, titleRow, friendRow, reqRow, coinRow, cashWonRow] = await Promise.all([
     db.select({ rank: raceResultsTable.rank })
       .from(raceResultsTable)
       .where(eq(raceResultsTable.userId, targetId)),
@@ -641,6 +641,14 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
       .where(eq(coinBalancesTable.userId, targetId))
       .limit(1)
       .then((r) => r[0] ?? null),
+    db.select({ totalCashWonCents: sql<number>`COALESCE(SUM(${raceResultsTable.prizeCents}), 0)::int` })
+      .from(raceResultsTable)
+      .innerJoin(raceRoomsTable, eq(raceResultsTable.raceRoomId, raceRoomsTable.id))
+      .where(and(
+        eq(raceResultsTable.userId, targetId),
+        gt(raceRoomsTable.entryAmountCents, 0),
+      ))
+      .then((r) => r[0] ?? null),
   ]);
 
   let friendStatus: "none" | "pending_sent" | "pending_received" | "friends" = "none";
@@ -652,6 +660,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
     friendStatus = reqRow.senderId === myId ? "pending_sent" : "pending_received";
     friendRequestId = reqRow.id;
   }
+  const lifetimeCashWonCents = cashWonRow?.totalCashWonCents ?? 0;
 
   return res.json({
     userId: p.id,
@@ -667,6 +676,8 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
     stats: {
       lifetimeSteps:     p.totalSteps ?? 0,
       coinsBalance:      coinRow?.currentBalance ?? 0,
+      lifetimeCashWonCents,
+      lifetimeCashWonDollars: lifetimeCashWonCents / 100,
       racesPlayed:       raceRows.length,
       raceWins:          raceRows.filter((r) => r.rank === 1).length,
       currentStreakDays:  p.currentStreak ?? 0,
