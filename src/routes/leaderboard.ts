@@ -49,6 +49,7 @@ const AVATAR_COLORS = [
   "#00E676", "#00B4FF", "#06B6D4", "#FFD700", "#FF6B35",
   "#A855F7", "#F472B6", "#34D399", "#60A5FA", "#FBBF24",
 ];
+const RACE_WIN_MAX_RANK = 3;
 
 /** Validates a client-supplied YYYY-MM-DD date string. */
 function isValidDateStr(s: unknown): s is string {
@@ -274,7 +275,7 @@ router.get("/leaderboard", requireAuth, async (req, res) => {
 
 // ── GET /api/leaderboard/races ────────────────────────────────────────────────
 // query: entryType=free|paid_1|paid_3|paid_5
-// Returns users ranked by number of race wins (rank=1 in race_results)
+// Returns users ranked by race wins. Product defines 1st, 2nd, and 3rd as wins.
 router.get("/leaderboard/races", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const entryType = req.query.entryType as string | undefined;
@@ -286,9 +287,9 @@ router.get("/leaderboard/races", requireAuth, async (req, res) => {
       ? (entryType as EntryType)
       : undefined;
 
-  // Build where conditions — race_results.rank = 1 means the winner
+  // Build where conditions — 1st, 2nd, and 3rd all count toward win totals.
   const whereConditions = [
-    eq(raceResultsTable.rank, 1),
+    lte(raceResultsTable.rank, RACE_WIN_MAX_RANK),
     notInArray(profilesTable.accountStatus, ["banned", "deleted"]),
   ];
   if (filteredEntryType) {
@@ -357,7 +358,7 @@ router.get("/leaderboard/races", requireAuth, async (req, res) => {
     // Count user's own wins to determine rank
     const myWinConditions = [
       eq(raceResultsTable.userId, userId),
-      eq(raceResultsTable.rank, 1),
+      lte(raceResultsTable.rank, RACE_WIN_MAX_RANK),
     ];
     if (filteredEntryType) myWinConditions.push(eq(raceRoomsTable.entryType, filteredEntryType));
 
@@ -372,7 +373,7 @@ router.get("/leaderboard/races", requireAuth, async (req, res) => {
     if (userWins > 0) {
       // Count users with more wins than the current user
       const aboveConditions = [
-        eq(raceResultsTable.rank, 1),
+        lte(raceResultsTable.rank, RACE_WIN_MAX_RANK),
         notInArray(profilesTable.accountStatus, ["banned", "deleted"]),
         ne(profilesTable.id, userId),
       ];

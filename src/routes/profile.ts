@@ -95,6 +95,10 @@ function computeXP(totalSteps: number, raceResults: { rank: number; prizeCents: 
   return stepXP + raceXP;
 }
 
+function isRaceWinRank(rank: number | null | undefined): boolean {
+  return typeof rank === "number" && rank >= 1 && rank <= 3;
+}
+
 // Compute consecutive-day streak from step_daily_totals rows (ordered by date desc).
 // A streak is consecutive days ending on today or yesterday with steps > 0.
 function computeStreak(rows: { date: string | Date; steps: number | null }[]): number {
@@ -244,8 +248,8 @@ router.get("/profile/me", requireAuth, async (req, res) => {
   const levelData      = computeLevelData(lifetimeXP);
 
   const totalRaces   = allRaceRows.length;
-  const racesWon     = allRaceRows.filter((r) => r.rank === 1).length;
-  const top3Finishes = allRaceRows.filter((r) => r.rank !== null && r.rank <= 3).length;
+  const racesWon     = allRaceRows.filter((r) => isRaceWinRank(r.rank)).length;
+  const top3Finishes = allRaceRows.filter((r) => isRaceWinRank(r.rank)).length;
   const winRate      = totalRaces > 0 ? Math.round((racesWon / totalRaces) * 100) : 0;
 
   db.update(profilesTable).set({ lastSeenAt: new Date() }).where(eq(profilesTable.id, userId)).catch(() => {});
@@ -579,8 +583,8 @@ router.get("/profile/public/:username", async (req, res) => {
         xp:              levelData.xp,
         progressPercent: levelData.progressPercent,
         totalRaces:      raceRows.length,
-        racesWon:        raceRows.filter((r) => r.rank === 1).length,
-        top3Finishes:    raceRows.filter((r) => r.rank <= 3).length,
+        racesWon:        raceRows.filter((r) => isRaceWinRank(r.rank)).length,
+        top3Finishes:    raceRows.filter((r) => isRaceWinRank(r.rank)).length,
       },
     },
   });
@@ -679,7 +683,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
       lifetimeCashWonCents,
       lifetimeCashWonDollars: lifetimeCashWonCents / 100,
       racesPlayed:       raceRows.length,
-      raceWins:          raceRows.filter((r) => r.rank === 1).length,
+      raceWins:          raceRows.filter((r) => isRaceWinRank(r.rank)).length,
       currentStreakDays:  p.currentStreak ?? 0,
     },
   });
