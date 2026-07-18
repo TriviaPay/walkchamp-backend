@@ -50,6 +50,7 @@ const envSchema = z
     RATE_LIMIT_SECRET: z.string().optional(),
     DESCOPE_PROJECT_ID: z.string().optional(),
     DESCOPE_MANAGEMENT_KEY: z.string().optional(),
+    MIN_SESSION_ENFORCE_VERSION: z.string().optional(),
     SESSION_SECRET: z.string().optional(),
     CASH_FEATURES_ENABLED: z.enum(["true", "false"]).optional(),
     FEATURE_CASH_FEATURES: z.enum(["true", "false"]).optional(),
@@ -316,6 +317,12 @@ export const config = {
   auth: {
     descopeProjectId: rawEnv.DESCOPE_PROJECT_ID?.trim() ?? (isTest ? "test-project" : null),
     descopeManagementKey: rawEnv.DESCOPE_MANAGEMENT_KEY?.trim() ?? null,
+    // Single active session rollout gate. When null (default), enforcement is "monitor-first":
+    // a client that DOES send a session id is validated strictly (replaced sessions are
+    // rejected), but a client that sends none is allowed through. Set to a minimum app version
+    // (e.g. "1.5.0") to additionally require any client at/above that version to present a valid
+    // active session.
+    minSessionEnforceVersion: rawEnv.MIN_SESSION_ENFORCE_VERSION?.trim() || null,
   },
   payments: {
     stripeSecretKey: rawEnv.STRIPE_SECRET_KEY?.trim() ?? null,

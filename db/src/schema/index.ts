@@ -25,3 +25,5 @@ export * from "./auditLogs.js";
 export * from "./liveActivity.js";
 export * from "./sponsoredGiftCards.js";
 export * from "./hardening.js";
+export * from "./referrals.js";
+export * from "./authSessions.js";

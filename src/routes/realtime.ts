@@ -76,6 +76,12 @@ async function canAccessRaceChannel(userId: string, raceId: string): Promise<boo
   return !!spectatorSession;
 }
 
+// Single-session enforcement: this route runs behind `requireAuth`, which rejects any request
+// presenting a replaced/revoked X-Session-Id before it reaches here — so a superseded device
+// cannot authorize new private/presence subscriptions once it identifies its session. Legacy
+// clients that send no session id keep working (monitor-first policy), matching every other
+// protected route; we deliberately do not restrict realtime more tightly and break their
+// wallet/chat/race channels.
 router.post("/realtime/pusher/auth", requireAuth, requireActiveAccount, async (req, res) => {
   if (!isPusherConfigured()) {
     return res.status(503).json({ error: "Realtime not configured" });
@@ -94,6 +100,15 @@ router.post("/realtime/pusher/auth", requireAuth, requireActiveAccount, async (r
     const channelUserId = channel_name.replace("private-user-", "");
     if (channelUserId !== userId) {
       return res.status(403).json({ error: "Not authorized for this channel" });
+    }
+  } else if (channel_name.startsWith("private-session-")) {
+    // A device may subscribe only to its OWN active session's channel, so it receives the
+    // session-invalidated event if it is later superseded. req.sessionId is set by requireAuth
+    // only for a validated active session.
+    const channelSessionId = channel_name.replace("private-session-", "");
+    const activeSessionId = (req as AuthenticatedRequest).sessionId;
+    if (!activeSessionId || activeSessionId !== channelSessionId) {
+      return res.status(403).json({ error: "Not authorized for this session" });
     }
   } else if (channel_name.startsWith("private-chat-")) {
     const conversationId = channel_name.replace("private-chat-", "");

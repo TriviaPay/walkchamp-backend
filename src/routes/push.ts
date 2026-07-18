@@ -38,6 +38,13 @@ router.post("/push/register-device", requireAuth, async (req, res) => {
   // Prefer subscription ID (v5), fall back to player ID (v4 legacy)
   const playerId = onesignalSubscriptionId ?? onesignalPlayerId!;
 
+  // Associate the registration with the backend session/device (audit only — push identity is
+  // never used for authorization). Reassigning a device to a new user on account switch is the
+  // existing upsert behaviour; we do not delete history.
+  const authReq = req as AuthenticatedRequest;
+  const deviceId = authReq.deviceInfo?.deviceId ?? null;
+  const sessionId = authReq.sessionId ?? null;
+
   await db
     .insert(notificationDevicesTable)
     .values({
@@ -46,6 +53,8 @@ router.post("/push/register-device", requireAuth, async (req, res) => {
       platform: devicePlatform ?? "unknown",
       deviceModel,
       appVersion,
+      deviceId,
+      sessionId,
       active: true,
       lastSeenAt: new Date(),
     })
@@ -56,6 +65,8 @@ router.post("/push/register-device", requireAuth, async (req, res) => {
         platform: devicePlatform ?? "unknown",
         deviceModel,
         appVersion,
+        deviceId,
+        sessionId,
         active: true,
         lastSeenAt: new Date(),
         updatedAt: new Date(),

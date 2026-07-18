@@ -95,6 +95,11 @@ router.post("/notifications/register-device", requireAuth, async (req, res) => {
 
   const { onesignalPlayerId, platform, deviceModel, appVersion } = parsed.data;
 
+  // Associate with the backend session/device (audit only — push identity is never used for auth).
+  const authReq = req as AuthenticatedRequest;
+  const deviceId = authReq.deviceInfo?.deviceId ?? null;
+  const sessionId = authReq.sessionId ?? null;
+
   await db
     .insert(notificationDevicesTable)
     .values({
@@ -103,6 +108,8 @@ router.post("/notifications/register-device", requireAuth, async (req, res) => {
       platform,
       deviceModel,
       appVersion,
+      deviceId,
+      sessionId,
       active: true,
       lastSeenAt: new Date(),
     })
@@ -113,6 +120,8 @@ router.post("/notifications/register-device", requireAuth, async (req, res) => {
         platform,
         deviceModel,
         appVersion,
+        deviceId,
+        sessionId,
         active: true,
         lastSeenAt: new Date(),
         updatedAt: new Date(),

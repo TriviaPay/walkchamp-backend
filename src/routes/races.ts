@@ -36,6 +36,7 @@ import { requireAdminKey } from "../middleware/requireAdminKey.js";
 import { recordCoinLedgerEntry } from "../lib/coinsService.js";
 import {
   deriveOpenRoomStatus,
+  type DbTx,
   joinOrReviveParticipant,
   lockRaceRoom,
   lockScheduledRegistration,
@@ -64,6 +65,7 @@ import {
   debitCashChallengeEntry,
   hasCompletedEntryPayment,
 } from "../lib/cashChallengePayments.js";
+import { grantReferralBonusForCashChallenge } from "../lib/referralBonusService.js";
 import {
   createRefundBatchForRaceCancellation,
   createRefundForRaceLeave,
@@ -88,6 +90,11 @@ class PaidJoinRollback extends Error {
     super(String(body.error ?? "Paid join failed."));
   }
 }
+
+const REGULAR_RACE_REGISTRATION_EXISTS_CODE = "REGULAR_RACE_REGISTRATION_EXISTS";
+const REGULAR_RACE_REGISTRATION_EXISTS_TITLE = "Already Registered";
+const REGULAR_RACE_REGISTRATION_EXISTS_MESSAGE =
+  "You are already registered for another race. Please withdraw from or complete your current race before registering for a new one.";
 
 // ── In-memory spectator tracking (resets on server restart) ──────────────────
 const spectatorSeen = new Map<string, Map<string, number>>();
@@ -1146,6 +1153,107 @@ async function checkPaidEligibility(userId: string, res: ReturnType<Router["get"
   return true; // simplified — full checks in POST /races
 }
 
+type RegularRaceRegistrationRow = {
+  roomId: string;
+  roomStatus: typeof raceRoomsTable.$inferSelect.status;
+  type: typeof raceRoomsTable.$inferSelect.type;
+  entryType: typeof raceRoomsTable.$inferSelect.entryType;
+  entryAmountCents: number;
+  targetSteps: number;
+  trackLayout: string;
+  creatorId: string;
+  currentPlayers: number;
+  challengeDurationDays: number;
+  challengeEndAt: Date | null;
+  startedAt: Date | null;
+  scheduledStartAt: Date | null;
+  participantCurrentSteps: number | null;
+  participantBaselineSteps: number | null;
+};
+
+type RegistrationDb = typeof db | DbTx;
+
+async function lockRegularRaceRegistrationForUser(tx: DbTx, userId: string): Promise<void> {
+  await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`regular_race_registration:${userId}`}, 0))`);
+}
+
+async function getRegularRaceRegistrationForUser(
+  dbOrTx: RegistrationDb,
+  userId: string,
+  excludeRoomId?: string,
+): Promise<RegularRaceRegistrationRow | null> {
+  const excludeCurrentRoom = excludeRoomId ? ne(raceRoomsTable.id, excludeRoomId) : undefined;
+
+  const [row] = await dbOrTx
+    .select({
+      roomId: raceRoomsTable.id,
+      roomStatus: raceRoomsTable.status,
+      type: raceRoomsTable.type,
+      entryType: raceRoomsTable.entryType,
+      entryAmountCents: raceRoomsTable.entryAmountCents,
+      targetSteps: raceRoomsTable.targetSteps,
+      trackLayout: raceRoomsTable.trackLayout,
+      creatorId: raceRoomsTable.creatorId,
+      currentPlayers: raceRoomsTable.currentPlayers,
+      challengeDurationDays: raceRoomsTable.challengeDurationDays,
+      challengeEndAt: raceRoomsTable.challengeEndAt,
+      startedAt: raceRoomsTable.startedAt,
+      scheduledStartAt: raceRoomsTable.scheduledStartAt,
+      participantCurrentSteps: raceParticipantsTable.currentSteps,
+      participantBaselineSteps: raceParticipantsTable.raceBaselineSteps,
+    })
+    .from(raceRoomsTable)
+    .innerJoin(
+      raceParticipantsTable,
+      and(
+        eq(raceParticipantsTable.raceRoomId, raceRoomsTable.id),
+        eq(raceParticipantsTable.userId, userId),
+        inArray(raceParticipantsTable.status, ["joined", "active"]),
+      ),
+    )
+    .where(and(
+      inArray(raceRoomsTable.status, ["open", "full", "in_progress"]),
+      ne(raceRoomsTable.type, "sponsored"),
+      excludeCurrentRoom,
+    ))
+    .orderBy(desc(raceRoomsTable.createdAt))
+    .limit(1);
+
+  if (row) return row;
+
+  const [registration] = await dbOrTx
+    .select({
+      roomId: raceRoomsTable.id,
+      roomStatus: raceRoomsTable.status,
+      type: raceRoomsTable.type,
+      entryType: raceRoomsTable.entryType,
+      entryAmountCents: raceRoomsTable.entryAmountCents,
+      targetSteps: raceRoomsTable.targetSteps,
+      trackLayout: raceRoomsTable.trackLayout,
+      creatorId: raceRoomsTable.creatorId,
+      currentPlayers: raceRoomsTable.currentPlayers,
+      challengeDurationDays: raceRoomsTable.challengeDurationDays,
+      challengeEndAt: raceRoomsTable.challengeEndAt,
+      startedAt: raceRoomsTable.startedAt,
+      scheduledStartAt: raceRoomsTable.scheduledStartAt,
+      participantCurrentSteps: sql<number | null>`null`,
+      participantBaselineSteps: sql<number | null>`null`,
+    })
+    .from(scheduledRoomRegistrationsTable)
+    .innerJoin(raceRoomsTable, eq(raceRoomsTable.id, scheduledRoomRegistrationsTable.raceRoomId))
+    .where(and(
+      eq(scheduledRoomRegistrationsTable.userId, userId),
+      eq(scheduledRoomRegistrationsTable.status, "registered"),
+      eq(raceRoomsTable.status, "scheduled"),
+      ne(raceRoomsTable.type, "sponsored"),
+      excludeCurrentRoom,
+    ))
+    .orderBy(asc(raceRoomsTable.scheduledStartAt))
+    .limit(1);
+
+  return registration ?? null;
+}
+
 // ── Shared helper: find an active non-sponsored race the user is currently participating in ─
 async function getActiveRaceForUser(userId: string) {
   const [row] = await db
@@ -1159,7 +1267,10 @@ async function getActiveRaceForUser(userId: string) {
       trackLayout: raceRoomsTable.trackLayout,
       creatorId: raceRoomsTable.creatorId,
       currentPlayers: raceRoomsTable.currentPlayers,
+      challengeDurationDays: raceRoomsTable.challengeDurationDays,
+      challengeEndAt: raceRoomsTable.challengeEndAt,
       startedAt: raceRoomsTable.startedAt,
+      scheduledStartAt: raceRoomsTable.scheduledStartAt,
       participantCurrentSteps: raceParticipantsTable.currentSteps,
       participantBaselineSteps: raceParticipantsTable.raceBaselineSteps,
     })
@@ -1181,8 +1292,18 @@ async function getActiveRaceForUser(userId: string) {
   return row ?? null;
 }
 
+function regularRaceRegistrationConflictBody(row: RegularRaceRegistrationRow, userId: string) {
+  return {
+    success: false,
+    code: REGULAR_RACE_REGISTRATION_EXISTS_CODE,
+    title: REGULAR_RACE_REGISTRATION_EXISTS_TITLE,
+    message: REGULAR_RACE_REGISTRATION_EXISTS_MESSAGE,
+    active_race: activeRacePayload(row, userId),
+  };
+}
+
 function activeRacePayload(
-  row: NonNullable<Awaited<ReturnType<typeof getActiveRaceForUser>>>,
+  row: RegularRaceRegistrationRow,
   userId: string,
   trackTheme: TrackThemeMedia = buildTrackThemeMedia(row.trackLayout ?? "bg"),
 ) {
@@ -1755,9 +1876,11 @@ router.post("/rooms/:roomId/register", requireAuth, async (req, res) => {
   req.log.info({ roomId, userId }, "[ScheduleRoom] registerClicked");
   let registeredCount = 0;
   let errorStatus: number | null = null;
-  let errorBody: Record<string, string> | null = null;
+  let errorBody: Record<string, unknown> | null = null;
 
   await db.transaction(async (tx) => {
+    await lockRegularRaceRegistrationForUser(tx, userId);
+
     const room = await lockRaceRoom(tx, roomId);
     if (!room) {
       errorStatus = 404;
@@ -1768,6 +1891,14 @@ router.post("/rooms/:roomId/register", requireAuth, async (req, res) => {
       errorStatus = 409;
       errorBody = { error: "Room is no longer accepting registrations." };
       return;
+    }
+    if (room.type !== "sponsored") {
+      const existingRegularRace = await getRegularRaceRegistrationForUser(tx, userId, roomId);
+      if (existingRegularRace) {
+        errorStatus = 409;
+        errorBody = regularRaceRegistrationConflictBody(existingRegularRace, userId);
+        return;
+      }
     }
 
     const existing = await lockScheduledRegistration(tx, roomId, userId);
@@ -2038,17 +2169,10 @@ router.post("/races/host", requireAuth, async (req, res) => {
     return res.status(403).json({ error: "You must unlock this track before hosting a challenge with it." });
   }
 
-  // Enforce: user may only be in one active race at a time (only for instant rooms)
-  if (!isScheduledFuture) {
-    const alreadyActive = await getActiveRaceForUser(userId);
-    if (alreadyActive) {
-      return res.status(409).json({
-        success: false,
-        code: "ACTIVE_RACE_EXISTS",
-        message: "You are already in an active race.",
-        active_race: activeRacePayload(alreadyActive, userId),
-      });
-    }
+  // Enforce: user may only be registered for one regular race at a time.
+  const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId);
+  if (existingRegularRace) {
+    return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
 
   // For paid races validate eligibility
@@ -2118,7 +2242,12 @@ router.post("/races/host", requireAuth, async (req, res) => {
     "[ScheduleRoom] createPayload"
   );
 
+  let createConflict: RegularRaceRegistrationRow | null = null;
   const result = await db.transaction(async (tx) => {
+    await lockRegularRaceRegistrationForUser(tx, userId);
+    createConflict = await getRegularRaceRegistrationForUser(tx, userId);
+    if (createConflict) return null;
+
     const roomTitle = isCountryVs && teamACountry && teamBCountry
       ? `${teamACountry} vs ${teamBCountry}`
       : (titleMap[entryType] ?? "Walk Challenge");
@@ -2167,6 +2296,13 @@ router.post("/races/host", requireAuth, async (req, res) => {
     return { room, participant };
   });
 
+  if (createConflict) {
+    return res.status(409).json(regularRaceRegistrationConflictBody(createConflict, userId));
+  }
+  if (!result) {
+    return res.status(409).json({ error: "Unable to create race." });
+  }
+
   req.log.info({ raceId: result.room.id, userId, entryType, isPrivate, isScheduledFuture }, "[ScheduleRoom] createResponse");
   if (!isPrivate) {
     if (isScheduledFuture) {
@@ -2191,15 +2327,22 @@ router.post("/races/host", requireAuth, async (req, res) => {
       .where(eq(profilesTable.id, userId))
       .limit(1);
     const provider = resolvePaymentProvider(profile?.countryCode);
-    const charge = await db.transaction(async (tx) =>
-      debitCashChallengeEntry(tx, {
+    const charge = await db.transaction(async (tx) => {
+      const debit = await debitCashChallengeEntry(tx, {
         userId,
         raceRoomId: result.room.id,
         entryFeeCents: amountCents,
         paymentProvider: provider,
         description: `Cash challenge host entry: ${result.room.title}`,
-      }),
-    );
+      });
+      if (debit.ok) {
+        await grantReferralBonusForCashChallenge(tx, {
+          referredUserId: userId,
+          raceRoomId: result.room.id,
+        });
+      }
+      return debit;
+    });
     if (!charge.ok) {
       await db
         .update(raceRoomsTable)
@@ -2318,6 +2461,10 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
           if (!result.ok) {
             throw new Error(result.error);
           }
+          await grantReferralBonusForCashChallenge(tx, {
+            referredUserId: p.userId,
+            raceRoomId: raceId,
+          });
         }
       });
 
@@ -2837,14 +2984,9 @@ router.post("/races", requireAuth, async (req, res) => {
     return res.status(403).json({ error: "You must unlock this track before hosting a challenge with it." });
   }
 
-  const alreadyActive = await getActiveRaceForUser(userId);
-  if (alreadyActive) {
-    return res.status(409).json({
-      success: false,
-      code: "ACTIVE_RACE_EXISTS",
-      message: "You are already in an active race.",
-      active_race: activeRacePayload(alreadyActive, userId),
-    });
+  const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId);
+  if (existingRegularRace) {
+    return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
 
   if (amountCents > 0) {
@@ -2865,22 +3007,36 @@ router.post("/races", requireAuth, async (req, res) => {
     ? randomBytes(4).toString("hex").toUpperCase()
     : null;
 
-  const [room] = await db
-    .insert(raceRoomsTable)
-    .values({
-      creatorId: userId,
-      title: data.title,
-      type: data.type,
-      entryType: data.entryType,
-      entryAmountCents: amountCents,
-      targetSteps: data.targetSteps,
-      maxPlayers: data.maxPlayers,
-      isPrivate: data.isPrivate,
-      countryCode: data.countryCode,
-      trackLayout: data.trackLayout,
-      inviteCode,
-    })
-    .returning();
+  let createConflict: RegularRaceRegistrationRow | null = null;
+  const [room] = await db.transaction(async (tx) => {
+    await lockRegularRaceRegistrationForUser(tx, userId);
+    createConflict = await getRegularRaceRegistrationForUser(tx, userId);
+    if (createConflict) return [];
+
+    return tx
+      .insert(raceRoomsTable)
+      .values({
+        creatorId: userId,
+        title: data.title,
+        type: data.type,
+        entryType: data.entryType,
+        entryAmountCents: amountCents,
+        targetSteps: data.targetSteps,
+        maxPlayers: data.maxPlayers,
+        isPrivate: data.isPrivate,
+        countryCode: data.countryCode,
+        trackLayout: data.trackLayout,
+        inviteCode,
+      })
+      .returning();
+  });
+
+  if (createConflict) {
+    return res.status(409).json(regularRaceRegistrationConflictBody(createConflict, userId));
+  }
+  if (!room) {
+    return res.status(409).json({ error: "Unable to create race." });
+  }
 
   try {
     await setUserDefaultTrackTheme(userId, data.trackLayout);
@@ -2906,14 +3062,9 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
   }
   const { maxPlayers, targetSteps } = parsed.data;
 
-  const alreadyActive = await getActiveRaceForUser(userId);
-  if (alreadyActive) {
-    return res.status(409).json({
-      success: false,
-      code: "ACTIVE_RACE_EXISTS",
-      message: "You are already in an active race.",
-      active_race: activeRacePayload(alreadyActive, userId),
-    });
+  const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId);
+  if (existingRegularRace) {
+    return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
 
   const [profile] = await db
@@ -2948,6 +3099,10 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
     let joined = false;
 
     await db.transaction(async (tx) => {
+      await lockRegularRaceRegistrationForUser(tx, userId);
+      const conflict = await getRegularRaceRegistrationForUser(tx, userId, room.id);
+      if (conflict) return;
+
       const lockedRoom = await lockRaceRoom(tx, room.id);
       if (!lockedRoom || (lockedRoom.status !== "open" && lockedRoom.status !== "full")) return;
       if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) return;
@@ -2977,25 +3132,43 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
   }
 
   if (!targetRoomId || !participant || !joinedRoom) {
-    const [newRoom] = await db
-      .insert(raceRoomsTable)
-      .values({
-        creatorId: userId,
-        title: "Quick Free Challenge",
-        type: "quick",
-        entryType: "free",
-        entryAmountCents: 0,
-        targetSteps,
-        maxPlayers,
-        currentPlayers: 1,
-    })
-      .returning();
-    targetRoomId = newRoom.id;
+    let createConflict: RegularRaceRegistrationRow | null = null;
+    const created = await db.transaction(async (tx) => {
+      await lockRegularRaceRegistrationForUser(tx, userId);
+      createConflict = await getRegularRaceRegistrationForUser(tx, userId);
+      if (createConflict) return null;
 
-    [participant] = await db
-      .insert(raceParticipantsTable)
-      .values({ raceRoomId: targetRoomId, userId, status: "joined" })
-      .returning();
+      const [newRoom] = await tx
+        .insert(raceRoomsTable)
+        .values({
+          creatorId: userId,
+          title: "Quick Free Challenge",
+          type: "quick",
+          entryType: "free",
+          entryAmountCents: 0,
+          targetSteps,
+          maxPlayers,
+          currentPlayers: 1,
+        })
+        .returning();
+
+      const [newParticipant] = await tx
+        .insert(raceParticipantsTable)
+        .values({ raceRoomId: newRoom.id, userId, status: "joined" })
+        .returning();
+
+      return { newRoom, newParticipant };
+    });
+
+    if (createConflict) {
+      return res.status(409).json(regularRaceRegistrationConflictBody(createConflict, userId));
+    }
+    if (!created) {
+      return res.status(409).json({ error: "Unable to join a race." });
+    }
+
+    targetRoomId = created.newRoom.id;
+    participant = created.newParticipant;
 
     req.log.info({ raceId: targetRoomId, userId }, "user quick-joined (created) free race");
     return res.status(201).json({ raceId: targetRoomId, isHost: true });
@@ -3014,14 +3187,9 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const raceId = String(req.params.id);
 
-  const alreadyActive = await getActiveRaceForUser(userId);
-  if (alreadyActive && alreadyActive.roomId !== raceId) {
-    return res.status(409).json({
-      success: false,
-      code: "ACTIVE_RACE_EXISTS",
-      message: "You are already in an active race.",
-      active_race: activeRacePayload(alreadyActive, userId),
-    });
+  const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId, raceId);
+  if (existingRegularRace) {
+    return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
 
   const [room] = await db
@@ -3075,10 +3243,12 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   let lockedRoom: typeof raceRoomsTable.$inferSelect | null = null;
   let joinedCurrentPlayers = room.currentPlayers;
   let joinErrorStatus: number | null = null;
-  let joinErrorBody: Record<string, string> | null = null;
+  let joinErrorBody: Record<string, unknown> | null = null;
 
   try {
     await db.transaction(async (tx) => {
+      await lockRegularRaceRegistrationForUser(tx, userId);
+
       lockedRoom = await lockRaceRoom(tx, raceId);
       if (!lockedRoom) {
         joinErrorStatus = 404;
@@ -3094,6 +3264,14 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
         joinErrorStatus = 409;
         joinErrorBody = { error: "Race is full." };
         return;
+      }
+      if (lockedRoom.type !== "sponsored") {
+        const conflict = await getRegularRaceRegistrationForUser(tx, userId, raceId);
+        if (conflict) {
+          joinErrorStatus = 409;
+          joinErrorBody = regularRaceRegistrationConflictBody(conflict, userId);
+          return;
+        }
       }
 
       const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: raceId, userId });
@@ -3129,6 +3307,10 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
       if (!debit.ok) {
         throw new PaidJoinRollback(402, { error: debit.error });
       }
+      await grantReferralBonusForCashChallenge(tx, {
+        referredUserId: userId,
+        raceRoomId: raceId,
+      });
 
       joinedCurrentPlayers = newPlayerCount;
       lockedRoom = { ...lockedRoom, currentPlayers: newPlayerCount, status: deriveOpenRoomStatus(newPlayerCount, lockedRoom.maxPlayers) };
@@ -3168,14 +3350,9 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const raceId = String(req.params.id);
 
-  const alreadyActive = await getActiveRaceForUser(userId);
-  if (alreadyActive && alreadyActive.roomId !== raceId) {
-    return res.status(409).json({
-      success: false,
-      code: "ACTIVE_RACE_EXISTS",
-      message: "You are already in an active race.",
-      active_race: activeRacePayload(alreadyActive, userId),
-    });
+  const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId, raceId);
+  if (existingRegularRace) {
+    return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
 
   const [room] = await db
@@ -3212,9 +3389,11 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
   let lockedRoom: typeof raceRoomsTable.$inferSelect | null = null;
   let joinedCurrentPlayers = room.currentPlayers;
   let joinErrorStatus: number | null = null;
-  let joinErrorBody: Record<string, string | undefined> | null = null;
+  let joinErrorBody: Record<string, unknown> | null = null;
 
   await db.transaction(async (tx) => {
+    await lockRegularRaceRegistrationForUser(tx, userId);
+
     lockedRoom = await lockRaceRoom(tx, raceId);
     if (!lockedRoom) {
       joinErrorStatus = 404;
@@ -3230,6 +3409,14 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
       joinErrorStatus = 409;
       joinErrorBody = { error: "Race is full." };
       return;
+    }
+    if (lockedRoom.type !== "sponsored") {
+      const conflict = await getRegularRaceRegistrationForUser(tx, userId, raceId);
+      if (conflict) {
+        joinErrorStatus = 409;
+        joinErrorBody = regularRaceRegistrationConflictBody(conflict, userId);
+        return;
+      }
     }
 
     const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: raceId, userId });
@@ -3350,15 +3537,9 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
     return res.status(409).json({ success: false, code: "ROOM_FULL", error: "This room is full." });
   }
 
-  // Active race check
-  const alreadyActive = await getActiveRaceForUser(userId);
-  if (alreadyActive && alreadyActive.roomId !== room.id) {
-    return res.status(409).json({
-      success: false,
-      code: "ACTIVE_RACE_EXISTS",
-      message: "You are already in an active race.",
-      active_race: activeRacePayload(alreadyActive, userId),
-    });
+  const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId, room.id);
+  if (existingRegularRace) {
+    return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
 
   // Check existing participation
@@ -3481,10 +3662,12 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
   let lockedRoom: typeof raceRoomsTable.$inferSelect | null = null;
   let joinedCurrentPlayers = room.currentPlayers;
   let joinErrorStatus: number | null = null;
-  let joinErrorBody: Record<string, string | boolean> | null = null;
+  let joinErrorBody: Record<string, unknown> | null = null;
 
   try {
     await db.transaction(async (tx) => {
+      await lockRegularRaceRegistrationForUser(tx, userId);
+
       lockedRoom = await lockRaceRoom(tx, room.id);
       if (!lockedRoom) {
         joinErrorStatus = 404;
@@ -3505,6 +3688,14 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
         joinErrorStatus = 409;
         joinErrorBody = { success: false, code: "ROOM_FULL", error: "This room is full." };
         return;
+      }
+      if (lockedRoom.type !== "sponsored") {
+        const conflict = await getRegularRaceRegistrationForUser(tx, userId, lockedRoom.id);
+        if (conflict) {
+          joinErrorStatus = 409;
+          joinErrorBody = regularRaceRegistrationConflictBody(conflict, userId);
+          return;
+        }
       }
 
       const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: lockedRoom.id, userId });
@@ -3530,6 +3721,10 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
         if (!debit.ok) {
           throw new PaidJoinRollback(402, { error: debit.error });
         }
+        await grantReferralBonusForCashChallenge(tx, {
+          referredUserId: userId,
+          raceRoomId: lockedRoom.id,
+        });
       }
 
       const newPlayerCount = lockedRoom.currentPlayers + 1;

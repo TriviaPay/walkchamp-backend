@@ -1,10 +1,25 @@
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { db } from "../../db/src/index.js";
 import { profilesTable, walletsTable } from "../../db/src/schema/index.js";
 import { eq } from "drizzle-orm";
 import { getDescopeClient } from "../lib/descope.js";
-import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { requireAuth, requireJwtOnly, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { parseAndValidateDob } from "../lib/dateOfBirth.js";
+import {
+  registerOrReplaceSession,
+  revokeSession,
+  resumeSession,
+  type SessionErrorCode,
+  type DeviceInfo,
+} from "../lib/sessionService.js";
 import { z } from "zod";
+
+const SESSION_STATUS_MESSAGES: Record<SessionErrorCode, string> = {
+  SESSION_REPLACED: "This account was signed in on another device.",
+  SESSION_INVALID: "This session is no longer valid. Please sign in again.",
+  SESSION_REVOKED: "This session has been signed out. Please sign in again.",
+  SESSION_EXPIRED: "This session has expired. Please sign in again.",
+};
 
 const router = Router();
 
@@ -26,15 +41,6 @@ function isBlockedUsername(username: string): boolean {
   );
 }
 
-function calcAge(dob: string): number {
-  const birth = new Date(dob);
-  const today = new Date();
-  let age = today.getFullYear() - birth.getFullYear();
-  const m = today.getMonth() - birth.getMonth();
-  if (m < 0 || (m === 0 && today.getDate() < birth.getDate())) age--;
-  return age;
-}
-
 function getExpectedAppleAudiences(): Set<string> {
   const raw = process.env.APPLE_EXPECTED_AUDIENCES?.trim();
   const values = raw
@@ -44,8 +50,13 @@ function getExpectedAppleAudiences(): Set<string> {
 }
 
 // ── GET /api/me — authenticated: return profile for the JWT owner ─────────────
-router.get("/me", requireAuth, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
+// Resume/read hook. JWT-only (bootstrap-safe: reachable before a session exists), and pure
+// resume — it never registers a session, so a superseded device that calls /me cannot resurrect
+// itself. When the client presents X-Session-Id we report its live status alongside the profile.
+// Registration happens via POST /auth/session/register after a successful login.
+router.get("/me", requireJwtOnly, async (req, res) => {
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.descopeUserId;
 
   const [profile] = await db
     .select()
@@ -64,7 +75,103 @@ router.get("/me", requireAuth, async (req, res) => {
     .where(eq(profilesTable.id, userId))
     .catch(() => {});
 
+  // Report (do not mutate) session status when the client presented one.
+  if (authReq.sessionId) {
+    const status = await resumeSession(authReq.sessionId, userId);
+    if (status.active) {
+      return res.json({
+        profile,
+        session: {
+          active: true,
+          sessionId: status.session.sessionId,
+          sessionGeneration: status.session.sessionGeneration,
+        },
+      });
+    }
+    return res.json({ profile, session: { active: false, code: status.code } });
+  }
   return res.json({ profile });
+});
+
+// ── Session endpoints (single active session) ────────────────────────────────
+function deviceFromRequest(req: AuthenticatedRequest): DeviceInfo {
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const headerDevice = req.deviceInfo ?? {};
+  const str = (v: unknown): string | null => (typeof v === "string" && v.length > 0 ? v : null);
+  return {
+    deviceId: str(body.deviceId) ?? headerDevice.deviceId ?? null,
+    platform: str(body.platform) ?? headerDevice.platform ?? null,
+    appVersion: str(body.appVersion) ?? headerDevice.appVersion ?? null,
+    buildNumber: str(body.buildNumber) ?? headerDevice.buildNumber ?? null,
+    deviceModel: str(body.deviceModel),
+    manufacturer: str(body.manufacturer),
+    osName: str(body.osName),
+    osVersion: str(body.osVersion),
+    androidApiLevel: typeof body.androidApiLevel === "number" ? body.androidApiLevel : str(body.androidApiLevel),
+    clientSessionId: str(body.clientSessionId),
+  };
+}
+
+function sessionIdFromRequest(req: Request): string | undefined {
+  const h = req.headers["x-session-id"];
+  const headerSid = Array.isArray(h) ? h[0] : h;
+  if (headerSid) return headerSid;
+  const body = (req.body ?? {}) as { sessionId?: unknown; clientSessionId?: unknown };
+  if (typeof body.sessionId === "string") return body.sessionId;
+  if (typeof body.clientSessionId === "string") return body.clientSessionId;
+  return undefined;
+}
+
+// Login hook: call after any successful authentication (including client-side OTP/social flows).
+// JWT-only so it is reachable before the client holds a session id (avoids a bootstrap deadlock
+// once the enforcement version gate is enabled).
+router.post("/auth/session/register", requireJwtOnly, async (req, res) => {
+  const authReq = req as AuthenticatedRequest;
+  const result = await registerOrReplaceSession({
+    userId: authReq.descopeUserId,
+    descopeSessionId: authReq.descopeSessionId ?? null,
+    device: deviceFromRequest(authReq),
+    currentSessionId: sessionIdFromRequest(req) ?? null,
+  });
+  if (!result) return res.status(404).json({ error: "profile_required" });
+  return res.json({
+    sessionId: result.sessionId,
+    sessionGeneration: result.sessionGeneration,
+    replaced: result.replaced,
+    createdAt: result.createdAt,
+  });
+});
+
+// Fast app-resume check. JWT-only so a replaced session gets a 200 status body rather than being
+// blocked by the session gate. Accepts GET (X-Session-Id header) or POST ({ sessionId } body).
+async function sessionStatusHandler(req: Request, res: Response) {
+  const authReq = req as AuthenticatedRequest;
+  const sid = sessionIdFromRequest(req);
+  if (!sid) {
+    return res.json({ active: false, code: "SESSION_INVALID", message: SESSION_STATUS_MESSAGES.SESSION_INVALID });
+  }
+  const status = await resumeSession(sid, authReq.descopeUserId);
+  if (!status.active) {
+    return res.json({ active: false, code: status.code, message: SESSION_STATUS_MESSAGES[status.code] });
+  }
+  return res.json({
+    active: true,
+    sessionId: status.session.sessionId,
+    sessionGeneration: status.session.sessionGeneration,
+    createdAt: status.session.createdAt,
+  });
+}
+router.get("/auth/session/status", requireJwtOnly, sessionStatusHandler);
+router.post("/auth/session/status", requireJwtOnly, sessionStatusHandler);
+
+// Logout of the current session. Idempotent; JWT-only so an already-replaced session can still
+// clean itself up.
+router.post("/auth/session/revoke-current", requireJwtOnly, async (req, res) => {
+  const authReq = req as AuthenticatedRequest;
+  const sid = sessionIdFromRequest(req);
+  if (!sid) return res.json({ ok: true });
+  const result = await revokeSession(sid, authReq.descopeUserId, "logout");
+  return res.json({ ok: result.ok });
 });
 
 // ── GET /api/auth/username-check?username=xxx ────────────────────────────────
@@ -111,7 +218,8 @@ const createProfileSchema = z.object({
 
 type CreateProfileData = z.infer<typeof createProfileSchema>;
 
-router.post("/auth/profile", requireAuth, async (req, res) => {
+// JWT-only: onboarding runs before the client holds a session id.
+router.post("/auth/profile", requireJwtOnly, async (req, res) => {
   const authUserId = (req as AuthenticatedRequest).descopeUserId;
 
   const parse = createProfileSchema.safeParse(req.body);
@@ -138,7 +246,11 @@ router.post("/auth/profile", requireAuth, async (req, res) => {
     return res.status(409).json({ error: "username_taken" });
   }
 
-  const age = calcAge(data.dateOfBirth);
+  const dob = parseAndValidateDob(data.dateOfBirth);
+  if (!dob.ok) {
+    return res.status(400).json({ error: "invalid_date_of_birth", message: dob.message });
+  }
+  const age = dob.age;
   const isAdult = age >= 18;
   const referralCode = "WC" + Math.random().toString(36).substring(2, 8).toUpperCase();
 
@@ -150,7 +262,7 @@ router.post("/auth/profile", requireAuth, async (req, res) => {
         email: data.email.toLowerCase().trim(),
         fullName: data.fullName.trim(),
         username: data.username.toLowerCase().trim(),
-        dateOfBirth: data.dateOfBirth,
+        dateOfBirth: dob.normalized,
         age,
         country: data.country,
         countryCode: data.countryCode,
@@ -269,7 +381,8 @@ const completeSignupSchema = z.object({
   marketingOptIn: z.boolean().default(false),
 });
 
-router.post("/auth/complete-signup", requireAuth, async (req, res) => {
+// JWT-only: onboarding runs before the client holds a session id.
+router.post("/auth/complete-signup", requireJwtOnly, async (req, res) => {
   const authUserId = (req as AuthenticatedRequest).descopeUserId;
 
   const parse = completeSignupSchema.safeParse(req.body);
@@ -277,6 +390,12 @@ router.post("/auth/complete-signup", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Invalid data", details: parse.error.issues });
   }
   const data = parse.data;
+
+  // Validate DOB before any side effects (e.g. setting the Descope password).
+  const dob = parseAndValidateDob(data.dateOfBirth);
+  if (!dob.ok) {
+    return res.status(400).json({ error: "invalid_date_of_birth", message: dob.message });
+  }
 
   // Resolve the user's loginId (email) from Descope using the verified userId
   const client = getDescopeClient();
@@ -311,7 +430,7 @@ router.post("/auth/complete-signup", requireAuth, async (req, res) => {
     return res.status(409).json({ error: "username_taken" });
   }
 
-  const age = calcAge(data.dateOfBirth);
+  const age = dob.age;
   const isAdult = age >= 18;
   const referralCode = "WC" + Math.random().toString(36).substring(2, 8).toUpperCase();
 
@@ -324,7 +443,7 @@ router.post("/auth/complete-signup", requireAuth, async (req, res) => {
           email: loginId.toLowerCase().trim(),
           fullName: data.fullName.trim(),
           username: data.username.toLowerCase().trim(),
-          dateOfBirth: data.dateOfBirth,
+          dateOfBirth: dob.normalized,
           age,
           country: data.country,
           countryCode: data.countryCode,

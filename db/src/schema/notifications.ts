@@ -59,6 +59,10 @@ export const notificationDevicesTable = pgTable(
     platform: text("platform").notNull().default("unknown"),
     deviceModel: text("device_model"),
     appVersion: text("app_version"),
+    // Associates this push registration with the backend session/device that
+    // registered it. Informational/audit only — never used for authorization.
+    deviceId: text("device_id"),
+    sessionId: text("session_id"),
     active: boolean("active").notNull().default(true),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

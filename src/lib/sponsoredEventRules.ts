@@ -2,6 +2,7 @@ export const SPONSORED_EVENT_ENTRY_COINS = 5000;
 export const SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS = 500;
 export const SPONSORED_EVENT_TARGET_STEPS = 10000;
 export const SPONSORED_EVENT_MAX_SLOTS = 10;
+export const SPONSORED_EVENT_MIN_PLAYERS_TO_START = 1;
 
 export function getSponsoredWinnerCount(playerCount: number): number {
   if (playerCount <= 0) return 0;

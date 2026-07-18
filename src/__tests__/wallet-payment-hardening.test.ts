@@ -53,6 +53,30 @@ describe("wallet payment hardening", () => {
     expect(refundService).toContain("CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY");
   });
 
+  it("credits referral bonuses only after the referred user's first cash challenge entry", () => {
+    const referralService = readFileSync("src/lib/referralBonusService.ts", "utf8");
+    const racesRoute = readFileSync("src/routes/races.ts", "utf8");
+    const referralSchema = readFileSync("db/src/schema/referrals.ts", "utf8");
+    const migration = readFileSync("db/migrations/0014_referral_bonus_awards.sql", "utf8");
+
+    expect(referralSchema).toContain("referral_bonus_awards");
+    expect(referralSchema).toContain("referral_bonus_awards_referred_user_unique_idx");
+    expect(migration).toContain("CREATE TABLE IF NOT EXISTS \"referral_bonus_awards\"");
+    expect(migration).toContain("referral_bonus_awards_referred_user_unique_idx");
+
+    expect(referralService).toContain("REFERRAL_BONUS_CENTS = 300");
+    expect(referralService).toContain("transactionType: \"referral_credit\"");
+    expect(referralService).toContain("description: REFERRER_REFERRAL_BONUS_DESCRIPTION");
+    expect(referralService).toContain("description: REFERRED_REFERRAL_BONUS_DESCRIPTION");
+    expect(referralService).toContain("referral_bonus:referrer:${input.referredUserId}");
+    expect(referralService).toContain("referral_bonus:referred:${input.referredUserId}");
+    expect(referralService).toContain("paidEntryCount !== 1");
+    expect(referralService).toContain("action: \"referral_bonus_credited\"");
+
+    expect(racesRoute).toContain("grantReferralBonusForCashChallenge");
+    expect((racesRoute.match(/grantReferralBonusForCashChallenge/g) ?? []).length).toBeGreaterThanOrEqual(5);
+  });
+
   it("hardens Razorpay checkout signatures, create-order idempotency, and manual capture", () => {
     const depositRoute = readFileSync("src/routes/deposit.ts", "utf8");
     const settlementService = readFileSync("src/lib/depositSettlement.ts", "utf8");
