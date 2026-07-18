@@ -18,17 +18,23 @@ import { logger } from "../lib/logger.js";
 import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration, registerOrReviveScheduledRegistration } from "../lib/raceIntegrity.js";
 import { notifyPromotionalSponsoredEvent } from "../lib/pushNotificationService.js";
 import { createPendingSponsoredGiftCardAwards } from "../lib/sponsoredGiftCards.js";
+import {
+  getSponsoredPrizePoolCents,
+  getSponsoredWinnerCount,
+  SPONSORED_EVENT_ENTRY_COINS,
+  SPONSORED_EVENT_MAX_SLOTS,
+  SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS,
+  SPONSORED_EVENT_TARGET_STEPS,
+} from "../lib/sponsoredEventRules.js";
 
 const router = Router();
 
 // ── Constants ──────────────────────────────────────────────────────────────────
-const ENTRY_COINS = 5000;
-const PRIZE_CENTS = 1000;          // $10 total pool
-const WINNER_COUNT = 2;            // Top 2 winners
-const PRIZE_PER_WINNER_CENTS = 500; // $5 Amazon gift card per winner (tie → split equally)
-const TARGET_STEPS = 10000;
-const MAX_SLOTS = 10;
-const MIN_PARTICIPANTS = 2;
+const ENTRY_COINS = SPONSORED_EVENT_ENTRY_COINS;
+const PRIZE_PER_WINNER_CENTS = SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS;
+const TARGET_STEPS = SPONSORED_EVENT_TARGET_STEPS;
+const MAX_SLOTS = SPONSORED_EVENT_MAX_SLOTS;
+const MIN_PLAYERS_TO_START = 1;
 // America/Chicago CDT (UTC-5 in summer). Adjust to UTC-6 in winter if needed.
 const TZ_OFFSET_HOURS = -5;
 const PUSHER_CHANNEL = "public-sponsored-events";
@@ -134,7 +140,7 @@ async function autoFillSchedule(): Promise<void> {
       status: "scheduled",
       scheduleType: "scheduled",
       scheduledStartAt: startAt,
-      prizePoolCents: PRIZE_CENTS,
+      prizePoolCents: getSponsoredPrizePoolCents(MAX_SLOTS),
       inviteCode,
       isPrivate: false,
       trackLayout: pickTrackLayout(ev.day, ev.date),
@@ -198,8 +204,7 @@ async function processSponsuredEvents() {
       logger.info({ roomId: room.id, count: paidUserIds.length }, "[SponsoredEventsJob] all registered users pre-paid");
 
       // ── Require at least 1 registered player before starting ──
-      const MIN_PLAYERS = 1;
-      if (paidUserIds.length < MIN_PLAYERS) {
+      if (paidUserIds.length < MIN_PLAYERS_TO_START) {
         logger.info({ roomId: room.id, count: paidUserIds.length }, "[SponsoredEventsJob] skipped — no players registered");
         continue;
       }
@@ -288,7 +293,7 @@ async function processSponsuredEvents() {
         sendPushToUser(
           uid,
           "🏆 Sponsored Race Started!",
-          `${room.title} has started! Compete for the $${(PRIZE_CENTS / 100).toFixed(0)} prize pool.`,
+          `${room.title} has started! Compete for a $${(PRIZE_PER_WINNER_CENTS / 100).toFixed(0)} gift card.`,
           { type: "sponsored_event_started", room_id: room.id },
         );
       }
@@ -339,11 +344,12 @@ async function finalizeSponsoredEvents(now: Date) {
       .where(eq(raceParticipantsTable.raceRoomId, room.id));
 
     // Identify winners (reached target steps)
+    const winnerCount = getSponsoredWinnerCount(parts.length);
     const winnerIds = new Set(
       parts
         .filter((p) => p.finishedGoal && p.finishedAt)
         .sort((a, b) => (a.finishedAt?.getTime() ?? 0) - (b.finishedAt?.getTime() ?? 0))
-        .slice(0, WINNER_COUNT)
+        .slice(0, winnerCount)
         .map((p) => p.userId),
     );
     await createPendingSponsoredGiftCardAwards({
@@ -371,7 +377,14 @@ async function finalizeSponsoredEvents(now: Date) {
     // Mark room completed
     await db
       .update(raceRoomsTable)
-      .set({ status: "completed", completedAt: now, updatedAt: now })
+      .set({
+        status: "completed",
+        completedAt: now,
+        updatedAt: now,
+        winnerCount,
+        winnersPoolCents: winnerIds.size * PRIZE_PER_WINNER_CENTS,
+        unawardedAmountCents: Math.max(0, getSponsoredPrizePoolCents(parts.length) - winnerIds.size * PRIZE_PER_WINNER_CENTS),
+      })
       .where(eq(raceRoomsTable.id, room.id));
 
     // Mark participants inactive
@@ -575,6 +588,10 @@ export async function getSponsoredEventsForUser(
   }
 
   const events = rooms.map((r) => {
+    const playerCountForPrize = r.status === "in_progress" || r.status === "completed"
+      ? r.currentPlayers
+      : r.registeredCount;
+    const winnerCount = getSponsoredWinnerCount(playerCountForPrize);
     // Compute when the race ends (3 hours from start / scheduled start)
     const endsAtDate = r.status === "in_progress" && r.startedAt
       ? new Date(r.startedAt.getTime() + RACE_DURATION_MS)
@@ -598,12 +615,12 @@ export async function getSponsoredEventsForUser(
       scheduledStartAt: r.scheduledStartAt?.toISOString() ?? null,
       startedAt: r.startedAt?.toISOString() ?? null,
       endsAt: endsAtDate?.toISOString() ?? null,
-      targetSteps: r.targetSteps,
+      targetSteps: TARGET_STEPS,
       maxSlots: r.maxPlayers,
       registeredCount: r.registeredCount,
-      prizePoolCents: r.prizePoolCents,
+      prizePoolCents: getSponsoredPrizePoolCents(playerCountForPrize),
       prizePerWinnerCents: PRIZE_PER_WINNER_CENTS,
-      winnerCount: WINNER_COUNT,
+      winnerCount,
       entryCoinFee: ENTRY_COINS,
       isRegistered: myRegRoomIds.has(r.id),
       isActive: myActiveRoomIds.has(r.id),
@@ -705,7 +722,7 @@ router.post("/sponsored-events/generate-weekend", requireAuth, requireAdminKey, 
         status: "scheduled",
         scheduleType: "scheduled",
         scheduledStartAt: startAt,
-        prizePoolCents: PRIZE_CENTS,
+        prizePoolCents: getSponsoredPrizePoolCents(MAX_SLOTS),
         inviteCode,
         isPrivate: false,
         trackLayout: pickTrackLayout(ev.day, ev.date),
@@ -1031,12 +1048,13 @@ router.post("/sponsored-events/:roomId/steps/sync", requireAuth, async (req, res
       ? latestDeviceSteps
       : existingBaseline;
 
+    const targetSteps = TARGET_STEPS;
     const rawProgress = latestDeviceSteps - baseline;
     const calculated = Math.max(0, rawProgress);
-    const clamped = Math.min(calculated, room.targetSteps ?? TARGET_STEPS);
+    const clamped = Math.min(calculated, targetSteps);
     const newProgress = Math.max(participant.currentSteps, clamped);
 
-    const justFinished = newProgress >= (room.targetSteps ?? TARGET_STEPS) && !participant.finishedGoal;
+    const justFinished = newProgress >= targetSteps && !participant.finishedGoal;
 
     await db.update(raceParticipantsTable)
       .set({
@@ -1066,7 +1084,7 @@ router.post("/sponsored-events/:roomId/steps/sync", requireAuth, async (req, res
         raceProgressSteps: newProgress,
         raceBaselineSteps: baseline,
         latestDeviceSteps,
-        targetSteps: room.targetSteps ?? TARGET_STEPS,
+        targetSteps,
         finished: justFinished,
       },
     });
@@ -1112,7 +1130,7 @@ router.get("/sponsored-events/:roomId/results", requireAuth, async (req, res) =>
       .filter((p) => p.finishedGoal && p.finishedAt)
       .sort((a, b) => (a.finishedAt?.getTime() ?? 0) - (b.finishedAt?.getTime() ?? 0));
 
-    const winnerCount = parts.length === 1 ? 1 : WINNER_COUNT;
+    const winnerCount = getSponsoredWinnerCount(parts.length);
     const winners = finishers.slice(0, winnerCount);
     const winnerIds = new Set(winners.map((w) => w.userId));
 
@@ -1122,8 +1140,10 @@ router.get("/sponsored-events/:roomId/results", requireAuth, async (req, res) =>
         id: room.id,
         title: room.title,
         status: room.status,
-        targetSteps: room.targetSteps,
-        prizePoolCents: room.prizePoolCents,
+        targetSteps: TARGET_STEPS,
+        prizePoolCents: getSponsoredPrizePoolCents(parts.length),
+        prizePerWinnerCents: PRIZE_PER_WINNER_CENTS,
+        winnerCount,
         startedAt: room.startedAt?.toISOString() ?? null,
         endsAt: endsAt?.toISOString() ?? null,
       },
@@ -1161,8 +1181,8 @@ router.patch("/sponsored-events/:roomId/target-steps", requireAuth, async (req, 
     const roomId = String(req.params.roomId);
     const { targetSteps } = req.body as { targetSteps?: number };
 
-    if (typeof targetSteps !== "number" || targetSteps < 1) {
-      return res.status(400).json({ error: "targetSteps must be a positive number." });
+    if (typeof targetSteps !== "number" || targetSteps !== TARGET_STEPS) {
+      return res.status(400).json({ error: `Sponsored event target steps must be ${TARGET_STEPS}.` });
     }
 
     const [room] = await db.select().from(raceRoomsTable)

@@ -22,7 +22,7 @@ import {
   cashChallengeConsentsTable,
   raceTrackThemesTable,
 } from "../../db/src/schema/index.js";
-import { eq, and, desc, asc, sql, ne, inArray, or, notExists } from "drizzle-orm";
+import { eq, and, desc, asc, sql, ne, inArray, or } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
 import { randomBytes } from "crypto";
@@ -70,6 +70,12 @@ import {
 } from "../lib/refundService.js";
 import { buildTrackThemeMedia, TRACK_THEME_CODES, type TrackThemeMedia } from "../lib/trackThemeMedia.js";
 import { createPendingSponsoredGiftCardAwards } from "../lib/sponsoredGiftCards.js";
+import {
+  getSponsoredPrizePoolCents,
+  getSponsoredWinnerCount,
+  SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS,
+  SPONSORED_EVENT_TARGET_STEPS,
+} from "../lib/sponsoredEventRules.js";
 
 const router = Router();
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -580,21 +586,49 @@ function assignPayoutsWithTies(
   return results;
 }
 
-// Shared auto-complete logic used by the 60s timer, early-winner trigger, and force-complete endpoint.
-// For sponsored events: prizes only go to participants who finished the goal (finishedAt !== null).
-// Max 2 winners. If finisherCount === 0, no prize is awarded.
-function buildSponsoredPrizeSlots(prizePoolCents: number, finisherCount: number): Array<{ rank: number; amountCents: number }> {
-  if (prizePoolCents <= 0 || finisherCount === 0) return [];
-  const winnerCount = Math.min(2, finisherCount); // max 2 winners for sponsored events
-  const perWinner = Math.floor(prizePoolCents / winnerCount);
+// Shared auto-complete logic used by the timer, forfeit path, and force-complete endpoint.
+// For sponsored events: 1-2 players -> 1 winner, 3-10 players -> 2 winners.
+// Only participants who finished the goal can receive gift-card awards.
+function buildSponsoredPrizeSlots(playerCount: number, finisherCount: number): Array<{ rank: number; amountCents: number }> {
+  if (finisherCount === 0) return [];
+  const winnerCount = Math.min(getSponsoredWinnerCount(playerCount), finisherCount);
   const slots: Array<{ rank: number; amountCents: number }> = [];
-  let remaining = prizePoolCents;
   for (let i = 1; i <= winnerCount; i++) {
-    const amount = i === winnerCount ? remaining : perWinner;
-    slots.push({ rank: i, amountCents: amount });
-    remaining -= perWinner;
+    slots.push({ rank: i, amountCents: SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS });
   }
   return slots;
+}
+
+function assignSponsoredGiftCardPayouts(
+  participants: TieParticipant[],
+  playerCount: number,
+): TiePayoutResult[] {
+  const winnerCount = getSponsoredWinnerCount(playerCount);
+  const sorted = [...participants].sort((a, b) => {
+    if (a.finishedAt && b.finishedAt) return a.finishedAt.getTime() - b.finishedAt.getTime();
+    if (a.finishedAt) return -1;
+    if (b.finishedAt) return 1;
+    return b.finalSteps - a.finalSteps;
+  });
+
+  return sorted.map((p, index) => {
+    const rank = index + 1;
+    const eligibleForPrize = p.finishedAt !== null && rank <= winnerCount;
+    return {
+      userId: p.userId,
+      rank,
+      displayRank: rank,
+      isTied: false,
+      tieGroupId: "",
+      tieGroupSize: 1,
+      prizeCents: eligibleForPrize ? SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS : 0,
+      eligibleForPrize,
+    };
+  });
+}
+
+function targetStepsForRoom(room: Pick<typeof raceRoomsTable.$inferSelect, "type" | "targetSteps">): number {
+  return room.type === "sponsored" ? SPONSORED_EVENT_TARGET_STEPS : room.targetSteps;
 }
 
 async function autoCompleteRace(raceId: string, endedReason = "time_expired"): Promise<void> {
@@ -711,7 +745,8 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   });
 
   const isSponsored = room.type === "sponsored";
-  const sponsoredPrizeCents = isSponsored ? (room.prizePoolCents ?? 0) : 0;
+  const sponsoredPlayerCount = uniqueParticipants.length;
+  const sponsoredPrizeCents = isSponsored ? getSponsoredPrizePoolCents(sponsoredPlayerCount) : 0;
   const { winners: winnersPoolCents, total: totalPoolCents } = isSponsored && sponsoredPrizeCents > 0
     ? { winners: sponsoredPrizeCents, total: sponsoredPrizeCents }
     : calcPrizePool(room.entryAmountCents, uniqueParticipants.length);
@@ -725,7 +760,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
 
   // ── Build integer-cent reward slots ─────────────────────────────────────────
   const rewardSlots = isSponsored && sponsoredPrizeCents > 0
-    ? buildSponsoredPrizeSlots(sponsoredPrizeCents, sponsoredFinishers.length)
+    ? buildSponsoredPrizeSlots(sponsoredPlayerCount, sponsoredFinishers.length)
     : buildRewardSplitCents(room.entryAmountCents, uniqueParticipants.length);
 
   // ── Tie-aware payout assignment ──────────────────────────────────────────────
@@ -744,7 +779,9 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     raceId, rewardSlots, tieParticipants.length,
   );
 
-  const payouts = assignPayoutsWithTies(tieParticipants, rewardSlots);
+  const payouts = isSponsored
+    ? assignSponsoredGiftCardPayouts(tieParticipants, sponsoredPlayerCount)
+    : assignPayoutsWithTies(tieParticipants, rewardSlots);
 
   // Log tie groups
   const stepGroupMap = new Map<number, string[]>();
@@ -882,7 +919,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
           winnersPoolCents,
           platformFeeCents: platformFeeCentsVal,
           rewardSplitJson: rewardSplitForRoom as unknown as null,
-          winnerCount: numWinners(uniqueParticipants.length),
+          winnerCount: isSponsored ? getSponsoredWinnerCount(uniqueParticipants.length) : numWinners(uniqueParticipants.length),
           unawardedAmountCents,
           payoutFinalizedAt,
           ...(room.entryType === "coins_battle" && {
@@ -980,9 +1017,10 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   logger.info({ raceId }, "[RaceFinalize] race_id: %s", raceId);
   logger.info({ raceId, challengeType: room.entryType }, "[RaceFinalize] challenge_type: %s", room.entryType);
   logger.info({ raceId, participantCount: uniqueParticipants.length }, "[RaceFinalize] participant_count: %d", uniqueParticipants.length);
-  logger.info({ raceId, winnerCount: numWinners(uniqueParticipants.length) }, "[RaceFinalize] winner_count: %d", numWinners(uniqueParticipants.length));
-  logger.info({ raceId, finishedUsers: resultRows.filter((r) => r.rank <= numWinners(uniqueParticipants.length)).map((r) => r.userId) }, "[RaceFinalize] finished_users: %j", resultRows.map((r) => r.userId));
-  logger.info({ raceId, winnerSlotsFinalized: numWinners(uniqueParticipants.length) }, "[RaceFinalize] winner_slots_finalized: %d", numWinners(uniqueParticipants.length));
+  const finalWinnerCount = isSponsored ? getSponsoredWinnerCount(uniqueParticipants.length) : numWinners(uniqueParticipants.length);
+  logger.info({ raceId, winnerCount: finalWinnerCount }, "[RaceFinalize] winner_count: %d", finalWinnerCount);
+  logger.info({ raceId, finishedUsers: resultRows.filter((r) => r.rank <= finalWinnerCount).map((r) => r.userId) }, "[RaceFinalize] finished_users: %j", resultRows.map((r) => r.userId));
+  logger.info({ raceId, winnerSlotsFinalized: finalWinnerCount }, "[RaceFinalize] winner_slots_finalized: %d", finalWinnerCount);
   logger.info({ raceId, tieGroups: uniqueTieGroups }, "[RaceFinalize] tie_groups: %j", uniqueTieGroups);
   logger.info({ raceId, rewardType }, "[RaceFinalize] reward_type: %s", rewardType);
   logger.info({ raceId, rewardAssignments: resultRows.map((r) => ({ userId: r.userId, rank: r.rank, prize: r.prizeCents })) }, "[RaceFinalize] reward_assignments: %j", resultRows);
@@ -1011,7 +1049,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
       if (!r.eligibleForPrize && r.status === "disqualified_simulation") continue;
       // Race-win coins: only for top N winners AND 1k-step-goal races
       if (r.rank <= winnerSlots) {
-        const code = getRaceWinRewardCode(room.entryType, r.rank, room.targetSteps);
+        const code = getRaceWinRewardCode(room.entryType, r.rank, targetStepsForRoom(room));
         if (code) {
           const raceLabel = RACE_LABEL[room.entryType] ?? "race";
           const rankLabel = RANK_LABEL[r.rank] ?? `${r.rank}th`;
@@ -1056,7 +1094,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     })().catch((err) => logger.error({ raceId, err }, "autoCompleteRace: coins_battle payout failed"));
   }
 
-  const winnerCount = numWinners(uniqueParticipants.length);
+  const winnerCount = finalWinnerCount;
   const resultsPayload = resultRows.map((r) => {
     const tp = tieParticipants.find((p) => p.userId === r.userId);
     return {
@@ -1108,12 +1146,13 @@ async function checkPaidEligibility(userId: string, res: ReturnType<Router["get"
   return true; // simplified — full checks in POST /races
 }
 
-// ── Shared helper: find an active race the user is currently participating in ─
+// ── Shared helper: find an active non-sponsored race the user is currently participating in ─
 async function getActiveRaceForUser(userId: string) {
   const [row] = await db
     .select({
       roomId: raceRoomsTable.id,
       roomStatus: raceRoomsTable.status,
+      type: raceRoomsTable.type,
       entryType: raceRoomsTable.entryType,
       entryAmountCents: raceRoomsTable.entryAmountCents,
       targetSteps: raceRoomsTable.targetSteps,
@@ -1133,7 +1172,10 @@ async function getActiveRaceForUser(userId: string) {
         inArray(raceParticipantsTable.status, ["joined", "active"]),
       ),
     )
-    .where(inArray(raceRoomsTable.status, ["open", "full", "in_progress"]))
+    .where(and(
+      inArray(raceRoomsTable.status, ["open", "full", "in_progress"]),
+      ne(raceRoomsTable.type, "sponsored"),
+    ))
     .orderBy(desc(raceRoomsTable.createdAt))
     .limit(1);
   return row ?? null;
@@ -1147,9 +1189,11 @@ function activeRacePayload(
   return {
     room_id: row.roomId,
     room_status: row.roomStatus,
+    room_type: row.type,
+    is_sponsored: row.type === "sponsored",
     challenge_type: row.entryType,
     entry_fee: row.entryAmountCents / 100,
-    target_steps: row.targetSteps,
+    target_steps: targetStepsForRoom(row),
     current_user_role: row.creatorId === userId ? "host" : "participant",
     can_leave: true,
     next_screen: row.roomStatus === "in_progress" ? "race_track" : "waiting_room",
@@ -1214,6 +1258,7 @@ export async function getChallengeCardsForUser(userId: string) {
       and(
         inArray(raceRoomsTable.entryType, ["free", "paid_1", "paid_3", "paid_5", "coins_battle"]),
         inArray(raceRoomsTable.status, ["open", "in_progress"]),
+        ne(raceRoomsTable.type, "sponsored"),
         eq(raceRoomsTable.isPrivate, false),
       ),
     )
@@ -1240,6 +1285,7 @@ export async function getChallengeCardsForUser(userId: string) {
         .select({
           id: raceRoomsTable.id,
           status: raceRoomsTable.status,
+          type: raceRoomsTable.type,
           creatorId: raceRoomsTable.creatorId,
           currentPlayers: raceRoomsTable.currentPlayers,
           maxPlayers: raceRoomsTable.maxPlayers,
@@ -1258,14 +1304,7 @@ export async function getChallengeCardsForUser(userId: string) {
           and(
             eq(raceRoomsTable.entryType, et),
             inArray(raceRoomsTable.status, ["open", "full", "in_progress"]),
-            // Sponsored-event rooms must not appear as HOSTING/RACING on regular
-            // challenge cards — the user can't host a sponsored event.
-            notExists(
-              db
-                .select({ one: sql`1` })
-                .from(scheduledRoomRegistrationsTable)
-                .where(eq(scheduledRoomRegistrationsTable.raceRoomId, raceRoomsTable.id)),
-            ),
+            ne(raceRoomsTable.type, "sponsored"),
           ),
         )
         .orderBy(desc(raceRoomsTable.createdAt))
@@ -1286,7 +1325,7 @@ export async function getChallengeCardsForUser(userId: string) {
             raceId: room.id,
             isHost, isParticipant: true,
             joinedCount: room.currentPlayers, maxPlayers: room.maxPlayers,
-            targetSteps: room.targetSteps,
+            targetSteps: targetStepsForRoom(room),
             canHost: false, canJoin: false, isActive: true, isFinished: false,
             label: isHost ? "Hosting · Active" : "My Race · Active",
             liveCount: lc, waitingCount: wc, canHostNew: false,
@@ -1300,7 +1339,7 @@ export async function getChallengeCardsForUser(userId: string) {
           raceId: room.id,
           isHost, isParticipant: true,
           joinedCount: room.currentPlayers, maxPlayers: room.maxPlayers,
-          targetSteps: room.targetSteps,
+          targetSteps: targetStepsForRoom(room),
           canHost: false, canJoin: false, isActive: false, isFinished: false,
           label: isHost
             ? `Hosting · ${room.currentPlayers}/${room.maxPlayers}`
@@ -1321,6 +1360,7 @@ export async function getChallengeCardsForUser(userId: string) {
           and(
             eq(raceRoomsTable.entryType, et),
             inArray(raceRoomsTable.status, ["open", "full"]),
+            ne(raceRoomsTable.type, "sponsored"),
             eq(raceRoomsTable.isPrivate, false),
             sql`${raceRoomsTable.currentPlayers} < ${raceRoomsTable.maxPlayers}`,
           ),
@@ -1657,7 +1697,7 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
       entry_fee: r.entryAmountCents / 100,
       currency: "USD",
       title: r.title,
-      target_steps: r.targetSteps,
+      target_steps: targetStepsForRoom(r),
       max_players: r.maxPlayers,
       current_players: r.currentPlayers,
       available_slots: r.maxPlayers - r.currentPlayers,
@@ -2646,7 +2686,7 @@ router.get("/races", requireAuth, async (req, res) => {
           avatarUrl: r.avatarUrl ?? null,
           avatarVersion: r.updatedAt?.getTime() ?? 0,
           currentSteps: r.steps,
-          targetSteps: room.targetSteps,
+          targetSteps: targetStepsForRoom(room),
           rank: r.rank,
           isHost: r.userId === room.creatorId,
           prizeAmount: (r.prizeCents ?? 0) > 0 ? r.prizeCents! / 100 : undefined,
@@ -2687,7 +2727,7 @@ router.get("/races", requireAuth, async (req, res) => {
           avatarUrl: p.avatarUrl ?? null,
           avatarVersion: p.updatedAt?.getTime() ?? 0,
           currentSteps: p.currentSteps,
-          targetSteps: room.targetSteps,
+          targetSteps: targetStepsForRoom(room),
           rank: i + 1,
           isHost: p.userId === room.creatorId,
         }));
@@ -2697,7 +2737,8 @@ router.get("/races", requireAuth, async (req, res) => {
       const splits = getPrizeSplits(room.currentPlayers);
       const prizeTiers = splits.map((s) => parseFloat(((winnersPoolCents / 100) * s).toFixed(2)));
       const rewardSplit = buildRewardSplit(room.entryAmountCents, room.currentPlayers);
-      const winnerCount = numWinners(room.currentPlayers);
+      const winnerCount = room.type === "sponsored" ? getSponsoredWinnerCount(room.currentPlayers) : numWinners(room.currentPlayers);
+      const displayPrizePoolCents = room.type === "sponsored" ? getSponsoredPrizePoolCents(room.currentPlayers) : (room.prizePoolCents ?? 0);
       const trackTheme = trackThemeForCode(room.trackLayout, trackThemeMediaMap);
       const challengeTime = buildChallengeTimeFields(room);
 
@@ -2709,11 +2750,11 @@ router.get("/races", requireAuth, async (req, res) => {
         entryAmountCents: room.entryAmountCents,
         playerCount: room.currentPlayers,
         maxPlayers: room.maxPlayers,
-        targetSteps: room.targetSteps,
+        targetSteps: targetStepsForRoom(room),
         status: room.status,
         prizePool: prizeTotal / 100,
-        prizePoolCents: room.prizePoolCents ?? 0,
-        winnersPool: winnersPoolCents / 100,
+        prizePoolCents: displayPrizePoolCents,
+        winnersPool: room.type === "sponsored" ? displayPrizePoolCents / 100 : winnersPoolCents / 100,
         platformFee: 0,
         prizeTiers,
         rewardSplit,
@@ -3916,7 +3957,8 @@ router.get("/races/:id", requireAuth, async (req, res) => {
   const splits = getPrizeSplits(room.currentPlayers);
   const prizeTiers = splits.map((s) => parseFloat(((winnersPoolCents / 100) * s).toFixed(2)));
   const rewardSplit = buildRewardSplit(room.entryAmountCents, room.currentPlayers);
-  const winnerCount = numWinners(room.currentPlayers);
+  const winnerCount = room.type === "sponsored" ? getSponsoredWinnerCount(room.currentPlayers) : numWinners(room.currentPlayers);
+  const displayPrizePoolCents = room.type === "sponsored" ? getSponsoredPrizePoolCents(room.currentPlayers) : room.prizePoolCents;
 
   // Tie summary — derived from stored participant results for completed races
   const tieRulesApplied = room.status === "completed" && participantRows.some((p) => p.isTied);
@@ -3935,9 +3977,11 @@ router.get("/races/:id", requireAuth, async (req, res) => {
       trackTheme,
       imageSet: trackTheme.imageSet,
       trackThemeImageSet: trackTheme.imageSet,
+      targetSteps: targetStepsForRoom(room),
       entryAmountDollars: room.entryAmountCents / 100,
-      prizePool: prizeTotal / 100,
-      winnersPool: winnersPoolCents / 100,
+      prizePool: room.type === "sponsored" ? displayPrizePoolCents / 100 : prizeTotal / 100,
+      prizePoolCents: displayPrizePoolCents,
+      winnersPool: room.type === "sponsored" ? displayPrizePoolCents / 100 : winnersPoolCents / 100,
       platformFee: 0,
       prizeTiers,
       rewardSplit,
@@ -4143,7 +4187,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
   }
 
   let newSteps = Math.max(participantData.currentSteps, Math.floor(steps));
-  const targetSteps = room?.targetSteps ?? 0;
+  const targetSteps = room ? targetStepsForRoom(room) : 0;
 
   // ── Baseline registration + backend-derived step recovery ──────────────────
   // When deviceTotalSteps is included in the sync payload:
@@ -4405,7 +4449,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
 router.get("/races/:id/leaderboard", requireAuth, async (req, res) => {
   const raceId = String(req.params.id);
   const [room] = await db
-    .select({ status: raceRoomsTable.status, targetSteps: raceRoomsTable.targetSteps, challengeEndAt: raceRoomsTable.challengeEndAt })
+    .select({ status: raceRoomsTable.status, type: raceRoomsTable.type, targetSteps: raceRoomsTable.targetSteps, challengeEndAt: raceRoomsTable.challengeEndAt })
     .from(raceRoomsTable)
     .where(eq(raceRoomsTable.id, raceId))
     .limit(1);
@@ -4420,7 +4464,7 @@ router.get("/races/:id/leaderboard", requireAuth, async (req, res) => {
     success: true,
     raceId,
     raceStatus: room.status,
-    goalSteps: room.targetSteps,
+    goalSteps: targetStepsForRoom(room),
     timeLeftSeconds,
     leaderboard,
     updatedAt: new Date().toISOString(),
@@ -4944,7 +4988,7 @@ router.post("/races/:id/invites", requireAuth, async (req, res) => {
     inviterAvatarUrl: hostProfile?.avatarUrl ?? null,
     challengeType: `${challengeLabel} Challenge`,
     entryAmountCents: room.entryAmountCents,
-    targetSteps: room.targetSteps,
+    targetSteps: targetStepsForRoom(room),
     isPrivate: room.isPrivate,
     inviteCode: room.isPrivate ? room.inviteCode : null,
     expiresAt: expiresAt.toISOString(),
@@ -5022,7 +5066,7 @@ router.post("/races/invites/:inviteId/respond", requireAuth, async (req, res) =>
       room: room ? {
         id: room.id,
         entryAmountCents: room.entryAmountCents,
-        targetSteps: room.targetSteps,
+        targetSteps: targetStepsForRoom(room),
         maxPlayers: room.maxPlayers,
         isPrivate: room.isPrivate,
         entryType: room.entryType,

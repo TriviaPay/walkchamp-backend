@@ -131,7 +131,9 @@ describe("wallet payment hardening", () => {
     expect(helper).toContain("createPendingSponsoredGiftCardAwards");
     expect(helper).toContain(".onConflictDoNothing()");
     expect(sponsoredEventsRoute).toContain("source: \"sponsored_event_finalizer\"");
+    expect(sponsoredEventsRoute).toContain("getSponsoredWinnerCount(parts.length)");
     expect(racesRoute).toContain("source: \"race_auto_completion\"");
+    expect(racesRoute).toContain("assignSponsoredGiftCardPayouts");
     expect(adminRoute).toContain("/admin/sponsored-gift-card-awards");
     expect(adminRoute).toContain("redactGiftCardAward");
     expect(adminRoute).toContain("sponsored_gift_card_fulfilled");
