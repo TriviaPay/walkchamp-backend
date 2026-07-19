@@ -96,6 +96,10 @@ const REGULAR_RACE_REGISTRATION_EXISTS_CODE = "REGULAR_RACE_REGISTRATION_EXISTS"
 const REGULAR_RACE_REGISTRATION_EXISTS_TITLE = "Already Registered";
 const REGULAR_RACE_REGISTRATION_EXISTS_MESSAGE =
   "You are already registered for another race. Please withdraw from or complete your current race before registering for a new one.";
+const FUTURE_ROOM_CREATION_EXISTS_CODE = "FUTURE_ROOM_CREATION_EXISTS";
+const FUTURE_ROOM_CREATION_EXISTS_TITLE = "Cannot create room";
+const FUTURE_ROOM_CREATION_EXISTS_MESSAGE =
+  "You already have a scheduled room. You can create a new future room only after your current scheduled room has been completed, cancelled, or closed.";
 
 // ── In-memory spectator tracking (resets on server restart) ──────────────────
 const spectatorSeen = new Map<string, Map<string, number>>();
@@ -1178,6 +1182,16 @@ type RegularRaceRegistrationRow = {
 
 type RegistrationDb = typeof db | DbTx;
 
+type FutureScheduledRoomRow = {
+  roomId: string;
+  roomStatus: typeof raceRoomsTable.$inferSelect.status;
+  type: typeof raceRoomsTable.$inferSelect.type;
+  entryType: typeof raceRoomsTable.$inferSelect.entryType;
+  creatorId: string;
+  scheduledStartAt: Date | null;
+  challengeEndAt: Date | null;
+};
+
 async function lockRegularRaceRegistrationForUser(tx: DbTx, userId: string): Promise<void> {
   await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`regular_race_registration:${userId}`}, 0))`);
 }
@@ -1259,6 +1273,63 @@ async function getRegularRaceRegistrationForUser(
   return registration ?? null;
 }
 
+async function getActiveFutureScheduledRoomForUser(
+  dbOrTx: RegistrationDb,
+  userId: string,
+  excludeRoomId?: string,
+): Promise<FutureScheduledRoomRow | null> {
+  const now = new Date();
+  const excludeCurrentRoom = excludeRoomId ? ne(raceRoomsTable.id, excludeRoomId) : undefined;
+
+  const [registration] = await dbOrTx
+    .select({
+      roomId: raceRoomsTable.id,
+      roomStatus: raceRoomsTable.status,
+      type: raceRoomsTable.type,
+      entryType: raceRoomsTable.entryType,
+      creatorId: raceRoomsTable.creatorId,
+      scheduledStartAt: raceRoomsTable.scheduledStartAt,
+      challengeEndAt: raceRoomsTable.challengeEndAt,
+    })
+    .from(scheduledRoomRegistrationsTable)
+    .innerJoin(raceRoomsTable, eq(raceRoomsTable.id, scheduledRoomRegistrationsTable.raceRoomId))
+    .where(and(
+      eq(scheduledRoomRegistrationsTable.userId, userId),
+      eq(scheduledRoomRegistrationsTable.status, "registered"),
+      eq(raceRoomsTable.status, "scheduled"),
+      ne(raceRoomsTable.type, "sponsored"),
+      sql`${raceRoomsTable.scheduledStartAt} > ${now}`,
+      excludeCurrentRoom,
+    ))
+    .orderBy(asc(raceRoomsTable.scheduledStartAt))
+    .limit(1);
+
+  if (registration) return registration;
+
+  const [createdRoom] = await dbOrTx
+    .select({
+      roomId: raceRoomsTable.id,
+      roomStatus: raceRoomsTable.status,
+      type: raceRoomsTable.type,
+      entryType: raceRoomsTable.entryType,
+      creatorId: raceRoomsTable.creatorId,
+      scheduledStartAt: raceRoomsTable.scheduledStartAt,
+      challengeEndAt: raceRoomsTable.challengeEndAt,
+    })
+    .from(raceRoomsTable)
+    .where(and(
+      eq(raceRoomsTable.creatorId, userId),
+      eq(raceRoomsTable.status, "scheduled"),
+      ne(raceRoomsTable.type, "sponsored"),
+      sql`${raceRoomsTable.scheduledStartAt} > ${now}`,
+      excludeCurrentRoom,
+    ))
+    .orderBy(asc(raceRoomsTable.scheduledStartAt))
+    .limit(1);
+
+  return createdRoom ?? null;
+}
+
 // ── Shared helper: find an active non-sponsored race the user is currently participating in ─
 async function getActiveRaceForUser(userId: string) {
   const [row] = await db
@@ -1304,6 +1375,31 @@ function regularRaceRegistrationConflictBody(row: RegularRaceRegistrationRow, us
     title: REGULAR_RACE_REGISTRATION_EXISTS_TITLE,
     message: REGULAR_RACE_REGISTRATION_EXISTS_MESSAGE,
     active_race: activeRacePayload(row, userId),
+  };
+}
+
+function futureRoomCreationBlockPayload(row: FutureScheduledRoomRow, userId: string) {
+  return {
+    code: FUTURE_ROOM_CREATION_EXISTS_CODE,
+    title: FUTURE_ROOM_CREATION_EXISTS_TITLE,
+    message: FUTURE_ROOM_CREATION_EXISTS_MESSAGE,
+    scheduled_room: {
+      room_id: row.roomId,
+      room_status: row.roomStatus,
+      room_type: row.type,
+      challenge_type: row.entryType,
+      current_user_role: row.creatorId === userId ? "host" : "participant",
+      scheduled_start_at: row.scheduledStartAt?.toISOString() ?? null,
+      challenge_end_at: row.challengeEndAt?.toISOString() ?? null,
+      next_screen: "waiting_room",
+    },
+  };
+}
+
+function futureRoomCreationConflictBody(row: FutureScheduledRoomRow, userId: string) {
+  return {
+    success: false,
+    ...futureRoomCreationBlockPayload(row, userId),
   };
 }
 
@@ -1589,8 +1685,25 @@ export async function getRoomCountsSummary() {
 
 router.get("/challenges/available", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
-  const challenges = await getChallengeCardsForUser(userId);
-  return res.json({ challenges });
+  const [challenges, futureRoomConflict] = await Promise.all([
+    getChallengeCardsForUser(userId),
+    getActiveFutureScheduledRoomForUser(db, userId),
+  ]);
+  return res.json({
+    challenges,
+    futureRoomCreation: futureRoomConflict
+      ? {
+          canCreateFutureRoom: false,
+          ...futureRoomCreationBlockPayload(futureRoomConflict, userId),
+        }
+      : {
+          canCreateFutureRoom: true,
+          code: null,
+          title: null,
+          message: null,
+          scheduled_room: null,
+        },
+  });
 });
 
 // ── GET /api/rooms/counts ─────────────────────────────────────────────────────
@@ -2174,6 +2287,13 @@ router.post("/races/host", requireAuth, async (req, res) => {
     return res.status(403).json({ error: "You must unlock this track before hosting a challenge with it." });
   }
 
+  if (isScheduledFuture) {
+    const existingScheduledRoom = await getActiveFutureScheduledRoomForUser(db, userId);
+    if (existingScheduledRoom) {
+      return res.status(409).json(futureRoomCreationConflictBody(existingScheduledRoom, userId));
+    }
+  }
+
   // Enforce: user may only be registered for one regular race at a time.
   const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId);
   if (existingRegularRace) {
@@ -2247,9 +2367,14 @@ router.post("/races/host", requireAuth, async (req, res) => {
     "[ScheduleRoom] createPayload"
   );
 
+  let scheduledCreateConflict: FutureScheduledRoomRow | null = null;
   let createConflict: RegularRaceRegistrationRow | null = null;
   const result = await db.transaction(async (tx) => {
     await lockRegularRaceRegistrationForUser(tx, userId);
+    if (isScheduledFuture) {
+      scheduledCreateConflict = await getActiveFutureScheduledRoomForUser(tx, userId);
+      if (scheduledCreateConflict) return null;
+    }
     createConflict = await getRegularRaceRegistrationForUser(tx, userId);
     if (createConflict) return null;
 
@@ -2301,6 +2426,9 @@ router.post("/races/host", requireAuth, async (req, res) => {
     return { room, participant };
   });
 
+  if (scheduledCreateConflict) {
+    return res.status(409).json(futureRoomCreationConflictBody(scheduledCreateConflict, userId));
+  }
   if (createConflict) {
     return res.status(409).json(regularRaceRegistrationConflictBody(createConflict, userId));
   }
