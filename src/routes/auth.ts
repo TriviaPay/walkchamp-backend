@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { getDescopeClient } from "../lib/descope.js";
 import { requireAuth, requireJwtOnly, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { parseAndValidateDob } from "../lib/dateOfBirth.js";
+import { config } from "../lib/config.js";
 import {
   registerOrReplaceSession,
   revokeSession,
@@ -123,6 +124,25 @@ function sessionIdFromRequest(req: Request): string | undefined {
   return undefined;
 }
 
+/** Numeric-tuple version compare (e.g. "1.5.0" vs "1.10.2"). Non-numeric parts count as 0. */
+function compareAppVersions(a: string, b: string): number {
+  const pa = a.split(".").map((p) => parseInt(p, 10) || 0);
+  const pb = b.split(".").map((p) => parseInt(p, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+function sessionIdRequiredForRequest(req: Request): boolean {
+  const min = config.auth.minSessionEnforceVersion;
+  const rawAppVersion = req.headers["x-app-version"];
+  const appVersion = Array.isArray(rawAppVersion) ? rawAppVersion[0] : rawAppVersion;
+  return Boolean(min && appVersion && compareAppVersions(appVersion, min) >= 0);
+}
+
 // Login hook: call after any successful authentication (including client-side OTP/social flows).
 // JWT-only so it is reachable before the client holds a session id (avoids a bootstrap deadlock
 // once the enforcement version gate is enabled).
@@ -197,7 +217,15 @@ async function sessionStatusHandler(req: Request, res: Response) {
   const authReq = req as AuthenticatedRequest;
   const sid = sessionIdFromRequest(req);
   if (!sid) {
-    return res.json({ active: false, code: "SESSION_INVALID", message: SESSION_STATUS_MESSAGES.SESSION_INVALID });
+    if (sessionIdRequiredForRequest(req)) {
+      return res.json({ active: false, code: "SESSION_INVALID", message: SESSION_STATUS_MESSAGES.SESSION_INVALID });
+    }
+    return res.json({
+      active: true,
+      sessionRequired: false,
+      code: "SESSION_NOT_PRESENT",
+      message: "No backend session id presented; continuing in monitor mode.",
+    });
   }
   const status = await resumeSession(sid, authReq.descopeUserId);
   if (!status.active) {
