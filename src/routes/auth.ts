@@ -76,8 +76,9 @@ router.get("/me", requireJwtOnly, async (req, res) => {
     .catch(() => {});
 
   // Report (do not mutate) session status when the client presented one.
-  if (authReq.sessionId) {
-    const status = await resumeSession(authReq.sessionId, userId);
+  const presentedSessionId = sessionIdFromRequest(req);
+  if (presentedSessionId) {
+    const status = await resumeSession(presentedSessionId, userId);
     if (status.active) {
       return res.json({
         profile,
@@ -140,6 +141,54 @@ router.post("/auth/session/register", requireJwtOnly, async (req, res) => {
     replaced: result.replaced,
     createdAt: result.createdAt,
   });
+});
+
+const refreshSessionSchema = z.object({
+  refreshJwt: z.string().trim().min(1).optional(),
+  refreshToken: z.string().trim().min(1).optional(),
+}).refine((value) => Boolean(value.refreshJwt || value.refreshToken), {
+  message: "refreshJwt required",
+  path: ["refreshJwt"],
+});
+
+// Refresh a short-lived Descope session JWT. This endpoint deliberately does not create or replace
+// the backend single-active-session row; it only exchanges a valid refresh token for fresh JWTs.
+router.post("/auth/session/refresh", async (req, res) => {
+  const parsed = refreshSessionSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "invalid_request", details: parsed.error.issues });
+  }
+
+  const refreshToken = parsed.data.refreshJwt ?? parsed.data.refreshToken!;
+
+  try {
+    const client = getDescopeClient();
+    const refreshed = await client.refreshSession(refreshToken);
+    const sessionJwt = refreshed.jwt;
+    const refreshJwt = refreshed.refreshJwt ?? null;
+    const userId = typeof refreshed.token.sub === "string" ? refreshed.token.sub : null;
+    const email = typeof refreshed.token.email === "string" ? refreshed.token.email : null;
+
+    return res.json({
+      sessionJwt,
+      refreshJwt,
+      user: userId
+        ? {
+            userId,
+            loginIds: email ? [email] : [],
+            name: typeof refreshed.token.name === "string" ? refreshed.token.name : null,
+            email,
+            verifiedEmail: Boolean(refreshed.token.email_verified),
+          }
+        : null,
+    });
+  } catch (err) {
+    req.log.warn({ err }, "auth/session/refresh failed");
+    return res.status(401).json({
+      error: "invalid_refresh_token",
+      message: "Refresh token is invalid or expired.",
+    });
+  }
 });
 
 // Fast app-resume check. JWT-only so a replaced session gets a 200 status body rather than being

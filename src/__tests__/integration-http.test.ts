@@ -205,6 +205,21 @@ describe("HTTP integration smoke", () => {
     });
   });
 
+  it("exposes session refresh validation without classifying it as a disabled cash route", async () => {
+    const { response, json } = await request("/api/auth/session/refresh", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({}),
+    });
+
+    expect(response.status).toBe(400);
+    expect(json).toMatchObject({
+      error: "invalid_request",
+    });
+  });
+
   it("rejects invalid username format without a database write", async () => {
     const { response, json } = await request("/api/auth/username-check?username=abc");
     expect(response.status).toBe(200);
