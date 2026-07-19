@@ -96,6 +96,10 @@ function computeXP(totalSteps: number, raceResults: { rank: number; prizeCents: 
 }
 
 function isRaceWinRank(rank: number | null | undefined): boolean {
+  return rank === 1;
+}
+
+function isRacePodiumRank(rank: number | null | undefined): boolean {
   return typeof rank === "number" && rank >= 1 && rank <= 3;
 }
 
@@ -249,7 +253,7 @@ router.get("/profile/me", requireAuth, async (req, res) => {
 
   const totalRaces   = allRaceRows.length;
   const racesWon     = allRaceRows.filter((r) => isRaceWinRank(r.rank)).length;
-  const top3Finishes = allRaceRows.filter((r) => isRaceWinRank(r.rank)).length;
+  const top3Finishes = allRaceRows.filter((r) => isRacePodiumRank(r.rank)).length;
   const winRate      = totalRaces > 0 ? Math.round((racesWon / totalRaces) * 100) : 0;
 
   db.update(profilesTable).set({ lastSeenAt: new Date() }).where(eq(profilesTable.id, userId)).catch(() => {});
@@ -584,7 +588,7 @@ router.get("/profile/public/:username", async (req, res) => {
         progressPercent: levelData.progressPercent,
         totalRaces:      raceRows.length,
         racesWon:        raceRows.filter((r) => isRaceWinRank(r.rank)).length,
-        top3Finishes:    raceRows.filter((r) => isRaceWinRank(r.rank)).length,
+        top3Finishes:    raceRows.filter((r) => isRacePodiumRank(r.rank)).length,
       },
     },
   });
