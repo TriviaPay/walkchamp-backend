@@ -66,6 +66,7 @@ const envSchema = z
     RAZORPAY_KEY_ID: z.string().optional(),
     RAZORPAY_KEY_SECRET: z.string().optional(),
     RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
+    CASH_CHALLENGE_PLATFORM_SERVICE_FEE_CENTS: z.string().optional(),
     OBJECT_STORAGE_ENDPOINT: z.string().optional(),
     OBJECT_STORAGE_REGION: z.string().optional(),
     OBJECT_STORAGE_BUCKET: z.string().optional(),

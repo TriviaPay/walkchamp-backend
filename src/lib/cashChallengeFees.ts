@@ -1,6 +1,10 @@
-type PaymentProvider = "stripe" | "razorpay";
+export type PaymentProvider = "stripe" | "razorpay";
 
 const ALLOWED_ENTRY_AMOUNTS_CENTS = new Set([300, 500, 1000, 1500, 2000, 2500]);
+const DEFAULT_PLATFORM_SERVICE_FEE_CENTS = 60;
+const PLATFORM_SERVICE_FEE_ENV = "CASH_CHALLENGE_PLATFORM_SERVICE_FEE_CENTS";
+const STRIPE_PROCESSING_BASIS_POINTS = 290;
+const STRIPE_PROCESSING_FIXED_CENTS = 30;
 export const CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY = "CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY";
 export const CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY_MESSAGE =
   "Cash challenges are not available for INR/Razorpay wallets yet.";
@@ -29,12 +33,34 @@ export function calcEntryPoolCents(entryFeeCents: number, numberOfPlayers: numbe
   return Math.max(0, entryFeeCents) * Math.max(0, numberOfPlayers);
 }
 
-export function calcPerPlayerFees(entryFeeCents: number, _provider: PaymentProvider = "stripe") {
+function parseConfiguredPlatformServiceFeeCents(): number {
+  const raw = process.env[PLATFORM_SERVICE_FEE_ENV]?.trim();
+  if (!raw) return DEFAULT_PLATFORM_SERVICE_FEE_CENTS;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${PLATFORM_SERVICE_FEE_ENV} must be a non-negative integer number of cents`);
+  }
+  return value;
+}
+
+export function calcPaymentProcessingFeeCents(entryFeeCents: number, provider: PaymentProvider = "stripe"): number {
+  const normalizedEntryFeeCents = Math.max(0, entryFeeCents);
+  if (normalizedEntryFeeCents === 0) return 0;
+  if (provider !== "stripe") return 0;
+  return Math.ceil((normalizedEntryFeeCents * STRIPE_PROCESSING_BASIS_POINTS) / 10_000) + STRIPE_PROCESSING_FIXED_CENTS;
+}
+
+export function calcPerPlayerFees(entryFeeCents: number, provider: PaymentProvider = "stripe") {
+  const normalizedEntryFeeCents = Math.max(0, entryFeeCents);
+  const paymentProcessingFeeCents = calcPaymentProcessingFeeCents(normalizedEntryFeeCents, provider);
+  const platformServiceFeeCents = normalizedEntryFeeCents > 0
+    ? parseConfiguredPlatformServiceFeeCents()
+    : 0;
   return {
-    entryFeeCents,
-    paymentProcessingFeeCents: 0,
-    platformServiceFeeCents: 0,
-    totalPayableCents: entryFeeCents,
+    entryFeeCents: normalizedEntryFeeCents,
+    paymentProcessingFeeCents,
+    platformServiceFeeCents,
+    totalPayableCents: normalizedEntryFeeCents + paymentProcessingFeeCents + platformServiceFeeCents,
   };
 }
 

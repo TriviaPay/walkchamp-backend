@@ -1,7 +1,12 @@
 import { and, eq, sql } from "drizzle-orm";
 import { walletsTable, walletTransactionsTable } from "../../db/src/schema/index.js";
+import { calcPerPlayerFees, type PaymentProvider } from "./cashChallengeFees.js";
 import { debitWalletForCashChallenge } from "./refundService.js";
 import { lockWalletByUserId, type DbTx } from "./raceIntegrity.js";
+
+function normalizePaymentProvider(provider?: string): PaymentProvider {
+  return provider === "razorpay" ? "razorpay" : "stripe";
+}
 
 export async function debitCashChallengeEntry(
   tx: DbTx,
@@ -13,9 +18,20 @@ export async function debitCashChallengeEntry(
     description: string;
   },
 ) {
+  const provider = normalizePaymentProvider(input.paymentProvider);
+  const fees = calcPerPlayerFees(input.entryFeeCents, provider);
   return debitWalletForCashChallenge(tx, {
     ...input,
+    debitAmountCents: fees.totalPayableCents,
     idempotencyKey: `challenge_entry:${input.raceRoomId}:${input.userId}`,
+    metadata: {
+      entryFeeCents: fees.entryFeeCents,
+      paymentProcessingFeeCents: fees.paymentProcessingFeeCents,
+      platformServiceFeeCents: fees.platformServiceFeeCents,
+      totalPayableCents: fees.totalPayableCents,
+      refundableAmountCents: fees.entryFeeCents,
+      paymentProvider: provider,
+    },
   });
 }
 

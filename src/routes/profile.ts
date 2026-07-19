@@ -383,9 +383,6 @@ router.put("/profile/me", requireAuth, async (req, res) => {
 
   if (updates.username) {
     const lower = updates.username.toLowerCase();
-    if (isBlocked(lower)) {
-      return res.status(409).json({ error: "This username is not allowed." });
-    }
     const existing = await db
       .select({ id: profilesTable.id })
       .from(profilesTable)
@@ -393,6 +390,9 @@ router.put("/profile/me", requireAuth, async (req, res) => {
       .limit(1);
     if (existing.length > 0 && existing[0].id !== userId) {
       return res.status(409).json({ error: "This username is already taken." });
+    }
+    if (isBlocked(lower) && existing[0]?.id !== userId) {
+      return res.status(409).json({ error: "This username is not allowed." });
     }
     updates.username = lower;
   }

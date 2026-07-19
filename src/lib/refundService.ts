@@ -353,7 +353,7 @@ async function createWalletRefundItem(
     reasonCode: string;
   },
 ) {
-  const amount = Math.abs(input.walletDebit.amountCents);
+  const amount = refundableAmountForWalletDebit(input.walletDebit);
   const reserved = await reservedAmountForComponent(tx, "wallet_transaction", input.walletDebit.id);
   const refundable = amount - reserved;
   if (refundable <= 0) return null;
@@ -507,7 +507,7 @@ export async function computeRefundEligibility(input: { paymentId?: string; race
       components: walletDebits.map((d) => ({
         type: "wallet_transaction",
         id: d.id,
-        amount: Math.abs(d.amountCents),
+        amount: refundableAmountForWalletDebit(d),
         currency: d.currency,
       })),
     };
@@ -1230,8 +1230,10 @@ export async function debitWalletForCashChallenge(tx: DbTx, input: {
   userId: string;
   raceRoomId: string;
   entryFeeCents: number;
+  debitAmountCents?: number;
   description: string;
   idempotencyKey?: string;
+  metadata?: Record<string, unknown>;
 }) {
   const wallet = await lockWalletByUserId(tx, input.userId);
   if (!wallet) return { ok: false as const, error: "Wallet not found.", balanceCents: 0 };
@@ -1259,11 +1261,16 @@ export async function debitWalletForCashChallenge(tx: DbTx, input: {
     return { ok: true as const, balanceCents: wallet.availableBalanceCents };
   }
 
-  if (wallet.availableBalanceCents < input.entryFeeCents) {
+  const debitAmountCents = input.debitAmountCents ?? input.entryFeeCents;
+  if (!Number.isInteger(debitAmountCents) || debitAmountCents < input.entryFeeCents || debitAmountCents < 0) {
+    return { ok: false as const, error: "Invalid cash challenge fee configuration.", balanceCents: wallet.availableBalanceCents };
+  }
+
+  if (wallet.availableBalanceCents < debitAmountCents) {
     return { ok: false as const, error: "Insufficient balance.", balanceCents: wallet.availableBalanceCents };
   }
   const before = wallet.availableBalanceCents;
-  const after = before - input.entryFeeCents;
+  const after = before - debitAmountCents;
   await tx.update(walletsTable)
     .set({ availableBalanceCents: after, updatedAt: new Date() })
     .where(eq(walletsTable.id, wallet.id));
@@ -1271,7 +1278,7 @@ export async function debitWalletForCashChallenge(tx: DbTx, input: {
     walletId: wallet.id,
     userId: input.userId,
     transactionType: "race_entry_wallet_debit",
-    amountCents: -input.entryFeeCents,
+    amountCents: -debitAmountCents,
     currency: wallet.currency,
     status: "completed",
     description: input.description,
@@ -1279,6 +1286,17 @@ export async function debitWalletForCashChallenge(tx: DbTx, input: {
     raceRoomId: input.raceRoomId,
     balanceBeforeCents: before,
     balanceAfterCents: after,
+    metadata: input.metadata ?? null,
   });
   return { ok: true as const, balanceCents: after };
+}
+
+function refundableAmountForWalletDebit(debit: typeof walletTransactionsTable.$inferSelect): number {
+  const debitedAmount = Math.abs(debit.amountCents);
+  const metadata = (debit.metadata as Record<string, unknown> | null) ?? null;
+  const configuredRefundable = metadata?.refundableAmountCents;
+  if (typeof configuredRefundable !== "number" || !Number.isInteger(configuredRefundable)) {
+    return debitedAmount;
+  }
+  return Math.max(0, Math.min(debitedAmount, configuredRefundable));
 }
