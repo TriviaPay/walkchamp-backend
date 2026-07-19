@@ -9,6 +9,11 @@ export function getSponsoredWinnerCount(playerCount: number): number {
   return playerCount <= 2 ? 1 : 2;
 }
 
+export function getSponsoredAwardedWinnerCount(playerCount: number, finisherCount: number): number {
+  if (playerCount <= 0 || finisherCount <= 0) return 0;
+  return Math.min(getSponsoredWinnerCount(playerCount), finisherCount);
+}
+
 export function getSponsoredPrizePoolCents(playerCount: number): number {
   return getSponsoredWinnerCount(playerCount) * SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS;
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  getSponsoredAwardedWinnerCount,
   getSponsoredPrizePoolCents,
   getSponsoredWinnerCount,
   SPONSORED_EVENT_MIN_PLAYERS_TO_START,
@@ -15,6 +16,18 @@ describe("sponsored event rules", () => {
   it("uses one winner for one or two players", () => {
     expect(getSponsoredWinnerCount(1)).toBe(1);
     expect(getSponsoredWinnerCount(2)).toBe(1);
+  });
+
+  it("awards no winner when a solo participant does not finish the target", () => {
+    expect(getSponsoredWinnerCount(1)).toBe(1);
+    expect(getSponsoredAwardedWinnerCount(1, 0)).toBe(0);
+  });
+
+  it("caps awarded winners to sponsored finishers", () => {
+    expect(getSponsoredAwardedWinnerCount(1, 1)).toBe(1);
+    expect(getSponsoredAwardedWinnerCount(2, 1)).toBe(1);
+    expect(getSponsoredAwardedWinnerCount(3, 1)).toBe(1);
+    expect(getSponsoredAwardedWinnerCount(3, 2)).toBe(2);
   });
 
   it("uses two winners for three to ten players", () => {

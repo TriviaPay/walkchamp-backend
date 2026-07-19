@@ -19,6 +19,7 @@ import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration, regis
 import { notifyPromotionalSponsoredEvent } from "../lib/pushNotificationService.js";
 import { createPendingSponsoredGiftCardAwards } from "../lib/sponsoredGiftCards.js";
 import {
+  getSponsoredAwardedWinnerCount,
   getSponsoredPrizePoolCents,
   getSponsoredWinnerCount,
   SPONSORED_EVENT_ENTRY_COINS,
@@ -345,7 +346,8 @@ async function finalizeSponsoredEvents(now: Date) {
       .where(eq(raceParticipantsTable.raceRoomId, room.id));
 
     // Identify winners (reached target steps)
-    const winnerCount = getSponsoredWinnerCount(parts.length);
+    const finisherCount = parts.filter((p) => p.finishedGoal && p.finishedAt).length;
+    const winnerCount = getSponsoredAwardedWinnerCount(parts.length, finisherCount);
     const winnerIds = new Set(
       parts
         .filter((p) => p.finishedGoal && p.finishedAt)
@@ -592,7 +594,9 @@ export async function getSponsoredEventsForUser(
     const playerCountForPrize = r.status === "in_progress" || r.status === "completed"
       ? r.currentPlayers
       : r.registeredCount;
-    const winnerCount = getSponsoredWinnerCount(playerCountForPrize);
+    const winnerCount = r.status === "completed"
+      ? r.winnerCount
+      : getSponsoredWinnerCount(playerCountForPrize);
     // Compute when the race ends (3 hours from start / scheduled start)
     const endsAtDate = r.status === "in_progress" && r.startedAt
       ? new Date(r.startedAt.getTime() + RACE_DURATION_MS)
@@ -1131,7 +1135,7 @@ router.get("/sponsored-events/:roomId/results", requireAuth, async (req, res) =>
       .filter((p) => p.finishedGoal && p.finishedAt)
       .sort((a, b) => (a.finishedAt?.getTime() ?? 0) - (b.finishedAt?.getTime() ?? 0));
 
-    const winnerCount = getSponsoredWinnerCount(parts.length);
+    const winnerCount = getSponsoredAwardedWinnerCount(parts.length, finishers.length);
     const winners = finishers.slice(0, winnerCount);
     const winnerIds = new Set(winners.map((w) => w.userId));
 
@@ -1145,6 +1149,7 @@ router.get("/sponsored-events/:roomId/results", requireAuth, async (req, res) =>
         prizePoolCents: getSponsoredPrizePoolCents(parts.length),
         prizePerWinnerCents: PRIZE_PER_WINNER_CENTS,
         winnerCount,
+        potentialWinnerCount: getSponsoredWinnerCount(parts.length),
         startedAt: room.startedAt?.toISOString() ?? null,
         endsAt: endsAt?.toISOString() ?? null,
       },

@@ -73,6 +73,7 @@ import {
 import { buildTrackThemeMedia, TRACK_THEME_CODES, type TrackThemeMedia } from "../lib/trackThemeMedia.js";
 import { createPendingSponsoredGiftCardAwards } from "../lib/sponsoredGiftCards.js";
 import {
+  getSponsoredAwardedWinnerCount,
   getSponsoredPrizePoolCents,
   getSponsoredWinnerCount,
   SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS,
@@ -597,8 +598,7 @@ function assignPayoutsWithTies(
 // For sponsored events: 1-2 players -> 1 winner, 3-10 players -> 2 winners.
 // Only participants who finished the goal can receive gift-card awards.
 function buildSponsoredPrizeSlots(playerCount: number, finisherCount: number): Array<{ rank: number; amountCents: number }> {
-  if (finisherCount === 0) return [];
-  const winnerCount = Math.min(getSponsoredWinnerCount(playerCount), finisherCount);
+  const winnerCount = getSponsoredAwardedWinnerCount(playerCount, finisherCount);
   const slots: Array<{ rank: number; amountCents: number }> = [];
   for (let i = 1; i <= winnerCount; i++) {
     slots.push({ rank: i, amountCents: SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS });
@@ -894,6 +894,9 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
       status: isSimulatedUser ? "disqualified_simulation" : "verified",
     };
   });
+  const actualWinnerCount = isSponsored
+    ? resultRows.filter((r) => r.eligibleForPrize && r.prizeCents > 0).length
+    : numWinners(uniqueParticipants.length);
 
   const rewardSplitForRoom = buildRewardSplit(room.entryAmountCents, uniqueParticipants.length);
 
@@ -926,7 +929,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
           winnersPoolCents,
           platformFeeCents: platformFeeCentsVal,
           rewardSplitJson: rewardSplitForRoom as unknown as null,
-          winnerCount: isSponsored ? getSponsoredWinnerCount(uniqueParticipants.length) : numWinners(uniqueParticipants.length),
+          winnerCount: actualWinnerCount,
           unawardedAmountCents,
           payoutFinalizedAt,
           ...(room.entryType === "coins_battle" && {
@@ -1024,9 +1027,9 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   logger.info({ raceId }, "[RaceFinalize] race_id: %s", raceId);
   logger.info({ raceId, challengeType: room.entryType }, "[RaceFinalize] challenge_type: %s", room.entryType);
   logger.info({ raceId, participantCount: uniqueParticipants.length }, "[RaceFinalize] participant_count: %d", uniqueParticipants.length);
-  const finalWinnerCount = isSponsored ? getSponsoredWinnerCount(uniqueParticipants.length) : numWinners(uniqueParticipants.length);
+  const finalWinnerCount = actualWinnerCount;
   logger.info({ raceId, winnerCount: finalWinnerCount }, "[RaceFinalize] winner_count: %d", finalWinnerCount);
-  logger.info({ raceId, finishedUsers: resultRows.filter((r) => r.rank <= finalWinnerCount).map((r) => r.userId) }, "[RaceFinalize] finished_users: %j", resultRows.map((r) => r.userId));
+  logger.info({ raceId, finishedUsers: resultRows.filter((r) => r.eligibleForPrize && r.prizeCents > 0).map((r) => r.userId) }, "[RaceFinalize] finished_users: %j", resultRows.map((r) => r.userId));
   logger.info({ raceId, winnerSlotsFinalized: finalWinnerCount }, "[RaceFinalize] winner_slots_finalized: %d", finalWinnerCount);
   logger.info({ raceId, tieGroups: uniqueTieGroups }, "[RaceFinalize] tie_groups: %j", uniqueTieGroups);
   logger.info({ raceId, rewardType }, "[RaceFinalize] reward_type: %s", rewardType);
@@ -1052,6 +1055,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     const winnerSlots = numWinners(uniqueParticipants.length);
 
     for (const r of resultRows) {
+      if (isSponsored && !r.eligibleForPrize) continue;
       // Skip coin rewards for simulation-disqualified participants
       if (!r.eligibleForPrize && r.status === "disqualified_simulation") continue;
       // Race-win coins: only for top N winners AND 1k-step-goal races
@@ -1121,6 +1125,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
       tieGroupId: r.tieGroupId,
       tieGroupSize: r.tieGroupSize,
       eligibleForPrize: r.eligibleForPrize,
+      isWinner: r.eligibleForPrize && r.prizeCents > 0,
     };
   });
 
@@ -4152,7 +4157,11 @@ router.get("/races/:id", requireAuth, async (req, res) => {
   const splits = getPrizeSplits(room.currentPlayers);
   const prizeTiers = splits.map((s) => parseFloat(((winnersPoolCents / 100) * s).toFixed(2)));
   const rewardSplit = buildRewardSplit(room.entryAmountCents, room.currentPlayers);
-  const winnerCount = room.type === "sponsored" ? getSponsoredWinnerCount(room.currentPlayers) : numWinners(room.currentPlayers);
+  const winnerCount = room.type === "sponsored" && room.status === "completed"
+    ? participantRows.filter((p) => p.eligibleForPrize && p.prizeCents > 0).length
+    : room.type === "sponsored"
+      ? getSponsoredWinnerCount(room.currentPlayers)
+      : numWinners(room.currentPlayers);
   const displayPrizePoolCents = room.type === "sponsored" ? getSponsoredPrizePoolCents(room.currentPlayers) : room.prizePoolCents;
 
   // Tie summary — derived from stored participant results for completed races
@@ -4188,6 +4197,9 @@ router.get("/races/:id", requireAuth, async (req, res) => {
     participants: participantRows.map((p) => ({
       ...p,
       prizeAmount: p.prizeCents / 100,
+      isWinner: room.type === "sponsored"
+        ? p.eligibleForPrize && p.prizeCents > 0
+        : p.rank !== null && p.rank <= winnerCount,
     })),
   });
 });

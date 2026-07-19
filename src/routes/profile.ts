@@ -83,20 +83,20 @@ function computeLevelData(lifetimeXP: number) {
 
 // XP from walking: 1 XP per 100 steps (matches existing display)
 // XP from races: completes=10/20 (free/paid), win=+25, 2nd=+15, 3rd=+10
-function computeXP(totalSteps: number, raceResults: { rank: number; prizeCents: number }[]) {
+function computeXP(totalSteps: number, raceResults: { rank: number; prizeCents: number; eligibleForPrize?: boolean }[]) {
   const stepXP = Math.floor(totalSteps / 100);
   let raceXP = 0;
   for (const r of raceResults) {
     raceXP += r.prizeCents > 0 ? 20 : 10;
-    if (r.rank === 1) raceXP += 25;
+    if (isRaceWinResult(r)) raceXP += 25;
     else if (r.rank === 2) raceXP += 15;
     else if (r.rank === 3) raceXP += 10;
   }
   return stepXP + raceXP;
 }
 
-function isRaceWinRank(rank: number | null | undefined): boolean {
-  return rank === 1;
+function isRaceWinResult(r: { rank: number | null | undefined; eligibleForPrize?: boolean }): boolean {
+  return r.rank === 1 && r.eligibleForPrize !== false;
 }
 
 function isRacePodiumRank(rank: number | null | undefined): boolean {
@@ -185,7 +185,11 @@ router.get("/profile/me", requireAuth, async (req, res) => {
       .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, today)))
       .limit(1),
     // raceResultsTable is authoritative for stats: rank NOT NULL, prizeCents present
-    db.select({ rank: raceResultsTable.rank, prizeCents: raceResultsTable.prizeCents })
+    db.select({
+        rank: raceResultsTable.rank,
+        prizeCents: raceResultsTable.prizeCents,
+        eligibleForPrize: raceResultsTable.eligibleForPrize,
+      })
       .from(raceResultsTable)
       .where(eq(raceResultsTable.userId, userId)),
     db.select({ achievementCode: userTitlesTable.achievementCode })
@@ -252,7 +256,7 @@ router.get("/profile/me", requireAuth, async (req, res) => {
   const levelData      = computeLevelData(lifetimeXP);
 
   const totalRaces   = allRaceRows.length;
-  const racesWon     = allRaceRows.filter((r) => isRaceWinRank(r.rank)).length;
+  const racesWon     = allRaceRows.filter(isRaceWinResult).length;
   const top3Finishes = allRaceRows.filter((r) => isRacePodiumRank(r.rank)).length;
   const winRate      = totalRaces > 0 ? Math.round((racesWon / totalRaces) * 100) : 0;
 
@@ -557,7 +561,11 @@ router.get("/profile/public/:username", async (req, res) => {
   if (!p) return res.status(404).json({ error: "User not found" });
 
   const [raceRows, pubStreakRows] = await Promise.all([
-    db.select({ rank: raceResultsTable.rank, prizeCents: raceResultsTable.prizeCents })
+    db.select({
+        rank: raceResultsTable.rank,
+        prizeCents: raceResultsTable.prizeCents,
+        eligibleForPrize: raceResultsTable.eligibleForPrize,
+      })
       .from(raceResultsTable)
       .where(eq(raceResultsTable.userId, p.id)),
     db.select({ date: stepDailyTotalsTable.date, steps: stepDailyTotalsTable.steps })
@@ -587,7 +595,7 @@ router.get("/profile/public/:username", async (req, res) => {
         xp:              levelData.xp,
         progressPercent: levelData.progressPercent,
         totalRaces:      raceRows.length,
-        racesWon:        raceRows.filter((r) => isRaceWinRank(r.rank)).length,
+        racesWon:        raceRows.filter(isRaceWinResult).length,
         top3Finishes:    raceRows.filter((r) => isRacePodiumRank(r.rank)).length,
       },
     },
@@ -619,7 +627,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
   if (!p) return res.status(404).json({ error: "User not found" });
 
   const [raceRows, titleRow, friendRow, reqRow, coinRow, cashWonRow] = await Promise.all([
-    db.select({ rank: raceResultsTable.rank })
+    db.select({ rank: raceResultsTable.rank, eligibleForPrize: raceResultsTable.eligibleForPrize })
       .from(raceResultsTable)
       .where(eq(raceResultsTable.userId, targetId)),
     db.select({ code: achievementDefinitionsTable.code, title: achievementDefinitionsTable.title })
@@ -687,7 +695,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
       lifetimeCashWonCents,
       lifetimeCashWonDollars: lifetimeCashWonCents / 100,
       racesPlayed:       raceRows.length,
-      raceWins:          raceRows.filter((r) => isRaceWinRank(r.rank)).length,
+      raceWins:          raceRows.filter(isRaceWinResult).length,
       currentStreakDays:  p.currentStreak ?? 0,
     },
   });

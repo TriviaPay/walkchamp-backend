@@ -287,9 +287,10 @@ router.get("/leaderboard/races", requireAuth, async (req, res) => {
       ? (entryType as EntryType)
       : undefined;
 
-  // Build where conditions — only 1st place counts toward win totals.
+  // Build where conditions — only eligible 1st place counts toward win totals.
   const whereConditions = [
     eq(raceResultsTable.rank, RACE_WIN_RANK),
+    eq(raceResultsTable.eligibleForPrize, true),
     notInArray(profilesTable.accountStatus, ["banned", "deleted"]),
   ];
   if (filteredEntryType) {
@@ -359,6 +360,7 @@ router.get("/leaderboard/races", requireAuth, async (req, res) => {
     const myWinConditions = [
       eq(raceResultsTable.userId, userId),
       eq(raceResultsTable.rank, RACE_WIN_RANK),
+      eq(raceResultsTable.eligibleForPrize, true),
     ];
     if (filteredEntryType) myWinConditions.push(eq(raceRoomsTable.entryType, filteredEntryType));
 
@@ -374,6 +376,7 @@ router.get("/leaderboard/races", requireAuth, async (req, res) => {
       // Count users with more wins than the current user
       const aboveConditions = [
         eq(raceResultsTable.rank, RACE_WIN_RANK),
+        eq(raceResultsTable.eligibleForPrize, true),
         notInArray(profilesTable.accountStatus, ["banned", "deleted"]),
         ne(profilesTable.id, userId),
       ];
