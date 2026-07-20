@@ -11,6 +11,7 @@ import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAut
 import { z } from "zod";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
 import { assertOperationalLockOpen, WALLET_LEDGER_ANOMALY_LOCK } from "../lib/operationalLocks.js";
+import { computeIsAdult } from "../lib/dateOfBirth.js";
 
 const router = Router();
 
@@ -180,7 +181,9 @@ router.get("/wallet/transactions", requireAuth, async (req, res) => {
     status: tx.status,
     date: tx.createdAt.toISOString(),
     raceRoomId: tx.raceRoomId,
-    challengeId: tx.challengeId,
+    // challengeId kept for client compatibility — it always referred to the race
+    // room id, now sourced from the single raceRoomId column.
+    challengeId: tx.raceRoomId,
   }));
 
   return res.json({ transactions: formatted, total: txs.length, nextCursor });
@@ -273,7 +276,7 @@ router.post("/wallet/withdraw", requireAuth, async (req, res) => {
   if (status === "suspended" || status === "banned" || status === "deleted") {
     return res.status(403).json({ error: "Account is not eligible for withdrawals." });
   }
-  if (!profile.isAdult) {
+  if (!computeIsAdult(profile.dateOfBirth, profile.isAdult)) {
     return res.status(403).json({ error: "You must be 18 or older to withdraw." });
   }
   if (!profile.withdrawalsEnabled) {

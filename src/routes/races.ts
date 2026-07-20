@@ -25,7 +25,7 @@ import {
 import { eq, and, desc, asc, sql, ne, inArray, or } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { randomBytes } from "crypto";
+import { generateInviteCode } from "../lib/inviteCodes.js";
 import { triggerEvent } from "../lib/pusher.js";
 import { logger } from "../lib/logger.js";
 import { config } from "../lib/config.js";
@@ -37,6 +37,7 @@ import { recordCoinLedgerEntry } from "../lib/coinsService.js";
 import {
   deriveOpenRoomStatus,
   type DbTx,
+  isRaceParticipant,
   joinOrReviveParticipant,
   lockRaceRoom,
   lockScheduledRegistration,
@@ -66,6 +67,7 @@ import {
   hasCompletedEntryPayment,
 } from "../lib/cashChallengePayments.js";
 import { grantReferralBonusForCashChallenge } from "../lib/referralBonusService.js";
+import { computeIsAdult } from "../lib/dateOfBirth.js";
 import {
   createRefundBatchForRaceCancellation,
   createRefundForRaceLeave,
@@ -2414,7 +2416,7 @@ router.post("/races/host", requireAuth, async (req, res) => {
       .where(eq(profilesTable.id, userId))
       .limit(1);
     if (!profile) return res.status(403).json({ error: "Paid challenges are not available for your account." });
-    if (!profile.isAdult) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
+    if (!computeIsAdult(profile.dateOfBirth, profile.isAdult)) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
     if (!profile.paidRaceEnabled) return res.status(403).json({ error: "Paid challenges are not available for your account." });
     if (profile.accountStatus !== "active") return res.status(403).json({ error: "Your account is under review." });
     if (isCashChallengeUnsupportedForCountry(profile.countryCode)) {
@@ -2435,13 +2437,9 @@ router.post("/races/host", requireAuth, async (req, res) => {
     coins_battle: "Coins Battle",
   };
 
-  // 5-char code from a 32-char alphanumeric alphabet (no confusable 0/O/1/I)
-  const INVITE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const inviteCode = isPrivate
-    ? Array.from(randomBytes(5))
-        .map((b) => INVITE_CHARS[b % INVITE_CHARS.length])
-        .join("")
-    : null;
+  // CSPRNG code with rejection sampling (no modulo bias) and ≥64 bits of
+  // entropy so private/cash rooms cannot be enumerated by brute force.
+  const inviteCode = isPrivate ? generateInviteCode() : null;
 
   const durationDays = challengeDurationDays ?? 0;
   let challengeEndAt: Date | null = null;
@@ -2725,15 +2723,30 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
       let totalCollected = 0;
       // Capture new balances per-user so we can send Pusher updates after the TX
       const newBalanceMap = new Map<string, number>();
+      // Participants who could not pay the FULL entry are disqualified rather than
+      // admitted for free. Previously we charged min(balance, entry) and kept the
+      // participant in the race even when that was 0, letting them compete for a
+      // pool funded entirely by other players' full entries.
+      const disqualifiedUserIds: string[] = [];
       await db.transaction(async (tx) => {
         for (const p of coinParticipants) {
           const [bal] = await tx
             .select({ currentBalance: coinBalancesTable.currentBalance })
             .from(coinBalancesTable)
             .where(eq(coinBalancesTable.userId, p.userId))
-            .limit(1);
-          const toDeduct = Math.min(bal?.currentBalance ?? 0, room.coinEntryAmount);
-          if (toDeduct <= 0) continue;
+            .limit(1)
+            .for("update");
+          const balance = bal?.currentBalance ?? 0;
+          if (balance < room.coinEntryAmount) {
+            // Cannot afford the full entry — disqualify and exclude from the pool.
+            await tx
+              .update(raceParticipantsTable)
+              .set({ status: "disqualified" })
+              .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, p.userId)));
+            disqualifiedUserIds.push(p.userId);
+            continue;
+          }
+          const toDeduct = room.coinEntryAmount;
           const ledger = await recordCoinLedgerEntry(tx, {
             userId: p.userId,
             amount: -toDeduct,
@@ -2749,6 +2762,15 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
           newBalanceMap.set(p.userId, ledger.newBalance);
           totalCollected += toDeduct;
         }
+        if (disqualifiedUserIds.length > 0) {
+          await tx
+            .update(raceRoomsTable)
+            .set({
+              currentPlayers: sql`greatest(${raceRoomsTable.currentPlayers} - ${disqualifiedUserIds.length}, 0)`,
+              updatedAt: new Date(),
+            })
+            .where(eq(raceRoomsTable.id, raceId));
+        }
         if (totalCollected > 0) {
           await tx
             .update(raceRoomsTable)
@@ -2756,6 +2778,18 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
             .where(eq(raceRoomsTable.id, raceId));
         }
       });
+      for (const uid of disqualifiedUserIds) {
+        void triggerEvent(`private-user-${uid}`, "race:disqualified", {
+          raceId,
+          reason: "insufficient_coins",
+        }).catch(() => {});
+      }
+      if (disqualifiedUserIds.length > 0) {
+        req.log.info(
+          { raceId, disqualifiedCount: disqualifiedUserIds.length },
+          "[CoinsBattle] participants disqualified for insufficient coins at start",
+        );
+      }
       // Notify each participant of their new balance (fire-and-forget)
       for (const [uid, newBalance] of newBalanceMap.entries()) {
         void triggerEvent(`private-user-${uid}`, "wallet.updated", {
@@ -3235,16 +3269,16 @@ router.post("/races", requireAuth, async (req, res) => {
       .where(eq(profilesTable.id, userId))
       .limit(1);
     if (!profile) return res.status(403).json({ error: "Paid challenges are not available for your account." });
-    if (!profile.isAdult) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
+    if (!computeIsAdult(profile.dateOfBirth, profile.isAdult)) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
     if (!profile.paidRaceEnabled) return res.status(403).json({ error: "Paid challenges are not available for your account." });
     if (profile.accountStatus !== "active") return res.status(403).json({ error: "Your account is under review." });
     if (!profile.profileCompleted) return res.status(403).json({ error: "Paid challenges are not available for your account." });
     if ((profile.fraudScore ?? 0) >= 70) return res.status(403).json({ error: "Your account is under review." });
   }
 
-  const inviteCode = data.isPrivate
-    ? randomBytes(4).toString("hex").toUpperCase()
-    : null;
+  // CSPRNG code with ≥64 bits of entropy (replaces the brute-forceable 4-byte
+  // hex code) so private rooms cannot be enumerated.
+  const inviteCode = data.isPrivate ? generateInviteCode() : null;
 
   let createConflict: RegularRaceRegistrationRow | null = null;
   const [room] = await db.transaction(async (tx) => {
@@ -3443,7 +3477,7 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   // Eligibility checks
   const [profile] = await db.select().from(profilesTable).where(eq(profilesTable.id, userId)).limit(1);
   if (!profile) return res.status(403).json({ error: "Paid challenges are not available for your account." });
-  if (!profile.isAdult) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
+  if (!computeIsAdult(profile.dateOfBirth, profile.isAdult)) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
   if (!profile.paidRaceEnabled) return res.status(403).json({ error: "Paid challenges are not available for your account." });
   if (profile.accountStatus !== "active") return res.status(403).json({ error: "Your account is under review." });
   if (isCashChallengeUnsupportedForCountry(profile.countryCode)) {
@@ -3852,7 +3886,7 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
   if (room.entryAmountCents > 0) {
     const [profile] = await db.select().from(profilesTable).where(eq(profilesTable.id, userId)).limit(1);
     joinerProfile = profile ?? null;
-    if (!joinerProfile || !joinerProfile.isAdult || !joinerProfile.paidRaceEnabled || joinerProfile.accountStatus !== "active") {
+    if (!joinerProfile || !computeIsAdult(joinerProfile.dateOfBirth, joinerProfile.isAdult) || !joinerProfile.paidRaceEnabled || joinerProfile.accountStatus !== "active") {
       return res.status(403).json({ success: false, error: "Paid challenges are not available for your account." });
     }
     if (isCashChallengeUnsupportedForCountry(joinerProfile.countryCode)) {
@@ -4998,18 +5032,29 @@ router.post("/races/:id/reconcile-steps", requireAuth, async (req, res) => {
     return res.status(409).json({ error: "Reconciliation window has expired" });
   }
 
-  // Sanity check: steps must be plausible for the race duration (max ~10 steps/s)
-  const raceDurationMs = room.startedAt && room.completedAt
-    ? new Date(room.completedAt).getTime() - new Date(room.startedAt).getTime()
-    : 60 * 60_000; // 1-hour fallback when timestamps aren't available
-  const maxPlausibleSteps = Math.ceil((raceDurationMs / 1000) * 10);
-  if (steps > maxPlausibleSteps) {
-    return res.status(400).json({ error: "Step count is implausibly high for the race duration" });
-  }
-
   if (!existingResult) {
     // User was not in race results — nothing to reconcile
     return res.status(404).json({ error: "No race result found for this participant" });
+  }
+
+  // Authoritative bound: the live-progress sync enforces a strict per-second
+  // delta cap during the race, so the server already holds the true running
+  // total in raceParticipantsTable. Reconciliation may only nudge the recorded
+  // steps UP toward that server-tracked value — never past it. Previously the
+  // only cap was a duration-derived ceiling (10 steps/s for the whole race),
+  // which let a finisher who barely walked claim the ceiling and get "verified".
+  const [participant] = await db
+    .select({ currentSteps: raceParticipantsTable.currentSteps, finalSteps: raceParticipantsTable.finalSteps })
+    .from(raceParticipantsTable)
+    .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId)))
+    .limit(1);
+
+  const serverSteps = Math.max(participant?.currentSteps ?? 0, participant?.finalSteps ?? 0);
+  const RECONCILE_TOLERANCE = 100; // absorb a few last un-synced steps
+  const serverCap = serverSteps + RECONCILE_TOLERANCE;
+  if (steps > serverCap) {
+    req.log.warn({ raceId, userId, steps, serverSteps }, "reconcile rejected: exceeds server-tracked steps");
+    return res.status(400).json({ error: "Step count exceeds server-tracked progress for this race." });
   }
 
   // Only update if submitted steps are higher than stored value
@@ -5017,12 +5062,16 @@ router.post("/races/:id/reconcile-steps", requireAuth, async (req, res) => {
     return res.json({ reconciled: false, steps: existingResult.steps, reason: "Stored steps are already higher" });
   }
 
+  // "verified" requires server-side evidence (continuous synced progress that
+  // covers the reconciled value) — NOT the client-supplied source field.
+  const status = serverSteps > 0 && steps <= serverCap ? "verified" : "pending_verification";
+
   await db
     .update(raceResultsTable)
-    .set({ steps, status: source === "healthkit" ? "verified" : "pending_verification" })
+    .set({ steps, status })
     .where(and(eq(raceResultsTable.raceRoomId, raceId), eq(raceResultsTable.userId, userId)));
 
-  req.log.info({ raceId, userId, steps, source, prev: existingResult.steps }, "race steps reconciled");
+  req.log.info({ raceId, userId, steps, source, serverSteps, status, prev: existingResult.steps }, "race steps reconciled");
   return res.json({ reconciled: true, steps, rank: existingResult.rank });
 });
 
@@ -5093,6 +5142,13 @@ router.post("/races/:id/comments", requireAuth, async (req, res) => {
 
   const clientMsgId = typeof clientMessageId === "string" && clientMessageId.length > 0 && clientMessageId.length <= 80
     ? clientMessageId : undefined;
+
+  // Only participants may post comments — otherwise any authenticated user can
+  // inject comments and broadcast on the public race channel for a race they
+  // are not in.
+  if (!(await isRaceParticipant(userId, raceId))) {
+    return res.status(403).json({ error: "Only race participants can comment." });
+  }
 
   const [profile] = await db
     .select({ username: profilesTable.username, countryFlag: profilesTable.countryFlag, avatarColor: profilesTable.avatarColor, avatarUrl: profilesTable.avatarUrl, updatedAt: profilesTable.updatedAt })
@@ -5218,24 +5274,47 @@ router.post("/races/:id/participants/:userId/remove", requireAuth, async (req, r
   // If room was "full", removing a player opens a slot — reset to "open"
   const newRoomStatus = room.status === "full" ? "open" : room.status;
 
-  await db.transaction(async (tx) => {
-    await tx
-      .update(raceParticipantsTable)
-      .set({ status: "left" })
-      .where(and(
-        eq(raceParticipantsTable.raceRoomId, raceId),
-        eq(raceParticipantsTable.userId, targetUserId),
-        ne(raceParticipantsTable.status, "left"),
-      ));
-    await tx
-      .update(raceRoomsTable)
-      .set({
-        currentPlayers: sql`GREATEST(${raceRoomsTable.currentPlayers} - 1, 0)`,
-        status: newRoomStatus,
-        updatedAt: new Date(),
-      })
-      .where(eq(raceRoomsTable.id, raceId));
-  });
+  // Paid rooms: the removed player paid an entry fee. Reuse the same
+  // remove-and-refund path as a voluntary leave so the entry fee is credited
+  // back idempotently inside one transaction, instead of silently forfeiting it.
+  let refundProcessed = false;
+  let refundAmount = 0;
+  if (room.entryAmountCents > 0) {
+    const leaveResult = await createRefundForRaceLeave({
+      raceId,
+      userId: targetUserId,
+      reasonCode: "host_removed",
+    });
+    refundAmount = leaveResult.refund.succeededCashCents ?? 0;
+    refundProcessed = refundAmount > 0;
+    // createRefundForRaceLeave decremented currentPlayers but does not reopen a
+    // full room; reset the status here so a freed slot is joinable again.
+    if (newRoomStatus !== room.status) {
+      await db
+        .update(raceRoomsTable)
+        .set({ status: newRoomStatus, updatedAt: new Date() })
+        .where(eq(raceRoomsTable.id, raceId));
+    }
+  } else {
+    await db.transaction(async (tx) => {
+      await tx
+        .update(raceParticipantsTable)
+        .set({ status: "left" })
+        .where(and(
+          eq(raceParticipantsTable.raceRoomId, raceId),
+          eq(raceParticipantsTable.userId, targetUserId),
+          ne(raceParticipantsTable.status, "left"),
+        ));
+      await tx
+        .update(raceRoomsTable)
+        .set({
+          currentPlayers: sql`GREATEST(${raceRoomsTable.currentPlayers} - 1, 0)`,
+          status: newRoomStatus,
+          updatedAt: new Date(),
+        })
+        .where(eq(raceRoomsTable.id, raceId));
+    });
+  }
 
   const [updatedRoom] = await db
     .select({ currentPlayers: raceRoomsTable.currentPlayers })
@@ -5257,18 +5336,18 @@ router.post("/races/:id/participants/:userId/remove", requireAuth, async (req, r
     currentPlayers: participantCount,
     roomStatus: newRoomStatus,
     participantIds: remainingParticipants.map((p) => p.userId),
-    refundProcessed: false,
-    refundAmount: 0,
+    refundProcessed,
+    refundAmount,
   });
 
-  req.log.info({ raceId, removedUserId: targetUserId, byUserId: currentUserId, newRoomStatus }, "host removed participant from waiting room");
+  req.log.info({ raceId, removedUserId: targetUserId, byUserId: currentUserId, newRoomStatus, refundProcessed, refundAmount }, "host removed participant from waiting room");
   return res.json({
     success: true,
     raceId,
     removedUserId: targetUserId,
     participantCount,
-    refundProcessed: false,
-    refundAmount: 0,
+    refundProcessed,
+    refundAmount,
     message: "Player removed from room",
   });
 });

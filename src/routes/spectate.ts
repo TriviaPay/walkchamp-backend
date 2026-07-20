@@ -100,7 +100,11 @@ router.post("/spectate/complete", requireAuth, async (req, res) => {
     });
   }
 
-  const coins = await grantCoinReward(userId, "SPECTATE_MATCH", sessionId, "Spectated a match");
+  // Key the reward on the RACE, not the session. grantCoinReward is idempotent
+  // on (userId, rewardCode, sourceId); using sessionId let a user farm unlimited
+  // rewards by opening many sessions for the same race. raceRoomId caps it to
+  // one SPECTATE_MATCH reward per race.
+  const coins = await grantCoinReward(userId, "SPECTATE_MATCH", session.raceRoomId, "Spectated a match");
 
   await db
     .update(spectateSessionsTable)

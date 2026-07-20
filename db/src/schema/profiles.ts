@@ -24,7 +24,8 @@ export const profilesTable = pgTable("profiles", {
   fullName: text("full_name").notNull(),
   username: text("username").notNull().unique(),
   dateOfBirth: text("date_of_birth"),
-  age: integer("age"),
+  // NOTE: `age`/`is_adult` are derived from dateOfBirth — `age` was dropped
+  // (never read) and adulthood is computed at read time via computeIsAdult().
   country: text("country"),
   countryCode: text("country_code"),
   countryFlag: text("country_flag"),
@@ -50,7 +51,8 @@ export const profilesTable = pgTable("profiles", {
   bio: text("bio"),
   profileCompleted: boolean("profile_completed").notNull().default(false),
   stripeCustomerId: text("stripe_customer_id"),
-  walletBalance: integer("wallet_balance").notNull().default(0),
+  // Cash balance lives in the `wallets` table (availableBalanceCents). The old
+  // `wallet_balance` column here was unused/legacy and has been dropped.
   totalSteps: integer("total_steps").notNull().default(0),
   currentStreak: integer("current_streak").notNull().default(0),
   currentRank: integer("current_rank").notNull().default(9999),
@@ -67,7 +69,6 @@ export const insertProfileSchema = createInsertSchema(profilesTable).omit({
   lastLoginAt: true,
   lastSeenAt: true,
   fraudScore: true,
-  walletBalance: true,
   totalSteps: true,
   currentStreak: true,
   currentRank: true,

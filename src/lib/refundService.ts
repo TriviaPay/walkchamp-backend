@@ -1074,8 +1074,17 @@ export async function reconcileProviderRefund(input: {
     ? input.eventPayload.payment_id ?? entity?.payment_id
     : input.eventPayload.payment_intent ?? entity?.payment_intent;
 
+  // Coerce the amount before comparing. Previously the check only ran when
+  // eventAmount was already a `number`, so a provider sending a string ("1000")
+  // silently skipped amount verification. Now any PRESENT amount is coerced and
+  // a non-integer or mismatching value is treated as a binding failure.
+  const eventAmountRaw = eventAmount ?? null;
+  const eventAmountNum = eventAmountRaw === null ? null : Number(eventAmountRaw);
+  const amountMismatch =
+    eventAmountRaw !== null && (!Number.isInteger(eventAmountNum) || eventAmountNum !== item.approvedAmount);
+
   const bindingMismatch =
-    (typeof eventAmount === "number" && eventAmount !== item.approvedAmount)
+    amountMismatch
     || (typeof eventCurrency === "string" && eventCurrency.trim().toLowerCase() !== item.currency.trim().toLowerCase())
     || (typeof eventPaymentId === "string" && item.providerPaymentId && eventPaymentId !== item.providerPaymentId);
 

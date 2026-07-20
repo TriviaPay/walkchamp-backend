@@ -111,6 +111,12 @@ export async function recordCoinLedgerEntry(
     .values({ userId: entry.userId, currentBalance: 0, lifetimeEarned: 0, lifetimeSpent: 0 })
     .onConflictDoNothing();
 
+  // Lock the balance row FOR UPDATE before read-modify-write. Without this,
+  // two concurrent DISTINCT spends (different idempotency keys) both read the
+  // same starting balance and both commit, losing one debit (double-spend) and
+  // allowing the balance to go negative. The lock serializes them so the second
+  // spend sees the first spend's decremented balance and the negative-balance
+  // guard below can reject it.
   const [balanceRow] = await tx
     .select({
       currentBalance: coinBalancesTable.currentBalance,
@@ -119,7 +125,8 @@ export async function recordCoinLedgerEntry(
     })
     .from(coinBalancesTable)
     .where(eq(coinBalancesTable.userId, entry.userId))
-    .limit(1);
+    .limit(1)
+    .for("update");
 
   const currentBalance = balanceRow?.currentBalance ?? 0;
   if (entry.amount < 0 && currentBalance + entry.amount < 0) {

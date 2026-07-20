@@ -38,6 +38,28 @@ export function calcAgeFromDob(normalized: string, now: Date = new Date()): numb
   return age;
 }
 
+/**
+ * Authoritative adulthood check computed from the stored date of birth, so it
+ * stays correct as the user ages (a stored `is_adult` boolean set once at signup
+ * never flips when a 17-year-old turns 18). Falls back to `fallback` (the legacy
+ * stored flag) only when no valid DOB is present, so pre-DOB accounts are not
+ * locked out.
+ */
+export function computeIsAdult(
+  dateOfBirth: string | null | undefined,
+  fallback = false,
+  now: Date = new Date(),
+): boolean {
+  if (typeof dateOfBirth === "string") {
+    const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(dateOfBirth.trim());
+    if (m) {
+      const normalized = `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+      return calcAgeFromDob(normalized, now) >= MIN_SIGNUP_AGE;
+    }
+  }
+  return fallback;
+}
+
 export function parseAndValidateDob(input: unknown, now: Date = new Date()): DobResult {
   if (typeof input !== "string") {
     return { ok: false, code: "malformed", message: "Date of birth is required." };

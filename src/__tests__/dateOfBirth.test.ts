@@ -3,7 +3,7 @@
  * dates, future dates, and underage dates. Normalizes to YYYY-MM-DD without JS Date correction.
  */
 import { describe, it, expect } from "vitest";
-import { parseAndValidateDob, calcAgeFromDob, MIN_SIGNUP_AGE } from "../lib/dateOfBirth";
+import { parseAndValidateDob, calcAgeFromDob, computeIsAdult, MIN_SIGNUP_AGE } from "../lib/dateOfBirth";
 
 // Fixed "today" so future/underage assertions are deterministic (July 18, 2026, local).
 const NOW = new Date(2026, 6, 18);
@@ -39,6 +39,30 @@ describe("parseAndValidateDob — accepts", () => {
   it("computes age correctly (birthday not yet reached this year)", () => {
     expect(ok("2000-09-09").age).toBe(25); // Sep birthday, 'today' is July
     expect(ok("2000-01-01").age).toBe(26);
+  });
+});
+
+describe("computeIsAdult — derived from DOB, not a stale stored flag", () => {
+  it("recomputes adulthood as the user ages (fixes the stored is_adult staleness bug)", () => {
+    // Someone who was 17 at signup is now 18 by NOW — must be treated as adult
+    // even if a stored flag would still say false.
+    const eighteenthBirthday = new Date(NOW.getFullYear() - MIN_SIGNUP_AGE, NOW.getMonth(), NOW.getDate());
+    const dob = `${eighteenthBirthday.getFullYear()}-${String(eighteenthBirthday.getMonth() + 1).padStart(2, "0")}-${String(eighteenthBirthday.getDate()).padStart(2, "0")}`;
+    expect(computeIsAdult(dob, false, NOW)).toBe(true);
+  });
+
+  it("returns false for a genuine minor regardless of a stored true flag", () => {
+    expect(computeIsAdult("2020-01-01", true, NOW)).toBe(false);
+  });
+
+  it("accepts single-digit month/day", () => {
+    expect(computeIsAdult("2000-1-1", false, NOW)).toBe(true);
+  });
+
+  it("falls back to the stored flag only when DOB is missing/invalid", () => {
+    expect(computeIsAdult(null, true, NOW)).toBe(true);
+    expect(computeIsAdult(null, false, NOW)).toBe(false);
+    expect(computeIsAdult("garbage", true, NOW)).toBe(true);
   });
 });
 

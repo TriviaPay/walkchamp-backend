@@ -85,6 +85,30 @@ export async function lockWalletByUserId(tx: DbTx, userId: string) {
   return wallet ?? null;
 }
 
+/**
+ * Non-locking membership check: is `userId` an active participant of `raceRoomId`?
+ * Uses the shared `db` handle by default, or a transaction if provided.
+ * "Active" excludes participants who have left.
+ */
+export async function isRaceParticipant(
+  userId: string,
+  raceRoomId: string,
+  tx?: DbTx,
+): Promise<boolean> {
+  const runner = tx ?? db;
+  const [participant] = await runner
+    .select({ id: raceParticipantsTable.id })
+    .from(raceParticipantsTable)
+    .where(
+      and(
+        eq(raceParticipantsTable.raceRoomId, raceRoomId),
+        eq(raceParticipantsTable.userId, userId),
+      ),
+    )
+    .limit(1);
+  return Boolean(participant);
+}
+
 export async function lockParticipant(tx: DbTx, raceRoomId: string, userId: string) {
   const [participant] = await tx
     .select()

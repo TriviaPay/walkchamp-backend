@@ -17,6 +17,7 @@ import { proxyStoredObjectResponse } from "../lib/objectMediaProxy.js";
 import { config } from "../lib/config.js";
 import { triggerEvent } from "../lib/pusher.js";
 import { buildTrackThemeMedia } from "../lib/trackThemeMedia.js";
+import { logger } from "../lib/logger.js";
 
 const router = Router();
 const THEME_OBJECT_EXTENSIONS = ["", ".png", ".jpg", ".jpeg", ".webp", ".gif"];
@@ -509,8 +510,12 @@ export async function validateThemeOwnership(userId: string, themeCode: string):
       .limit(1);
 
     return !!owned;
-  } catch {
-    return true; // fail-open to avoid breaking race creation
+  } catch (err) {
+    // Fail CLOSED: an unexpected error (pool exhaustion, timeout, deadlock —
+    // all inducible under load) must not grant access to a paid theme. Deny and
+    // let the caller surface the failure rather than silently bypass the paywall.
+    logger.error({ err, userId, themeCode }, "validateThemeOwnership failed; denying access");
+    return false;
   }
 }
 

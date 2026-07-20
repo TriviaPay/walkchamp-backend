@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { getDescopeClient } from "../lib/descope.js";
 import { requireAuth, requireJwtOnly, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { parseAndValidateDob } from "../lib/dateOfBirth.js";
+import { generateReferralCode } from "../lib/inviteCodes.js";
 import { config } from "../lib/config.js";
 import {
   registerOrReplaceSession,
@@ -329,7 +330,7 @@ router.post("/auth/profile", requireJwtOnly, async (req, res) => {
   }
   const age = dob.age;
   const isAdult = age >= 18;
-  const referralCode = "WC" + Math.random().toString(36).substring(2, 8).toUpperCase();
+  const referralCode = generateReferralCode();
 
   try {
     const [profile] = await db
@@ -340,7 +341,6 @@ router.post("/auth/profile", requireJwtOnly, async (req, res) => {
         fullName: data.fullName.trim(),
         username: data.username.toLowerCase().trim(),
         dateOfBirth: dob.normalized,
-        age,
         country: data.country,
         countryCode: data.countryCode,
         countryFlag: data.countryFlag,
@@ -395,11 +395,15 @@ router.get("/auth/profile/:userId", requireAuth, async (req, res) => {
 });
 
 // ── PATCH /api/auth/profile/:userId — authenticated ─────────────────────────
+// Only user-editable presentation fields are accepted here. Trust/session
+// fields (emailVerified, lastLoginAt, lastSeenAt) are set exclusively by the
+// server-side auth flow — accepting them from the request body previously let a
+// user self-verify their email and forge login/activity timestamps.
 const updateProfileSchema = z.object({
-  emailVerified: z.boolean().optional(),
-  lastLoginAt: z.string().optional(),
-  lastSeenAt: z.string().optional(),
-  avatarColor: z.string().optional(),
+  avatarColor: z
+    .string()
+    .regex(/^#[0-9a-fA-F]{6}$/, "avatarColor must be a #RRGGBB hex color")
+    .optional(),
   bio: z.string().max(120).optional(),
 });
 
@@ -419,11 +423,8 @@ router.patch("/auth/profile/:userId", requireAuth, async (req, res) => {
 
   const updates: Record<string, unknown> = { updatedAt: new Date() };
   const d = parse.data;
-  if (d.emailVerified !== undefined) updates.emailVerified = d.emailVerified;
   if (d.avatarColor) updates.avatarColor = d.avatarColor;
   if (d.bio !== undefined) updates.bio = d.bio;
-  if (d.lastLoginAt) updates.lastLoginAt = new Date(d.lastLoginAt);
-  if (d.lastSeenAt) updates.lastSeenAt = new Date(d.lastSeenAt);
 
   const [updated] = await db
     .update(profilesTable)
@@ -509,7 +510,7 @@ router.post("/auth/complete-signup", requireJwtOnly, async (req, res) => {
 
   const age = dob.age;
   const isAdult = age >= 18;
-  const referralCode = "WC" + Math.random().toString(36).substring(2, 8).toUpperCase();
+  const referralCode = generateReferralCode();
 
   try {
     const [profile] = await db.transaction(async (tx) => {
@@ -521,7 +522,6 @@ router.post("/auth/complete-signup", requireJwtOnly, async (req, res) => {
           fullName: data.fullName.trim(),
           username: data.username.toLowerCase().trim(),
           dateOfBirth: dob.normalized,
-          age,
           country: data.country,
           countryCode: data.countryCode,
           countryFlag: data.countryFlag,
