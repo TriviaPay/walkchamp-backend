@@ -455,6 +455,34 @@ router.post("/chat/private/react", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Invalid reaction" });
   }
 
+  // Verify the caller is a member of the conversation AND that the message
+  // actually belongs to it, before writing a reaction or broadcasting to the
+  // conversation channel. Otherwise any user could pollute reactions and spam
+  // realtime events on conversations they are not part of.
+  const [conv] = await db
+    .select({ id: conversationsTable.id })
+    .from(conversationsTable)
+    .where(
+      and(
+        eq(conversationsTable.id, parsed.data.conversationId),
+        or(eq(conversationsTable.user1Id, userId), eq(conversationsTable.user2Id, userId)),
+      ),
+    )
+    .limit(1);
+  if (!conv) return res.status(403).json({ error: "Not a member of this conversation" });
+
+  const [message] = await db
+    .select({ id: privateChatMessagesTable.id })
+    .from(privateChatMessagesTable)
+    .where(
+      and(
+        eq(privateChatMessagesTable.id, parsed.data.messageId),
+        eq(privateChatMessagesTable.conversationId, parsed.data.conversationId),
+      ),
+    )
+    .limit(1);
+  if (!message) return res.status(404).json({ error: "Message not found in this conversation" });
+
   await db
     .insert(chatReactionsTable)
     .values({ messageId: parsed.data.messageId, messageType: "private", userId, emoji: parsed.data.emoji })

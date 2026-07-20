@@ -14,6 +14,7 @@ import { notifyGroupsOnDailyGoalCompletion } from "../lib/pushNotificationServic
 import { getChallengeCardsForUser, getRoomCountsSummary } from "./races.js";
 import { getSponsoredEventsForUser } from "./sponsoredEvents.js";
 import { getTrackThemeSummaryForUser } from "./trackThemes.js";
+import { validateRecentLocalDate } from "../lib/localDate.js";
 
 const router = Router();
 
@@ -209,7 +210,21 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   }
 
   const { steps, durationSeconds = 0, source } = parsed.data;
-  const today = localDateStr(parsed.data.localDate);
+
+  // Reject backdated / post-dated submissions. Milestone rewards are date-scoped
+  // (e.g. daily_walk_2020-01-01) and only dedupe within the SAME date, so an
+  // unbounded localDate lets a user farm milestone coins for hundreds of past
+  // dates. Allow ±1 day to tolerate client/server timezone skew.
+  let today: string;
+  if (parsed.data.localDate !== undefined) {
+    const dv = validateRecentLocalDate(parsed.data.localDate, { pastDays: 1, futureDays: 1 });
+    if (!dv.ok) {
+      return res.status(400).json({ error: "Step date is out of the allowed range.", code: dv.code });
+    }
+    today = dv.normalized;
+  } else {
+    today = localDateStr(undefined); // server UTC date
+  }
 
   // Read previous step total BEFORE the upsert — needed for goal-crossing detection.
   // If the row does not yet exist for today, previousSteps = 0.

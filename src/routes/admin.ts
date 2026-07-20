@@ -625,19 +625,37 @@ router.post("/admin/withdrawals/:id/approve", requireCashFeaturesEnabled, async 
     throw err;
   }
 
-  const [row] = await db
-    .select()
-    .from(withdrawalsTable)
-    .where(eq(withdrawalsTable.id, withdrawalId))
-    .limit(1);
+  // Atomic state transition: lock the row, then flip pending -> approved with a
+  // compare-and-swap predicate. Two concurrent approvals (double-click, retry,
+  // two admins) can no longer both succeed — the second sees rowsAffected === 0
+  // and returns 409. Prevents double approval / double payout (TOCTOU).
+  const result = await db.transaction(async (tx) => {
+    const [row] = await tx
+      .select()
+      .from(withdrawalsTable)
+      .where(eq(withdrawalsTable.id, withdrawalId))
+      .limit(1)
+      .for("update");
 
-  if (!row) return res.status(404).json({ error: "Withdrawal not found" });
-  if (row.status !== "pending") return res.status(409).json({ error: `Withdrawal is already ${row.status}` });
+    if (!row) return { status: "not_found" as const };
+    if (row.status !== "pending") return { status: "conflict" as const, withdrawal: row };
 
-  await db
-    .update(withdrawalsTable)
-    .set({ status: "approved", updatedAt: new Date() })
-    .where(eq(withdrawalsTable.id, withdrawalId));
+    const updated = await tx
+      .update(withdrawalsTable)
+      .set({ status: "approved", updatedAt: new Date() })
+      .where(and(eq(withdrawalsTable.id, withdrawalId), eq(withdrawalsTable.status, "pending")))
+      .returning({ id: withdrawalsTable.id });
+
+    if (updated.length === 0) return { status: "conflict" as const, withdrawal: row };
+    return { status: "approved" as const, withdrawal: row };
+  });
+
+  if (result.status === "not_found") return res.status(404).json({ error: "Withdrawal not found" });
+  if (result.status === "conflict") {
+    return res.status(409).json({ error: `Withdrawal is already ${result.withdrawal.status}` });
+  }
+
+  const row = result.withdrawal;
 
   logger.info({ withdrawalId, userId: row.userId, amountCents: row.amountCents }, "Admin: withdrawal approved");
   void writeAuditLog({

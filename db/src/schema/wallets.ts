@@ -71,7 +71,6 @@ export const walletTransactionsTable = pgTable("wallet_transactions", {
   idempotencyKey: text("idempotency_key"),
   depositTransactionId: uuid("deposit_transaction_id"),
   raceRoomId: uuid("race_room_id"),
-  challengeId: uuid("challenge_id"),
   paymentId: uuid("payment_id"),
   withdrawalId: uuid("withdrawal_id"),
   refundId: uuid("refund_id"),

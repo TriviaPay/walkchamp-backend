@@ -35,7 +35,10 @@ describe("refundService state helpers", () => {
     const refundService = readFileSync("src/lib/refundService.ts", "utf8");
 
     expect(refundService).toContain("provider_refund_binding_mismatch");
-    expect(refundService).toContain("typeof eventAmount === \"number\" && eventAmount !== item.approvedAmount");
+    // Amount binding now coerces the event amount so a string/non-numeric value
+    // cannot silently skip the check (see L-1 audit fix).
+    expect(refundService).toContain("const eventAmountNum = eventAmountRaw === null ? null : Number(eventAmountRaw)");
+    expect(refundService).toContain("!Number.isInteger(eventAmountNum) || eventAmountNum !== item.approvedAmount");
     expect(refundService).toContain("eventCurrency === \"string\"");
     expect(refundService).toContain("eventPaymentId === \"string\"");
     expect(refundService).toContain("[RefundService] provider refund webhook binding mismatch");

@@ -13,6 +13,8 @@ import {
 import { eq, and, sql, desc, inArray, ne } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
+import { validateRecentLocalDate } from "../lib/localDate.js";
+import { generateInviteCode } from "../lib/inviteCodes.js";
 import { triggerEvent } from "../lib/pusher.js";
 import { evaluateAndNotify } from "./achievementHooks.js";
 import { sendPushToUser } from "./push.js";
@@ -67,7 +69,9 @@ function todayUtc(): string {
 }
 
 function makeInviteCode(): string {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
+  // CSPRNG-backed, ~65 bits — see generateInviteCode. Math.random() is not
+  // cryptographically secure and its codes are predictable/enumerable.
+  return generateInviteCode();
 }
 
 async function getProfile(userId: string) {
@@ -1080,12 +1084,15 @@ router.get("/groups/:groupId/leaderboard", requireAuth, async (req, res) => {
 });
 
 // ── POST /api/groups/steps/sync ───────────────────────────────────────────────
+// Upper bounds match walk.ts (MAX_DAILY_STEPS) so a member cannot poison group
+// leaderboards with absurd counts; stepDate is bounded to a recent window below.
+const MAX_DAILY_STEPS = 200000;
 const stepSyncSchema = z.object({
-  dailySteps: z.number().int().min(0),
-  verifiedSteps: z.number().int().min(0).optional(),
+  dailySteps: z.number().int().min(0).max(MAX_DAILY_STEPS),
+  verifiedSteps: z.number().int().min(0).max(MAX_DAILY_STEPS).optional(),
   stepDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-  calories: z.number().optional(),
-  distanceMeters: z.number().optional(),
+  calories: z.number().min(0).max(100000).optional(),
+  distanceMeters: z.number().min(0).max(1000000).optional(),
 });
 
 router.post("/groups/steps/sync", requireAuth, async (req, res) => {
@@ -1094,6 +1101,11 @@ router.post("/groups/steps/sync", requireAuth, async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: "Invalid payload" });
 
   const { dailySteps, verifiedSteps, stepDate, calories, distanceMeters } = parsed.data;
+
+  // Reject backdated / future step dates (±1 day for timezone skew) to prevent
+  // rewriting historical group stats.
+  const dv = validateRecentLocalDate(stepDate, { pastDays: 1, futureDays: 1 });
+  if (!dv.ok) return res.status(400).json({ error: "Step date is out of the allowed range.", code: dv.code });
   req.log.info({ userId, dailySteps, stepDate }, "[Groups] step sync");
 
   // Find all active groups for this user

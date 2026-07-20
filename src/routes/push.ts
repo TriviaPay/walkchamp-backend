@@ -45,6 +45,19 @@ router.post("/push/register-device", requireAuth, async (req, res) => {
   const deviceId = authReq.deviceInfo?.deviceId ?? null;
   const sessionId = authReq.sessionId ?? null;
 
+  // Do not let one user silently seize a device already registered to another
+  // user (which would redirect the victim's push notifications). If the
+  // onesignalPlayerId is already owned by a different user, reject.
+  const [existingDevice] = await db
+    .select({ userId: notificationDevicesTable.userId })
+    .from(notificationDevicesTable)
+    .where(eq(notificationDevicesTable.onesignalPlayerId, playerId))
+    .limit(1);
+  if (existingDevice && existingDevice.userId !== userId) {
+    req.log.warn({ userId, playerId }, "push device register rejected: owned by another user");
+    return res.status(409).json({ error: "Device is registered to another account." });
+  }
+
   await db
     .insert(notificationDevicesTable)
     .values({
@@ -60,8 +73,10 @@ router.post("/push/register-device", requireAuth, async (req, res) => {
     })
     .onConflictDoUpdate({
       target: [notificationDevicesTable.onesignalPlayerId],
+      // Extra guard against a concurrent takeover: only update rows still owned
+      // by this user.
+      where: eq(notificationDevicesTable.userId, userId),
       set: {
-        userId,
         platform: devicePlatform ?? "unknown",
         deviceModel,
         appVersion,

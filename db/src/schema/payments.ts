@@ -33,7 +33,6 @@ export const paymentsTable = pgTable("payments", {
     .references(() => profilesTable.id, { onDelete: "restrict" }),
   stripePaymentIntentId: text("stripe_payment_intent_id").unique(),
   stripeCustomerId: text("stripe_customer_id"),
-  challengeId: uuid("challenge_id"),
   raceRoomId: uuid("race_room_id"),
   amountCents: integer("amount_cents").notNull(),
   currency: text("currency").notNull().default("usd"),

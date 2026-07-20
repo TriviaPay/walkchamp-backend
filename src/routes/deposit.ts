@@ -127,14 +127,20 @@ async function getUserCountryCode(userId: string): Promise<string | null> {
 async function markDepositReturnObserved(
   transactionId: string,
   patch: Record<string, unknown>,
+  opts: { onlyIfPending?: boolean } = {},
 ) {
   const [depositTx] = await db
-    .select({ id: depositTransactionsTable.id, metadata: depositTransactionsTable.metadata })
+    .select({ id: depositTransactionsTable.id, status: depositTransactionsTable.status, metadata: depositTransactionsTable.metadata })
     .from(depositTransactionsTable)
     .where(eq(depositTransactionsTable.id, transactionId))
     .limit(1);
 
   if (!depositTx) return;
+
+  // For unauthenticated browser callbacks, only touch transactions that are
+  // still pending. A settled (succeeded/failed) deposit must not have its
+  // metadata rewritten by anyone who knows the transaction UUID.
+  if (opts.onlyIfPending && depositTx.status !== "pending") return;
 
   await db
     .update(depositTransactionsTable)
@@ -955,7 +961,7 @@ router.get("/wallet/deposit/done", (req, res) => {
 
 const browserUpdateSchema = z.object({
   transaction_id: z.string().uuid(),
-  reason: z.string().optional(),
+  reason: z.string().max(200).optional(),
 });
 
 /**
@@ -972,7 +978,7 @@ router.post("/wallet/deposit/razorpay/browser-cancel", async (req, res) => {
     browserCancelSeenAt: new Date().toISOString(),
     browserCancelReason: parsed.data.reason ?? "browser_cancel",
     returnDisplayStatus: "cancelled",
-  });
+  }, { onlyIfPending: true });
 
   return res.json({ ok: true });
 });
@@ -994,7 +1000,7 @@ router.post("/wallet/deposit/razorpay/browser-fail", async (req, res) => {
     browserFailSeenAt: new Date().toISOString(),
     browserFailReason: reason,
     returnDisplayStatus: "failed",
-  });
+  }, { onlyIfPending: true });
 
   return res.json({ ok: true });
 });

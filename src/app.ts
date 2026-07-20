@@ -325,6 +325,29 @@ if (config.features.rateLimitingEnabled) {
     dimensions: ["ip", "actor", "device", "token"],
     enforcement: "monitor",
   }));
+  // Step-submission endpoints write persistent state and drive coin rewards /
+  // leaderboards; without a limiter a single account can spam them. Generous
+  // per-actor caps that legitimate periodic syncs stay well under.
+  app.use("/api/walk", createRedisRateLimit({
+    bucket: "walk-steps",
+    windowMs: 60 * 1000,
+    max: 60,
+    failureMode: "open",
+    message: "Too many step updates — please slow down.",
+    code: "WALK_RATE_LIMITED",
+    key: rateLimitByActorOrIp,
+    dimensions: ["ip", "actor", "device", "token"],
+  }));
+  app.use("/api/groups/steps", createRedisRateLimit({
+    bucket: "group-steps",
+    windowMs: 60 * 1000,
+    max: 30,
+    failureMode: "open",
+    message: "Too many step updates — please slow down.",
+    code: "GROUP_STEPS_RATE_LIMITED",
+    key: rateLimitByActorOrIp,
+    dimensions: ["ip", "actor", "device", "token"],
+  }));
 }
 
 app.use("/api", router);
