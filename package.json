@@ -11,7 +11,6 @@
     "dev": "pnpm run build && pnpm run start",
     "build": "node ./build.mjs",
     "ci:verify": "pnpm run typecheck && pnpm run test && pnpm run build",
-    "vercel-build": "pnpm run build",
     "start": "node --enable-source-maps ./dist/index.mjs",
     "worker": "node --enable-source-maps ./dist/worker.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
