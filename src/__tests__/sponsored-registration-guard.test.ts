@@ -199,3 +199,38 @@ describe("sponsored event single-registration guard", () => {
     expect(mocks.registerOrReviveScheduledRegistration).toHaveBeenCalledTimes(1);
   });
 });
+
+// The app registers for sponsored events via POST /api/sponsored-events/:roomId/register (which
+// deducts coins), NOT the /rooms/:roomId/register path. The guard must live there, take a per-user
+// lock, and run before the coin deduction. These assertions pin it to the correct endpoint so the
+// "guard exists but in the wrong file" regression cannot recur.
+describe("sponsored-events register endpoint enforces one active registration", () => {
+  const src = readFileSync("src/routes/sponsoredEvents.ts", "utf8");
+  const registerFn = src.slice(src.indexOf('"/sponsored-events/:roomId/register"'));
+  const registerBody = registerFn.slice(0, registerFn.indexOf("cancel-registration"));
+
+  it("serializes the user with a per-user advisory lock inside the transaction", () => {
+    expect(registerBody).toContain("pg_advisory_xact_lock");
+    expect(registerBody).toContain("sponsored_event_registration:${userId}");
+  });
+
+  it("runs the single-registration guard before deducting coins", () => {
+    const guardIdx = registerBody.indexOf("getActiveSponsoredRegistration(tx");
+    const debitIdx = registerBody.indexOf("recordCoinLedgerEntry");
+    expect(guardIdx).toBeGreaterThan(-1);
+    expect(debitIdx).toBeGreaterThan(-1);
+    expect(guardIdx).toBeLessThan(debitIdx);
+    expect(registerBody).toContain("SPONSORED_EVENT_REGISTRATION_EXISTS");
+  });
+
+  it("only counts non-completed sponsored events as blocking", () => {
+    const helper = src.slice(
+      src.indexOf("async function getActiveSponsoredRegistration"),
+      src.indexOf('"/sponsored-events/:roomId/register"'),
+    );
+    expect(helper).toContain('eq(raceRoomsTable.type, "sponsored")');
+    expect(helper).toContain('inArray(raceRoomsTable.status, ["open", "full", "in_progress"])');
+    expect(helper).toContain('eq(scheduledRoomRegistrationsTable.status, "registered")');
+    expect(helper).toContain('eq(raceRoomsTable.status, "scheduled")');
+  });
+});

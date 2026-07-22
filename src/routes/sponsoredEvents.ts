@@ -758,6 +758,57 @@ router.post("/sponsored-events/generate-weekend", requireAuth, requireAdminKey, 
   }
 });
 
+// Transaction handle type (drizzle tx passed to db.transaction callback).
+type TxLike = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+// Finds a Sponsored Event the user is already engaged in (registered for a scheduled event OR an
+// active participant of an open/in-progress event), excluding the room being registered for.
+// Used to enforce "one Sponsored Event at a time". Completed/cancelled events do not count.
+async function getActiveSponsoredRegistration(tx: TxLike, userId: string, excludeRoomId: string) {
+  const excludeCurrentRoom = ne(raceRoomsTable.id, excludeRoomId);
+
+  const [participating] = await tx
+    .select({
+      roomId: raceRoomsTable.id,
+      roomStatus: raceRoomsTable.status,
+      scheduledStartAt: raceRoomsTable.scheduledStartAt,
+    })
+    .from(raceRoomsTable)
+    .innerJoin(
+      raceParticipantsTable,
+      and(
+        eq(raceParticipantsTable.raceRoomId, raceRoomsTable.id),
+        eq(raceParticipantsTable.userId, userId),
+        inArray(raceParticipantsTable.status, ["joined", "active"]),
+      ),
+    )
+    .where(and(
+      eq(raceRoomsTable.type, "sponsored"),
+      inArray(raceRoomsTable.status, ["open", "full", "in_progress"]),
+      excludeCurrentRoom,
+    ))
+    .limit(1);
+  if (participating) return participating;
+
+  const [registration] = await tx
+    .select({
+      roomId: raceRoomsTable.id,
+      roomStatus: raceRoomsTable.status,
+      scheduledStartAt: raceRoomsTable.scheduledStartAt,
+    })
+    .from(scheduledRoomRegistrationsTable)
+    .innerJoin(raceRoomsTable, eq(raceRoomsTable.id, scheduledRoomRegistrationsTable.raceRoomId))
+    .where(and(
+      eq(scheduledRoomRegistrationsTable.userId, userId),
+      eq(scheduledRoomRegistrationsTable.status, "registered"),
+      eq(raceRoomsTable.type, "sponsored"),
+      eq(raceRoomsTable.status, "scheduled"),
+      excludeCurrentRoom,
+    ))
+    .limit(1);
+  return registration ?? null;
+}
+
 // ── POST /api/sponsored-events/:roomId/register ───────────────────────────────
 router.post("/sponsored-events/:roomId/register", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
@@ -767,6 +818,10 @@ router.post("/sponsored-events/:roomId/register", requireAuth, async (req, res) 
 
   try {
     const result = await db.transaction(async (tx) => {
+      // Serialize this user's sponsored registrations so concurrent requests to two different
+      // events cannot both pass the single-registration guard below.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`sponsored_event_registration:${userId}`}, 0))`);
+
       const room = await lockRaceRoom(tx, roomId);
 
       if (!room || room.type !== "sponsored") {
@@ -782,6 +837,24 @@ router.post("/sponsored-events/:roomId/register", requireAuth, async (req, res) 
 
       if (room.registeredCount >= room.maxPlayers) {
         return { status: 409 as const, body: { error: "This event is full." } };
+      }
+
+      // Enforce: a user may be registered for only one Sponsored Event at a time.
+      const existingSponsored = await getActiveSponsoredRegistration(tx, userId, roomId);
+      if (existingSponsored) {
+        return {
+          status: 409 as const,
+          body: {
+            error:
+              "You can register for only one Sponsored Event at a time. Leave your current Sponsored Event or wait until it has been completed before registering for another.",
+            code: "SPONSORED_EVENT_REGISTRATION_EXISTS",
+            sponsored_event: {
+              room_id: existingSponsored.roomId,
+              room_status: existingSponsored.roomStatus,
+              scheduled_start_at: existingSponsored.scheduledStartAt?.toISOString() ?? null,
+            },
+          },
+        };
       }
 
       await tx
