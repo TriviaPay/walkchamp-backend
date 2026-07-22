@@ -24,6 +24,7 @@ import groupsRouter from "./groups.js";
 import sponsoredEventsRouter from "./sponsoredEvents.js";
 import coinsBattleRouter from "./coinsBattle.js";
 import pushRouter from "./push.js";
+import referralRouter from "./referral.js";
 import adminRouter from "./admin.js";
 
 const router: IRouter = Router();
@@ -53,6 +54,7 @@ router.use(groupsRouter);
 router.use(sponsoredEventsRouter);
 router.use(coinsBattleRouter);
 router.use(pushRouter);
+router.use(referralRouter);
 router.use(adminRouter);
 
 export default router;
