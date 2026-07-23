@@ -1,8 +1,9 @@
 import { logger } from "./lib/logger.js";
-import { runIdempotentJob, startQueueWorker } from "./lib/queue.js";
+import { runIdempotentJob, startQueueWorker, closeQueues } from "./lib/queue.js";
 import { recomputeCoinProjection } from "./lib/coinsService.js";
-import { db } from "../db/src/index.js";
+import { db, pool } from "../db/src/index.js";
 import { coinBalancesTable } from "../db/src/schema/index.js";
+import { installProcessSafetyHandlers } from "./lib/processSafety.js";
 import { config } from "./lib/config.js";
 import { startWorkerOwnedRecurringJobs } from "./lib/backgroundJobs.js";
 import { startOutboxDispatcher } from "./lib/outbox.js";
@@ -17,6 +18,22 @@ async function reconcileAllCoinBalances() {
 }
 
 async function main() {
+  installProcessSafetyHandlers({
+    logger,
+    onShutdown: async () => {
+      try {
+        await closeQueues();
+      } catch (err) {
+        logger.error({ err }, "[shutdown] closeQueues failed");
+      }
+      try {
+        await pool.end();
+      } catch (err) {
+        logger.error({ err }, "[shutdown] pool.end failed");
+      }
+    },
+  });
+
   logger.info("Worker booted");
 
   if (!config.features.runBackgroundJobs) {

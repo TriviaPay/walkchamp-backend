@@ -88,6 +88,12 @@ export function getAppQueue(name: AppQueueName): Queue {
       ...getQueueRetentionPolicy(),
     },
   });
+  // LOAD-BEARING: BullMQ Queue/Worker are EventEmitters that emit 'error' on Redis connection
+  // problems. An unhandled 'error' event crashes the process — absorb it so a Redis blip is
+  // non-fatal (enforced by resilience-guards.test.ts).
+  queue.on("error", (err) => {
+    logger.error({ err, queueName: name }, "[Queue] queue connection error (non-fatal)");
+  });
   queues.set(name, queue);
   return queue;
 }
@@ -125,6 +131,11 @@ export function startQueueWorker<T = Record<string, unknown>>(
     concurrency: options?.concurrency ?? 2,
   });
 
+  // LOAD-BEARING: absorb Worker connection 'error' events so a Redis blip logs instead of
+  // crashing the worker process (enforced by resilience-guards.test.ts).
+  worker.on("error", (err) => {
+    logger.error({ err, queueName }, "[Queue] worker connection error (non-fatal)");
+  });
   worker.on("failed", (job, err) => {
     logger.error({ err, queueName, jobId: job?.id, jobName: job?.name }, "[Queue] job failed");
   });
