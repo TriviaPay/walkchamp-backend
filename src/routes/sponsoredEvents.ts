@@ -16,6 +16,8 @@ import { getCoinBalance, recordCoinLedgerEntry } from "../lib/coinsService.js";
 import { grantVariableCoinReward } from "../lib/coinRewardService.js";
 import { logger } from "../lib/logger.js";
 import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration, registerOrReviveScheduledRegistration } from "../lib/raceIntegrity.js";
+import { markRaceActive } from "../lib/raceRegistry.js";
+import { resolveLiveStateModeForNewRace, initializeRaceLiveState } from "../lib/raceLiveHydration.js";
 import { notifyPromotionalSponsoredEvent } from "../lib/pushNotificationService.js";
 import { createPendingSponsoredGiftCardAwards } from "../lib/sponsoredGiftCards.js";
 import {
@@ -223,6 +225,7 @@ async function processSponsuredEvents() {
             startedAt: now,
             updatedAt: now,
             registeredCount: paidUserIds.length,
+            liveStateMode: resolveLiveStateModeForNewRace(),
           })
           .where(eq(raceRoomsTable.id, room.id));
 
@@ -286,6 +289,11 @@ async function processSponsuredEvents() {
           .set({ currentPlayers: insertedCount, updatedAt: now })
           .where(eq(raceRoomsTable.id, room.id));
       });
+
+      // Register the live sponsored race (3h window) so the idle-gated cleanup considers it.
+      void markRaceActive(room.id, now.getTime() + 3 * 60 * 60_000);
+      // Seed redis-live if this race started in redis mode (no-op otherwise).
+      void initializeRaceLiveState(room.id);
 
       triggerEvent(PUSHER_CHANNEL, "sponsored_event.started", {
         room_id: room.id,

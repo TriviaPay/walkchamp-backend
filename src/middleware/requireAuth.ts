@@ -3,7 +3,7 @@ import { getDescopeClient } from "../lib/descope.js";
 import { config } from "../lib/config.js";
 import { writeAuditLog } from "../lib/auditLog.js";
 import {
-  getSessionById,
+  getSessionForAuthGate,
   touchSession,
   extractDescopeSessionId,
   sessionErrorCodeForStatus,
@@ -125,7 +125,7 @@ export async function requireAuth(
   const sessionId = header(req, "x-session-id");
 
   if (sessionId) {
-    const session = await getSessionById(sessionId);
+    const session = await getSessionForAuthGate(sessionId);
     if (!session || session.userId !== userId) {
       rejectSession(req, res, userId, sessionId, "SESSION_INVALID");
       return;

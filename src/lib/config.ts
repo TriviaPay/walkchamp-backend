@@ -32,6 +32,9 @@ const envSchema = z
     ENABLE_BULLMQ_WEBHOOK_PROCESSING: z.enum(["true", "false"]).optional(),
     ENABLE_CIRCUIT_BREAKERS: z.enum(["true", "false"]).optional(),
     ENABLE_EDGE_STRICT_MODE: z.enum(["true", "false"]).optional(),
+    // Phase 2 canary: route live race step state through redis-live instead of Postgres.
+    // OFF by default; only races that START while this is true adopt redis storage mode.
+    ENABLE_REDIS_LIVE_RACE: z.enum(["true", "false"]).optional(),
     BLOOM_GUARDS_MODE: z.enum(["off", "monitor", "enforce"]).optional(),
     TRUST_PROXY_HOPS: z.coerce.number().int().min(1).optional(),
     TRUST_PROXY_CIDRS: z.string().optional(),
@@ -47,6 +50,7 @@ const envSchema = z
     REDIS_URL: z.string().optional(),
     REDIS_CACHE_URL: z.string().optional(),
     REDIS_QUEUE_URL: z.string().optional(),
+    REDIS_LIVE_URL: z.string().optional(),
     RATE_LIMIT_SECRET: z.string().optional(),
     DESCOPE_PROJECT_ID: z.string().optional(),
     DESCOPE_MANAGEMENT_KEY: z.string().optional(),
@@ -105,6 +109,9 @@ const allowedOrigins = splitCsv(rawEnv.ALLOWED_ORIGINS);
 const trustedProxyCidrs = splitCsv(rawEnv.TRUST_PROXY_CIDRS);
 const redisCacheUrl = rawEnv.REDIS_CACHE_URL?.trim() || rawEnv.REDIS_URL?.trim() || null;
 const redisQueueUrl = rawEnv.REDIS_QUEUE_URL?.trim() || rawEnv.REDIS_URL?.trim() || null;
+// Live race state uses a dedicated instance; fall back to the queue instance (also noeviction
+// + AOF) if a separate one is not provisioned, and finally to REDIS_URL for single-node dev.
+const redisLiveUrl = rawEnv.REDIS_LIVE_URL?.trim() || redisQueueUrl || null;
 const rateLimitSecret =
   rawEnv.RATE_LIMIT_SECRET?.trim()
   || rawEnv.SESSION_SECRET?.trim()
@@ -127,6 +134,7 @@ const featureFlags = {
     ? rawEnv.ENABLE_CIRCUIT_BREAKERS === "true"
     : false,
   edgeStrictModeEnabled: parseBoolean(rawEnv.ENABLE_EDGE_STRICT_MODE),
+  redisLiveRaceEnabled: parseBoolean(rawEnv.ENABLE_REDIS_LIVE_RACE),
   bloomGuardsMode: parseBloomGuardsMode(rawEnv.BLOOM_GUARDS_MODE),
   cashFeaturesEnabled:
     parseBoolean(rawEnv.CASH_FEATURES_ENABLED)
@@ -171,6 +179,18 @@ if (featureFlags.rateLimitingEnabled && !rateLimitSecret) {
 
 if (featureFlags.bullmqWebhookProcessingEnabled && !redisQueueUrl) {
   configErrors.push("REDIS_QUEUE_URL or REDIS_URL is required when ENABLE_BULLMQ_WEBHOOK_PROCESSING=true");
+}
+
+if (featureFlags.redisLiveRaceEnabled) {
+  if (!redisLiveUrl) {
+    configErrors.push("REDIS_LIVE_URL (or a fallback queue/REDIS_URL) is required when ENABLE_REDIS_LIVE_RACE=true");
+  } else if (isProduction && (redisLiveUrl === redisQueueUrl || redisLiveUrl === redisCacheUrl)) {
+    // Live race state must not share the BullMQ queue instance (a race memory spike could
+    // starve payment/recovery jobs) nor the eviction-enabled cache (would evict race keys).
+    configErrors.push(
+      "ENABLE_REDIS_LIVE_RACE=true requires a DEDICATED REDIS_LIVE_URL in production (must differ from REDIS_CACHE_URL and REDIS_QUEUE_URL)",
+    );
+  }
 }
 
 if (isProduction) {
@@ -307,7 +327,9 @@ export const config = {
     url: redisCacheUrl,
     cacheUrl: redisCacheUrl,
     queueUrl: redisQueueUrl,
+    liveUrl: redisLiveUrl,
     splitConfigured: Boolean(redisCacheUrl && redisQueueUrl && redisCacheUrl !== redisQueueUrl),
+    liveDedicated: Boolean(redisLiveUrl && redisLiveUrl !== redisQueueUrl && redisLiveUrl !== redisCacheUrl),
   },
   health: {
     readinessDetailToken: rawEnv.READINESS_DETAIL_TOKEN?.trim() ?? null,

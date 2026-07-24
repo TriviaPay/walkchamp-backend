@@ -14,9 +14,11 @@ x-app-env: &app-env
   ENABLE_BULLMQ_WEBHOOK_PROCESSING: ${ENABLE_BULLMQ_WEBHOOK_PROCESSING:-false}
   ENABLE_CIRCUIT_BREAKERS: ${ENABLE_CIRCUIT_BREAKERS:-false}
   BLOOM_GUARDS_MODE: ${BLOOM_GUARDS_MODE:-monitor}
+  ENABLE_REDIS_LIVE_RACE: ${ENABLE_REDIS_LIVE_RACE:-false}
   REDIS_URL: redis://redis-cache:6379
   REDIS_CACHE_URL: redis://redis-cache:6379
   REDIS_QUEUE_URL: redis://redis-queue:6379
+  REDIS_LIVE_URL: redis://redis-live:6379
   DATABASE_RUNTIME_URL: ${DATABASE_RUNTIME_URL:?DATABASE_RUNTIME_URL is required}
   DATABASE_ADMIN_URL: ${DATABASE_ADMIN_URL:?DATABASE_ADMIN_URL is required}
   DESCOPE_PROJECT_ID: ${DESCOPE_PROJECT_ID:?DESCOPE_PROJECT_ID is required}
@@ -66,6 +68,9 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Bound the Node heap so a spike can't push the host into OOM and get the durable
+    # redis-queue / redis-live containers (payment + live-race state) killed instead.
+    mem_limit: ${API_CONTAINER_MEMORY:-1024m}
     expose:
       - "8080"
     depends_on:
@@ -73,6 +78,10 @@ services:
         condition: service_healthy
       redis-queue:
         condition: service_healthy
+      # Soft dependency: the app lazy-connects to redis-live only when the canary flag is on, so
+      # a redis-live problem must not block the whole fleet's startup (feature is OFF by default).
+      redis-live:
+        condition: service_started
     environment:
       <<: *app-env
       APP_PROCESS_ROLE: api
@@ -90,11 +99,16 @@ services:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    mem_limit: ${WORKER_CONTAINER_MEMORY:-1024m}
     depends_on:
       redis-cache:
         condition: service_healthy
       redis-queue:
         condition: service_healthy
+      # Soft dependency: the app lazy-connects to redis-live only when the canary flag is on, so
+      # a redis-live problem must not block the whole fleet's startup (feature is OFF by default).
+      redis-live:
+        condition: service_started
     environment:
       <<: *app-env
       APP_PROCESS_ROLE: worker
@@ -163,5 +177,36 @@ services:
       retries: 10
       start_period: 5s
 
+  # Dedicated instance for live race state (ZSET leaderboards + participant hashes). Kept
+  # separate from redis-cache (allkeys-lfu would evict race keys) and redis-queue (a race
+  # memory spike must not starve BullMQ payment/recovery jobs). Durable: AOF everysec.
+  redis-live:
+    image: redis:7.2-alpine
+    restart: unless-stopped
+    mem_limit: ${REDIS_LIVE_CONTAINER_MEMORY:-512m}
+    # AOF everysec only (no RDB save points). AOF already bounds loss to ~1s; skipping RDB
+    # avoids fork/COW memory spikes on this tight-headroom instance under write load.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      - --maxmemory
+      - ${REDIS_LIVE_MAXMEMORY:-384mb}
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis-live-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
 volumes:
   redis-queue-data:
+  redis-live-data:

@@ -1,9 +1,9 @@
 import type { Redis } from "ioredis";
 import { config } from "./config.js";
-import { getRedisCache, getRedisQueue } from "./redis.js";
+import { getRedisCache, getRedisQueue, getRedisLive } from "./redis.js";
 
 type RedisClient = InstanceType<typeof Redis>;
-type RedisRole = "cache" | "queue";
+type RedisRole = "cache" | "queue" | "live";
 
 export type RedisRuntimeStatus = {
   role: RedisRole;
@@ -89,22 +89,25 @@ export function evaluateRedisRuntime(
       warnings.push("redis-cache memory usage is at or above 85%");
     }
   } else {
+    // redis-queue and redis-live both hold data that must never be evicted (BullMQ jobs /
+    // live race state) and must survive a restart (AOF everysec).
+    const name = role === "queue" ? "redis-queue" : "redis-live";
     if (maxmemoryPolicy !== "noeviction") {
-      errors.push(`redis-queue maxmemory-policy must be noeviction, got ${maxmemoryPolicy ?? "unknown"}`);
+      errors.push(`${name} maxmemory-policy must be noeviction, got ${maxmemoryPolicy ?? "unknown"}`);
     }
     if (appendonly !== "yes") {
-      errors.push(`redis-queue appendonly must be yes, got ${appendonly ?? "unknown"}`);
+      errors.push(`${name} appendonly must be yes, got ${appendonly ?? "unknown"}`);
     }
     if (appendfsync !== "everysec") {
-      errors.push(`redis-queue appendfsync must be everysec, got ${appendfsync ?? "unknown"}`);
+      errors.push(`${name} appendfsync must be everysec, got ${appendfsync ?? "unknown"}`);
     }
     if (evictedKeys != null && evictedKeys > 0) {
-      errors.push(`redis-queue has evicted ${evictedKeys} keys; BullMQ Redis must not evict`);
+      errors.push(`${name} has evicted ${evictedKeys} keys; this Redis must not evict`);
     }
     if (usedMemoryRatio != null && usedMemoryRatio >= 0.85) {
-      errors.push("redis-queue memory usage is at or above 85%; pause noncritical enqueue sources");
+      errors.push(`${name} memory usage is at or above 85%; pause noncritical enqueue sources`);
     } else if (usedMemoryRatio != null && usedMemoryRatio >= 0.70) {
-      warnings.push("redis-queue memory usage is at or above 70%");
+      warnings.push(`${name} memory usage is at or above 70%`);
     }
   }
 
@@ -158,7 +161,8 @@ async function inspectRedisClient(role: RedisRole, redis: RedisClient): Promise<
 }
 
 export async function inspectRedisRuntime(role: RedisRole): Promise<RedisRuntimeStatus> {
-  return inspectRedisClient(role, role === "cache" ? getRedisCache() : getRedisQueue());
+  const client = role === "cache" ? getRedisCache() : role === "live" ? getRedisLive() : getRedisQueue();
+  return inspectRedisClient(role, client);
 }
 
 export async function shouldPauseNoncriticalQueueEnqueue(): Promise<boolean> {
