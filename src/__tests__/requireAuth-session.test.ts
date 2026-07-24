@@ -26,7 +26,14 @@ vi.mock("../lib/descope", () => ({
 
 vi.mock("../lib/sessionService", async (importActual) => {
   const actual = await importActual<typeof import("../lib/sessionService")>();
-  return { ...actual, getSessionById: mockGetSessionById, touchSession: vi.fn() };
+  // requireAuth reads the single-session gate via getSessionForAuthGate (Redis-cached in prod).
+  // Mock that seam; the mocked session objects supply the userId + status the gate checks.
+  return {
+    ...actual,
+    getSessionById: mockGetSessionById,
+    getSessionForAuthGate: mockGetSessionById,
+    touchSession: vi.fn(),
+  };
 });
 
 // Audit writes go to the DB; stub so rejection paths don't attempt a connection.
