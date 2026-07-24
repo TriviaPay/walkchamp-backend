@@ -82,6 +82,13 @@ export const raceRoomsTable = pgTable("race_rooms", {
   challengeDurationDays: integer("challenge_duration_days").notNull().default(0),
   challengeEndAt: timestamp("challenge_end_at"),
   registeredCount: integer("registered_count").notNull().default(0),
+  // ── Live-state storage engine (Phase 2 canary) ───────────────────────────────
+  // Authoritative record of how a race's LIVE step state is stored: "postgres" (legacy,
+  // per-tick writes) or "redis" (redis-live ZSET/hash, periodic checkpoint). Fixed at race
+  // start and never changed mid-race, so recovery after a redis-live loss knows the engine.
+  // Postgres owns this value; redis-live only caches it.
+  liveStateMode: text("live_state_mode").notNull().default("postgres"),
+  liveStateVersion: integer("live_state_version").notNull().default(0),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });

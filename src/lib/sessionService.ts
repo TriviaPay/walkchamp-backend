@@ -6,6 +6,7 @@ import type { AuthSession } from "../../db/src/schema/index.js";
 import { writeAuditLog } from "./auditLog.js";
 import { triggerEvent } from "./pusher.js";
 import { logger } from "./logger.js";
+import { getRedisCache, ensureRedisCacheConnected } from "./redis.js";
 
 export const SESSION_STATUS = {
   ACTIVE: "active",
@@ -228,6 +229,8 @@ export async function registerOrReplaceSession(params: {
   });
 
   if (result.replaced && result.replacedSessionId) {
+    // Fence the superseded session out of the gate cache so it can't keep validating.
+    void invalidateSessionCache(result.replacedSessionId, userId, SESSION_STATUS.REPLACED);
     publishInvalidation(userId, result.replacedSessionId);
   }
 
@@ -251,12 +254,15 @@ function publishInvalidation(userId: string, oldSessionId: string): void {
   void triggerEvent(`private-user-${userId}`, "session-invalidated", payload);
 }
 
-/** Bump last-seen for an active session. Fire-and-forget. */
+/**
+ * Bump last-seen for an active session. Fire-and-forget, and buffered in Redis instead of
+ * writing Postgres on every request — lastSeenAt is telemetry only (not used for auth
+ * validity), so a batched flush (flushSessionLastSeen) keeps the hot path off the database.
+ */
 export function touchSession(sessionId: string): void {
-  db.update(authSessionsTable)
-    .set({ lastSeenAt: new Date() })
-    .where(and(eq(authSessionsTable.sessionId, sessionId), eq(authSessionsTable.status, SESSION_STATUS.ACTIVE)))
-    .catch((err) => logger.error({ err }, "[Session] touch failed"));
+  void getRedisCache()
+    .hset(LASTSEEN_DIRTY_KEY, sessionId, String(Date.now()))
+    .catch((err) => logger.warn({ err }, "[Session] lastSeen buffer failed"));
 }
 
 export async function getSessionById(sessionId: string): Promise<AuthSession | undefined> {
@@ -266,6 +272,119 @@ export async function getSessionById(sessionId: string): Promise<AuthSession | u
     .where(eq(authSessionsTable.sessionId, sessionId))
     .limit(1);
   return row;
+}
+
+// ── Session gate cache ────────────────────────────────────────────────────────
+// The per-request single-session gate (requireAuth) validated every authenticated request
+// against Postgres — which kept Neon compute awake. We cache the (userId, status) needed by
+// the gate in redis-cache. Correctness is preserved with a version-fenced compare-and-set:
+// a cache fill carries the timestamp captured BEFORE its DB read, and a revocation writes a
+// tombstone stamped at revoke time. The Lua CAS refuses to overwrite an entry whose version
+// is newer-or-equal, so a stale fill (read before a concurrent revoke) can never resurrect a
+// revoked session. Postgres remains authoritative: any cache miss/eviction falls back to it.
+const SESSION_GATE_PREFIX = "session:gate:";
+const SESSION_GATE_TTL_S = 60; // fresh "active" entries are short-lived
+const SESSION_TOMBSTONE_TTL_S = 300; // tombstones outlive any in-flight stale fill
+const LASTSEEN_DIRTY_KEY = "session:lastseen-dirty";
+
+// Set KEYS[1]=ARGV[1](value) with EX ARGV[3] only if no existing entry has a version (v)
+// >= ARGV[2]. Returns 1 if written, 0 if a newer/equal entry was preserved.
+const SESSION_CAS_SCRIPT = `
+local cur = redis.call("GET", KEYS[1])
+if cur then
+  local ok, obj = pcall(cjson.decode, cur)
+  if ok and obj.v and tonumber(obj.v) >= tonumber(ARGV[2]) then
+    return 0
+  end
+end
+redis.call("SET", KEYS[1], ARGV[1], "EX", tonumber(ARGV[3]))
+return 1
+`;
+
+type CachedGate = { userId: string; status: string; v: number };
+
+async function casSetGate(sessionId: string, value: CachedGate, ttlSeconds: number): Promise<void> {
+  await ensureRedisCacheConnected();
+  await getRedisCache().eval(
+    SESSION_CAS_SCRIPT,
+    1,
+    SESSION_GATE_PREFIX + sessionId,
+    JSON.stringify(value),
+    String(value.v),
+    String(ttlSeconds),
+  );
+}
+
+/**
+ * Cached read for the single-session gate. Returns just what requireAuth needs
+ * ({ userId, status }) from redis-cache, falling back to (and filling from) Postgres on a
+ * miss. Never negative-caches, so a freshly-created session is not shadowed by a stale miss.
+ */
+export async function getSessionForAuthGate(
+  sessionId: string,
+): Promise<{ userId: string; status: string } | null> {
+  const key = SESSION_GATE_PREFIX + sessionId;
+  // Capture the version BEFORE the DB read so a revoke landing during the read wins the CAS.
+  const readStartedAt = Date.now();
+  try {
+    await ensureRedisCacheConnected();
+    const cached = await getRedisCache().get(key);
+    if (cached) {
+      const obj = JSON.parse(cached) as CachedGate;
+      return { userId: obj.userId, status: obj.status };
+    }
+  } catch (err) {
+    logger.warn({ err, sessionId }, "[Session] gate cache read failed — using DB");
+  }
+
+  const row = await getSessionById(sessionId);
+  if (!row) return null;
+
+  void casSetGate(sessionId, { userId: row.userId, status: row.status, v: readStartedAt }, SESSION_GATE_TTL_S)
+    .catch((err) => logger.warn({ err, sessionId }, "[Session] gate cache fill failed"));
+  return { userId: row.userId, status: row.status };
+}
+
+/**
+ * Fence a session out of the cache after a status change (revoke / replace / logout). Writes
+ * a tombstone stamped at call time via CAS so a concurrent stale fill cannot overwrite it.
+ */
+export async function invalidateSessionCache(
+  sessionId: string,
+  userId: string,
+  status: string,
+): Promise<void> {
+  try {
+    await casSetGate(sessionId, { userId, status, v: Date.now() }, SESSION_TOMBSTONE_TTL_S);
+  } catch (err) {
+    logger.warn({ err, sessionId }, "[Session] gate cache invalidation failed");
+  }
+}
+
+/**
+ * Flush buffered lastSeenAt telemetry from Redis to Postgres in a batch. Only touches the DB
+ * when there are dirty sessions (active users → Neon already awake), so idle periods stay
+ * DB-silent. Called on an interval by the worker's recurring jobs.
+ */
+export async function flushSessionLastSeen(): Promise<void> {
+  try {
+    await ensureRedisCacheConnected();
+    const redis = getRedisCache();
+    const dirty = await redis.hgetall(LASTSEEN_DIRTY_KEY);
+    const ids = Object.keys(dirty);
+    if (ids.length === 0) return; // idle → no DB work
+    // Claim these fields; touches arriving after this re-add them for the next flush.
+    await redis.hdel(LASTSEEN_DIRTY_KEY, ...ids);
+    for (const sessionId of ids) {
+      const ts = Number(dirty[sessionId]);
+      await db
+        .update(authSessionsTable)
+        .set({ lastSeenAt: new Date(Number.isFinite(ts) ? ts : Date.now()) })
+        .where(and(eq(authSessionsTable.sessionId, sessionId), eq(authSessionsTable.status, SESSION_STATUS.ACTIVE)));
+    }
+  } catch (err) {
+    logger.error({ err }, "[Session] lastSeen flush failed");
+  }
 }
 
 /**
@@ -309,6 +428,9 @@ export async function revokeSession(
       invalidationReason: reason,
     })
     .where(and(eq(authSessionsTable.id, row.id), eq(authSessionsTable.status, SESSION_STATUS.ACTIVE)));
+
+  // Fence the revoked session out of the gate cache (CAS tombstone beats any stale fill).
+  void invalidateSessionCache(sessionId, userId, SESSION_STATUS.LOGGED_OUT);
 
   void writeAuditLog({
     actorUserId: userId,

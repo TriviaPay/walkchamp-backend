@@ -92,13 +92,20 @@ router.get("/readyz", async (req, res) => {
     && config.nodeEnv !== "test"
     && (config.features.bullmqWebhookProcessingEnabled || config.processRole === "worker");
   const queueRedisRequired = config.processRole === "worker";
+  // Inspect redis-live only when the canary is enabled — verifies noeviction + AOF so the
+  // live-race durability guarantee is actually enforced (not silently violated).
+  const shouldInspectLiveRedis = config.redis.liveUrl !== null
+    && config.nodeEnv !== "test"
+    && config.features.redisLiveRaceEnabled;
 
   let redisCacheStatus: RedisRuntimeStatus | null = null;
   let redisQueueStatus: RedisRuntimeStatus | null = null;
+  let redisLiveStatus: RedisRuntimeStatus | null = null;
   let databaseCheck: CheckValue = "skipped";
   let migrationCheck: CheckValue = "skipped";
   let redisCacheCheck: CheckValue = shouldCheckRedis ? "error" : "skipped";
   let redisQueueCheck: CheckValue = shouldInspectQueueRedis ? "error" : "skipped";
+  let redisLiveCheck: CheckValue = shouldInspectLiveRedis ? "error" : "skipped";
   let redisSplitCheck: CheckValue = "skipped";
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -172,6 +179,18 @@ router.get("/readyz", async (req, res) => {
     }
   }
 
+  if (shouldInspectLiveRedis) {
+    try {
+      redisLiveStatus = await inspectRedisRuntime("live");
+      redisLiveCheck = redisCheckValue(redisLiveStatus, false);
+      if (!redisLiveStatus.ok) errors.push(...redisLiveStatus.errors);
+      warnings.push(...redisLiveStatus.warnings);
+    } catch (err) {
+      redisLiveCheck = "error";
+      errors.push(err instanceof Error ? err.message : "redis-live readiness check failed");
+    }
+  }
+
   const status: ReadinessStatus = errors.length > 0
     ? "not_ready"
     : warnings.length > 0
@@ -183,6 +202,7 @@ router.get("/readyz", async (req, res) => {
       migrations: migrationCheck,
       redisCache: redisCacheCheck,
       redisQueue: redisQueueCheck,
+      redisLive: redisLiveCheck,
       redisSplit: redisSplitCheck,
       eventLoop: eventLoopReady ? "ok" : "error",
       config: "ok",
@@ -191,6 +211,7 @@ router.get("/readyz", async (req, res) => {
     redis: {
       cache: redisCacheStatus,
       queue: redisQueueStatus,
+      live: redisLiveStatus,
     },
     warnings,
     errors,

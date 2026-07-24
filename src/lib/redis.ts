@@ -3,11 +3,16 @@ import { config } from "./config.js";
 import { logger } from "./logger.js";
 
 type RedisClient = InstanceType<typeof Redis>;
+type RedisRole = "cache" | "queue" | "live";
 
 let redisCacheClient: RedisClient | undefined;
 let redisQueueClient: RedisClient | undefined;
-let redisCacheConnectPromise: Promise<void> | null = null;
-let redisQueueConnectPromise: Promise<void> | null = null;
+let redisLiveClient: RedisClient | undefined;
+const connectPromises: Record<RedisRole, Promise<void> | null> = {
+  cache: null,
+  queue: null,
+  live: null,
+};
 
 export function hasRedisConfigured(): boolean {
   return Boolean(config.redis.cacheUrl);
@@ -17,7 +22,11 @@ export function hasRedisQueueConfigured(): boolean {
   return Boolean(config.redis.queueUrl);
 }
 
-function createRedisClient(url: string, role: "cache" | "queue"): RedisClient {
+export function hasRedisLiveConfigured(): boolean {
+  return Boolean(config.redis.liveUrl);
+}
+
+function createRedisClient(url: string, role: RedisRole): RedisClient {
   const client = new Redis(url, {
     enableReadyCheck: true,
     lazyConnect: true,
@@ -58,32 +67,35 @@ export function getRedisQueue(): RedisClient {
   return redisQueueClient;
 }
 
+export function getRedisLive(): RedisClient {
+  if (!config.redis.liveUrl) {
+    throw new Error("REDIS_LIVE_URL (or a fallback queue/REDIS_URL) is not configured.");
+  }
+
+  if (!redisLiveClient) {
+    redisLiveClient = createRedisClient(config.redis.liveUrl, "live");
+  }
+
+  return redisLiveClient;
+}
+
 export function getRedis(): RedisClient {
   return getRedisCache();
 }
 
-async function ensureConnected(redis: RedisClient, role: "cache" | "queue"): Promise<void> {
+async function ensureConnected(redis: RedisClient, role: RedisRole): Promise<void> {
   if (redis.status === "ready") return;
   if (redis.status === "wait" || redis.status === "end") {
-    const existing = role === "cache" ? redisCacheConnectPromise : redisQueueConnectPromise;
+    const existing = connectPromises[role];
     if (existing) {
       await existing;
       return;
     }
 
     const connectPromise = redis.connect().finally(() => {
-      if (role === "cache") {
-        redisCacheConnectPromise = null;
-      } else {
-        redisQueueConnectPromise = null;
-      }
+      connectPromises[role] = null;
     });
-
-    if (role === "cache") {
-      redisCacheConnectPromise = connectPromise;
-    } else {
-      redisQueueConnectPromise = connectPromise;
-    }
+    connectPromises[role] = connectPromise;
 
     await connectPromise;
     return;
@@ -100,6 +112,11 @@ export async function ensureRedisCacheConnected(): Promise<void> {
 export async function ensureRedisQueueConnected(): Promise<void> {
   if (!config.redis.queueUrl) return;
   await ensureConnected(getRedisQueue(), "queue");
+}
+
+export async function ensureRedisLiveConnected(): Promise<void> {
+  if (!config.redis.liveUrl) return;
+  await ensureConnected(getRedisLive(), "live");
 }
 
 export async function pingRedis(): Promise<void> {

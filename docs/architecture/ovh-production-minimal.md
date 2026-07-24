@@ -25,6 +25,19 @@ This is intentionally not HA. It is a pragmatic single-host setup for moderate t
 - Postgres stays in Neon.
 - Object storage reads and writes go to R2 through a provider-neutral S3-compatible client.
 
+## Health probes and Neon scale-to-zero
+
+Neon serverless compute only suspends after ~5 minutes with **zero** database activity, so any
+recurring probe that touches Postgres keeps it awake (and billing) 24/7.
+
+- **Container/orchestrator liveness** already targets `/api/healthz` (see `docker-compose.coolify.yml`),
+  which returns a static `{status:"ok"}` with **no SQL** — safe to poll frequently.
+- `/livez` is also DB-free (event-loop check only) and is the correct target for any external
+  uptime/liveness monitor.
+- `/readyz` runs a **DB + migration** check and is intended for **deploy-time / infrequent** deep
+  readiness only. Do **not** point a frequent external HTTP monitor (Coolify HTTP check, Grafana,
+  uptime pings) at `/readyz`, or Neon will never scale to zero. Use `/livez` or `/healthz` for those.
+
 ## Media compatibility phase
 
 Day-1 cutover keeps backend-owned compatibility routes:

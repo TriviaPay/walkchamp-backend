@@ -22,7 +22,7 @@ import {
   cashChallengeConsentsTable,
   raceTrackThemesTable,
 } from "../../db/src/schema/index.js";
-import { eq, and, desc, asc, sql, ne, inArray, or } from "drizzle-orm";
+import { eq, and, desc, asc, sql, ne, inArray, or, lt } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
 import { generateInviteCode } from "../lib/inviteCodes.js";
@@ -47,7 +47,24 @@ import {
   buildLiveRaceProgressContext,
   formatProgressSyncResponse,
   getLiveRaceStandings,
+  type LiveRaceProgressContext,
 } from "../lib/raceLeaderboardService.js";
+import {
+  getRaceConfig,
+  applyProgress,
+  getStandingsWithNames,
+  getParticipantCount,
+  getParticipantRank,
+  markFinishOfficial,
+  isRaceHydrated,
+  setRaceState,
+  snapshotRace,
+  getPendingFinishes,
+  getParticipantsState,
+  clearRaceLiveState,
+  tryAcquireBroadcastLease,
+  LIVE_RACE_STATE,
+} from "../lib/raceLiveState.js";
 import { triggerLiveActivityUpdate } from "../lib/liveActivityUpdateService.js";
 import { liveActivityTokensTable } from "../../db/src/schema/index.js";
 import {
@@ -67,6 +84,14 @@ import {
   hasCompletedEntryPayment,
 } from "../lib/cashChallengePayments.js";
 import { grantReferralBonusForCashChallenge } from "../lib/referralBonusService.js";
+import {
+  markRaceActive,
+  activeRaceCount,
+  listActiveRaces,
+  reconcileActive,
+  type ActiveRaceEntry,
+} from "../lib/raceRegistry.js";
+import { resolveLiveStateModeForNewRace, initializeRaceLiveState, ensureRaceHydrated, ensureParticipantHydrated } from "../lib/raceLiveHydration.js";
 import { computeIsAdult } from "../lib/dateOfBirth.js";
 import {
   createRefundBatchForRaceCancellation,
@@ -203,8 +228,17 @@ export async function recoverStaleRaces(): Promise<void> {
 // Called every 15s from app.ts. Completes races where everyone has finished or
 // forfeited. Also force-completes non-duration races stuck for >30 minutes
 // (safety net). Duration challenges run until challengeEndAt.
-export async function cleanupOverdueRaces(): Promise<void> {
+export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<void> {
   try {
+    // Fast-path gate: when the durable registry confidently reports zero active races,
+    // skip the Postgres scan entirely so Neon compute can suspend while idle. `null`
+    // means the registry is unavailable → fail open and scan. `force` bypasses the gate
+    // for the hourly backstop, which also reconciles the registry to DB truth.
+    if (!opts?.force) {
+      const active = await activeRaceCount();
+      if (active === 0) return;
+    }
+
     const SAFETY_TIMEOUT_MS = 30 * 60_000; // 30-minute hard cap for stuck races
     const stale = await db
       .select({
@@ -218,6 +252,15 @@ export async function cleanupOverdueRaces(): Promise<void> {
       })
       .from(raceRoomsTable)
       .where(eq(raceRoomsTable.status, "in_progress"));
+
+    // Reconcile the registry to DB truth: drops finalized races (so the gate can close)
+    // and (re)adds any in-progress race missing from it (so a missed start-hook self-heals).
+    const activeEntries: ActiveRaceEntry[] = stale.map((r) => ({
+      id: r.id,
+      timeoutAtMs: (r.startedAt?.getTime() ?? Date.now()) + SAFETY_TIMEOUT_MS,
+    }));
+    await reconcileActive(activeEntries);
+
     for (const race of stale) {
       const isSponsored = race.type === "sponsored";
       const isDurationChallenge = !isSponsored && race.challengeDurationDays > 0;
@@ -425,8 +468,15 @@ function calcPrizePool(entryAmountCents: number, playerCount: number) {
   return { total, platformFee: 0, winners: total };
 }
 
-const MAX_PROGRESS_DELTA_FLOOR = 500;
+// Cumulative anti-cheat budget. A participant's TOTAL race steps may never exceed
+//   ceil(secondsSinceRaceStart × MAX_PROGRESS_STEPS_PER_SECOND) + MAX_PROGRESS_BURST.
+// This allowance replenishes at a fixed rate and carries unused budget forward, so it
+// cannot be gamed by a per-tick bonus that resets each sync. (The previous 500-step
+// per-sync floor let a 3s tick jump ~167 steps/s and effectively defeated the 6/s cap.)
+// Overage is clamped to the plausible maximum and flagged for reconciliation — never
+// trusted onto the live leaderboard.
 const MAX_PROGRESS_STEPS_PER_SECOND = 6;
+const MAX_PROGRESS_BURST = 200;
 const MAX_DEVICE_TIME_SKEW_MS = 10 * 60 * 1000;
 
 /** How many places get prizes based on player count.
@@ -673,6 +723,16 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   }
 
   logger.info({ raceId, endedReason }, "autoCompleteRace: starting completion");
+
+  // Redis-mode races: freeze + flush live state to Postgres so the payout below reads the
+  // authoritative final steps, not a stale checkpoint. No-op for postgres-mode races.
+  if (room.liveStateMode === "redis") {
+    try {
+      await flushRedisRaceToPostgres(raceId);
+    } catch (err) {
+      logger.error({ err, raceId }, "autoCompleteRace: redis flush failed — finalizing on last checkpoint");
+    }
+  }
 
   const participants = await db
     .select({
@@ -1029,6 +1089,12 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   }
 
   logger.info({ raceId, participants: resultRows.length, tieRulesApplied }, "autoCompleteRace: race marked completed");
+
+  // Redis-mode races: mark finalized (late ticks now report "completed") and free live keys.
+  if (room.liveStateMode === "redis") {
+    await setRaceState(raceId, LIVE_RACE_STATE.FINALIZED).catch(() => {});
+    void clearRaceLiveState(raceId, participants.map((p) => p.userId));
+  }
 
   // ── [RaceFinalize] structured diagnostic logs ────────────────────────────────
   const tieGroups = resultRows.filter((r) => r.isTied).map((r) => r.tieGroupId).filter(Boolean);
@@ -2814,10 +2880,16 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
       status: "in_progress",
       startedAt,
       ...(challengeEndAt ? { challengeEndAt } : {}),
+      liveStateMode: resolveLiveStateModeForNewRace(),
       updatedAt: startedAt,
     })
     .where(eq(raceRoomsTable.id, raceId))
     .returning();
+
+  // Register the live race so the safety-net cleanup considers it (opens the idle gate).
+  void markRaceActive(raceId, (challengeEndAt?.getTime() ?? startedAt.getTime()) + 30 * 60_000);
+  // Seed redis-live if this race started in redis mode (no-op otherwise).
+  void initializeRaceLiveState(raceId);
 
   // Fire race:starting immediately so all clients can show the countdown overlay
   await triggerEvent(`public-live-race-${raceId}`, "race:starting", {
@@ -4490,6 +4562,296 @@ async function respondWithLiveProgress(
   return res.json(formatProgressSyncResponse(ctx, extra));
 }
 
+// ── Redis-live progress path (Phase 2 canary) ─────────────────────────────────
+// Durable finish write at the deciding moment. finishRank == the server-acceptance ordinal
+// assigned atomically in Redis (authoritative order), NOT a Postgres max()+1 which lock
+// ordering could reorder. Reuses the existing finalization lock + autoCompleteRace.
+async function persistRedisFinish(
+  raceId: string,
+  userId: string,
+  finishOrdinal: number,
+  steps: number,
+  acceptedAtMs: number,
+): Promise<void> {
+  try {
+    // Use the TRUE server-acceptance instant (when the goal-crossing tick was processed), not
+    // persist time — so finishedAt-ordered payouts match the live finish order. Lock-acquisition
+    // latency in this transaction must not reorder who gets paid.
+    const finishedAtMs = acceptedAtMs;
+    const result = await db.transaction(async (tx) => {
+      const room = await lockRaceRoom(tx, raceId);
+      if (!room || room.status !== "in_progress") return null;
+      const updated = await tx
+        .update(raceParticipantsTable)
+        .set({
+          currentSteps: steps,
+          finishedGoal: true,
+          finishedAt: new Date(finishedAtMs),
+          finishedAtMs,
+          finishRank: finishOrdinal,
+        })
+        .where(and(
+          eq(raceParticipantsTable.raceRoomId, raceId),
+          eq(raceParticipantsTable.userId, userId),
+          eq(raceParticipantsTable.finishedGoal, false),
+        ))
+        .returning({ id: raceParticipantsTable.id });
+      if (updated.length === 0) return null; // already persisted
+      const [{ finishedCount }] = await tx
+        .select({ finishedCount: sql<number>`count(distinct ${raceParticipantsTable.userId})::int` })
+        .from(raceParticipantsTable)
+        .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.finishedGoal, true)));
+      return { finishedCount, playerCount: room.currentPlayers ?? 0 };
+    });
+    if (!result) return;
+    await markFinishOfficial(raceId, userId); // clear from pending set, mark official in Redis
+    if (result.finishedCount >= numWinners(result.playerCount)) {
+      autoCompleteRace(raceId, "winners_finalized").catch(() => {});
+    }
+  } catch (err) {
+    logger.error({ err, raceId, userId }, "[redisProgress] persistRedisFinish failed");
+  }
+}
+
+function liveStatusToRaceStatus(status: string): string {
+  return status === LIVE_RACE_STATE.FINALIZED ? "completed" : "in_progress";
+}
+
+/**
+ * Recover finishes that were accepted in Redis (ordinal assigned, pending-finish recorded) but
+ * whose durable Postgres write never landed — e.g. the API crashed between applyProgress and
+ * persistRedisFinish. Without this, Postgres shows finishedGoal=false, so the
+ * finishedCount>=numWinners early-finalization trigger undercounts and the race hangs until the
+ * safety timeout. Runs periodically (worker) and is idempotent (persistRedisFinish no-ops if the
+ * finish already landed; markFinishOfficial clears the pending entry).
+ */
+export async function recoverPendingRedisFinishes(): Promise<void> {
+  if (!config.redis.liveUrl) return;
+  const raceIds = await listActiveRaces();
+  for (const raceId of raceIds) {
+    try {
+      if (!(await isRaceHydrated(raceId))) continue;
+      const pending = await getPendingFinishes(raceId);
+      if (pending.length === 0) continue;
+      const states = await getParticipantsState(raceId, pending.map((f) => f.userId));
+      for (let i = 0; i < pending.length; i += 1) {
+        const f = pending[i];
+        const steps = Number(states[i]?.currentSteps);
+        const acceptedAtMs = Number(states[i]?.finishAcceptedAtMs) || Date.now();
+        await persistRedisFinish(raceId, f.userId, f.ordinal, Number.isFinite(steps) ? steps : 0, acceptedAtMs);
+      }
+    } catch (err) {
+      logger.error({ err, raceId }, "[redisProgress] recoverPendingRedisFinishes failed");
+    }
+  }
+}
+
+/**
+ * Freeze a redis-mode race and flush its authoritative live state to Postgres BEFORE the
+ * finalizer reads currentSteps for payout. Sequence: FROZEN (reject further ticks) → drain
+ * pending finishes with their acceptance ordinal as finishRank → fenced UPSERT of steps
+ * (never lowers a value). After this, autoCompleteRace runs unchanged on authoritative data.
+ *
+ * NOTE (canary): FINALIZING accepts no late samples — it goes straight to FROZEN (conservative
+ * / strict). The bounded-grace window for timed races is a deferred refinement. If the flush
+ * throws, we log loudly and let finalization proceed on the last checkpoint (steps only ever
+ * move forward via GREATEST); productionizing should route an unflushable race to pending_review.
+ */
+async function flushRedisRaceToPostgres(raceId: string): Promise<void> {
+  if (!(await isRaceHydrated(raceId))) return;
+  await setRaceState(raceId, LIVE_RACE_STATE.FROZEN);
+
+  const [snapshot, pending] = await Promise.all([snapshotRace(raceId), getPendingFinishes(raceId)]);
+  const stepByUser = new Map(snapshot.map((s) => [s.userId, s.steps]));
+  // True acceptance instant per pending finisher (falls back to now if absent).
+  const pendingUserIds = pending.map((f) => f.userId);
+  const pendingStates = await getParticipantsState(raceId, pendingUserIds);
+  const acceptedAtByUser = new Map(
+    pendingUserIds.map((uid, i) => [uid, Number(pendingStates[i]?.finishAcceptedAtMs) || Date.now()]),
+  );
+
+  await db.transaction(async (tx) => {
+    for (const s of snapshot) {
+      // Fenced: only advance steps, never lower a value already in Postgres.
+      await tx
+        .update(raceParticipantsTable)
+        .set({ currentSteps: s.steps })
+        .where(and(
+          eq(raceParticipantsTable.raceRoomId, raceId),
+          eq(raceParticipantsTable.userId, s.userId),
+          lt(raceParticipantsTable.currentSteps, s.steps),
+        ));
+    }
+    for (const f of pending) {
+      const finishedAtMs = acceptedAtByUser.get(f.userId) ?? Date.now();
+      await tx
+        .update(raceParticipantsTable)
+        .set({
+          finishedGoal: true,
+          finishRank: f.ordinal,
+          finishedAt: new Date(finishedAtMs),
+          finishedAtMs,
+          ...(stepByUser.has(f.userId) ? { currentSteps: stepByUser.get(f.userId)! } : {}),
+        })
+        .where(and(
+          eq(raceParticipantsTable.raceRoomId, raceId),
+          eq(raceParticipantsTable.userId, f.userId),
+          eq(raceParticipantsTable.finishedGoal, false),
+        ));
+    }
+  });
+
+  for (const f of pending) await markFinishOfficial(raceId, f.userId).catch(() => {});
+}
+
+/**
+ * Handle a progress tick for a redis-mode race entirely off redis-live (zero SQL on the
+ * normal path). Returns true when handled (response sent); false to fall through to the
+ * legacy Postgres path (race is not redis-mode, or live state is unavailable → degraded).
+ */
+async function tryHandleRedisProgress(
+  res: import("express").Response,
+  args: {
+    raceId: string;
+    userId: string;
+    steps: number;
+    clientSeq: number | null;
+    deviceTotal: number | null;
+    srcLabel: string | null;
+    devTime: Date | null;
+  },
+): Promise<boolean> {
+  const { raceId, userId, steps, clientSeq, deviceTotal, srcLabel, devTime } = args;
+
+  let cfg = await getRaceConfig(raceId).catch(() => null);
+  if (!cfg) {
+    // Either a Postgres-mode race (fall through) or a redis race whose keys were lost.
+    const hydrated = await ensureRaceHydrated(raceId);
+    if (!hydrated) return false;
+    cfg = await getRaceConfig(raceId).catch(() => null);
+    if (!cfg) return false;
+  }
+
+  if (cfg.status !== LIVE_RACE_STATE.ACTIVE) {
+    // Finalizing/frozen/finalized: reject new steps, echo current standing (no acceptance).
+    const rank = await getParticipantRank(raceId, userId).catch(() => null);
+    await sendRedisProgressResponse(res, raceId, userId, cfg, rank?.steps ?? 0, { skipped: "not_active" });
+    return true;
+  }
+
+  // Device-time skew guard (parity with the Postgres path).
+  const nowMs = Date.now();
+  if (devTime && Math.abs(nowMs - devTime.getTime()) > MAX_DEVICE_TIME_SKEW_MS) {
+    res.status(400).json({ error: "deviceTime is outside the allowed skew window", code: "DEVICE_TIME_SKEW" });
+    return true;
+  }
+
+  let result = await applyProgress({ raceId, userId, requestedSteps: steps, clientSeq, deviceTotal, nowMs });
+  if (!result.ok && result.reason === "not_hydrated") {
+    // Participant not yet in live state (late join / sponsored auto-create / post-restart).
+    // Hydrate them from Postgres once and retry; if they don't exist yet, fall through to the
+    // Postgres path (which auto-creates them — the next tick then lands here).
+    const added = await ensureParticipantHydrated(raceId, userId);
+    if (!added) return false;
+    result = await applyProgress({ raceId, userId, requestedSteps: steps, clientSeq, deviceTotal, nowMs });
+  }
+  if (!result.ok) {
+    if (result.reason === "not_active") {
+      // Race was frozen for finalization between our checks — echo current standing, no accept.
+      const rank = await getParticipantRank(raceId, userId).catch(() => null);
+      await sendRedisProgressResponse(res, raceId, userId, cfg, rank?.steps ?? 0, { skipped: "not_active" });
+      return true;
+    }
+    // Still not hydrated after a recovery attempt → degrade gracefully; client should retry.
+    res.status(503).json({ status: "sync_degraded", retryable: true });
+    return true;
+  }
+
+  // Reduced-volume audit (2i): only persist flagged events (simulation source / clamped
+  // overage), never every tick. The finalization simulation-guard reads these rows; normal
+  // ticks leave no audit row, avoiding millions of rows/day.
+  if (srcLabel === "simulation" || result.pendingReconciliation) {
+    void db.insert(raceStepSyncLogsTable).values({
+      raceId,
+      userId,
+      stepSource: srcLabel,
+      latestDeviceSteps: deviceTotal,
+      calculatedProgress: steps,
+      storedProgress: result.newSteps,
+      suspicious: result.pendingReconciliation,
+      reason: result.pendingReconciliation ? "rate_exceeded_cumulative" : "simulation_source",
+      deviceTime: devTime,
+    }).catch(() => { /* audit failures never affect the request */ });
+  }
+
+  if (result.justFinished && result.finishOrdinal != null) {
+    await persistRedisFinish(raceId, userId, result.finishOrdinal, result.newSteps, nowMs);
+    // Finish events are rare and important — always delivered (not coalesced).
+    void triggerEvent(`public-live-race-${raceId}`, "participant_finished_goal", {
+      participantId: result.participantId,
+      userId,
+      finishRank: result.finishOrdinal,
+    });
+  }
+
+  const standings = await getStandingsWithNames(raceId, 20);
+  const userRank = standings.find((s) => s.userId === userId)?.rank ?? 0;
+  // Coalesce leaderboard broadcasts across processes: at most ~1 per 750ms per race. On lease
+  // error, default to broadcasting so a redis blip doesn't silently drop all updates.
+  const shouldBroadcast = result.justFinished
+    || (await tryAcquireBroadcastLease(raceId).catch(() => true));
+  if (shouldBroadcast) {
+    void triggerEvent(`public-live-race-${raceId}`, "race:progress_updated", {
+      participantId: result.participantId,
+      userId,
+      steps: result.newSteps,
+      progress: result.newSteps / Math.max(cfg.targetSteps, 1),
+      rank: userRank,
+      leaderboard: standings.slice(0, 20),
+    });
+  }
+
+  await sendRedisProgressResponse(
+    res,
+    raceId,
+    userId,
+    cfg,
+    result.newSteps,
+    result.pendingReconciliation ? { pending_reconciliation: true } : {},
+    standings,
+  );
+  return true;
+}
+
+/** Build the progress-sync response from redis-live state (no SQL), matching the legacy shape. */
+async function sendRedisProgressResponse(
+  res: import("express").Response,
+  raceId: string,
+  userId: string,
+  cfg: NonNullable<Awaited<ReturnType<typeof getRaceConfig>>>,
+  raceSteps: number,
+  extra: Record<string, unknown>,
+  standings?: Awaited<ReturnType<typeof getStandingsWithNames>>,
+) {
+  const board = standings ?? (await getStandingsWithNames(raceId, 20));
+  const me = board.find((s) => s.userId === userId);
+  const total = await getParticipantCount(raceId).catch(() => board.length);
+  const ctx: LiveRaceProgressContext = {
+    raceId,
+    userId,
+    username: me?.username ?? "Runner",
+    raceSteps,
+    rank: me?.rank ?? total,
+    totalParticipants: total,
+    goalSteps: cfg.targetSteps,
+    timeLeftSeconds: cfg.challengeEndAtMs ? Math.max(0, Math.floor((cfg.challengeEndAtMs - Date.now()) / 1000)) : 0,
+    raceStatus: liveStatusToRaceStatus(cfg.status),
+    lastSyncedAt: new Date().toISOString(),
+    leaderboard: board,
+  };
+  return res.json(formatProgressSyncResponse(ctx, extra));
+}
+
 // Participant reports their current race step count. Steps only ever increase.
 // Optional fields (non-breaking):
 //   sequenceId      — monotonic client counter; duplicate/stale syncs are silently
@@ -4527,6 +4889,17 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
 
   // Optional: device-reported sync timestamp
   const devTime = typeof deviceTime === "string" ? new Date(deviceTime) : null;
+
+  // Redis-live canary: for redis-mode races, handle the tick entirely off redis-live (zero
+  // SQL). Falls through to the legacy Postgres path for postgres-mode races or if unavailable.
+  if (config.features.redisLiveRaceEnabled) {
+    const handled = await tryHandleRedisProgress(res, { raceId, userId, steps, clientSeq, deviceTotal, srcLabel, devTime })
+      .catch((err) => {
+        req.log.error({ err, raceId, userId }, "[redisProgress] handler error — falling back to Postgres");
+        return false;
+      });
+    if (handled) return;
+  }
 
   // Fetch both participant and room in one shot
   const [[participant], [room]] = await Promise.all([
@@ -4641,26 +5014,9 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
     });
   }
 
-  const lastSyncAtMs = participantData.lastStepSyncAt?.getTime() ?? room?.startedAt?.getTime() ?? nowMs;
-  const elapsedSinceLastSyncSeconds = Math.max(1, (nowMs - lastSyncAtMs) / 1000);
-  const maxAllowedDelta = Math.max(
-    MAX_PROGRESS_DELTA_FLOOR,
-    Math.ceil(elapsedSinceLastSyncSeconds * MAX_PROGRESS_STEPS_PER_SECOND),
-  );
-  const requestedSteps = Math.floor(steps);
-  const requestedDelta = requestedSteps - participantData.currentSteps;
-  if (requestedDelta > maxAllowedDelta) {
-    req.log.warn(
-      { raceId, userId, requestedSteps, currentSteps: participantData.currentSteps, requestedDelta, maxAllowedDelta, elapsedSinceLastSyncSeconds },
-      "[RaceStepsSync] rejected due to excessive progress delta",
-    );
-    return res.status(409).json({
-      error: "Progress jump exceeds the allowed sync delta.",
-      code: "STEP_DELTA_TOO_LARGE",
-      max_allowed_delta: maxAllowedDelta,
-    });
-  }
-
+  // NOTE: the per-sync delta cap is enforced *after* baseline/backfill resolution as a
+  // cumulative budget (see "Cumulative rate cap" below), so it bounds the final stored
+  // total — including backend-derived recovery — rather than a single tick's delta.
   let newSteps = Math.max(participantData.currentSteps, Math.floor(steps));
   const targetSteps = room ? targetStepsForRoom(room) : 0;
 
@@ -4717,6 +5073,27 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
     );
   }
 
+  // ── Cumulative rate cap (anti-cheat) ──────────────────────────────────────
+  // Bound the participant's TOTAL steps by the plausible race-time budget. This
+  // replenishes at MAX_PROGRESS_STEPS_PER_SECOND and carries forward, so it cannot
+  // be defeated by a per-tick allowance. Overage (including implausible offline
+  // backfill) is clamped to the max and flagged for reconciliation rather than
+  // trusted. Skipped only when race start time is unknown (cannot judge plausibility).
+  const rawNewSteps = newSteps;
+  let pendingReconciliation = false;
+  if (room?.startedAt) {
+    const maxCumulativeSteps =
+      Math.ceil(elapsedSeconds * MAX_PROGRESS_STEPS_PER_SECOND) + MAX_PROGRESS_BURST;
+    if (newSteps > maxCumulativeSteps) {
+      pendingReconciliation = true;
+      newSteps = Math.max(participantData.currentSteps, maxCumulativeSteps);
+      req.log.warn(
+        { raceId, userId, rawNewSteps, clampedTo: newSteps, maxCumulativeSteps, elapsedSeconds, srcLabel },
+        "[RaceStepsSync] steps exceeded cumulative budget — clamped, pending reconciliation",
+      );
+    }
+  }
+
   req.log.info(
     {
       raceId,
@@ -4752,10 +5129,13 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
     raceStartedAt: room?.startedAt ?? null,
     baselineSteps: baselineToStore ?? (existingBaseline > 0 ? existingBaseline : null),
     latestDeviceSteps: deviceTotal,
-    calculatedProgress: newSteps,
+    calculatedProgress: rawNewSteps,
     storedProgress: Math.max(participantData.currentSteps, newSteps),
-    suspicious: suspiciousEarlyJump,
-    reason: suspiciousReason,
+    suspicious: suspiciousEarlyJump || pendingReconciliation,
+    reason: [
+      suspiciousReason,
+      pendingReconciliation ? `rate_exceeded_cumulative: raw ${rawNewSteps} clamped ${newSteps}` : null,
+    ].filter(Boolean).join("; ") || null,
     deviceTime: devTime,
   }).catch(() => { /* audit log failures must never affect the main request */ });
 
@@ -4917,7 +5297,13 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
     }
   }
 
-  return respondWithLiveProgress(res, raceId, userId, newSteps);
+  return respondWithLiveProgress(
+    res,
+    raceId,
+    userId,
+    newSteps,
+    pendingReconciliation ? { pending_reconciliation: true } : {},
+  );
 });
 
 // ── GET /api/races/:id/leaderboard ───────────────────────────────────────────
