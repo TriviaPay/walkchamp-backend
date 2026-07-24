@@ -1,5 +1,15 @@
-import { getRedisQueue } from "./redis.js";
+import { getRedisQueue, ensureRedisQueueConnected } from "./redis.js";
 import { logger } from "./logger.js";
+
+/**
+ * redis-queue client, guaranteed connected first. The client is lazy (lazyConnect) with
+ * enableOfflineQueue=false, so issuing a command before the socket is ready throws
+ * "Stream isn't writeable" — ensure the connection like the cache/live modules do.
+ */
+async function q() {
+  await ensureRedisQueueConnected();
+  return getRedisQueue();
+}
 
 /**
  * Durable registry of races that need periodic attention, used to GATE the recurring
@@ -24,7 +34,7 @@ export type ScheduledRaceEntry = { id: string; startAtMs: number };
 /** Mark a race as live so the safety-net cleanup will consider it. Best-effort. */
 export async function markRaceActive(raceId: string, timeoutAtMs: number): Promise<void> {
   try {
-    await getRedisQueue().zadd(ACTIVE_KEY, timeoutAtMs, raceId);
+    await (await q()).zadd(ACTIVE_KEY, timeoutAtMs, raceId);
   } catch (err) {
     logger.warn({ err, raceId }, "[raceRegistry] markRaceActive failed (non-fatal)");
   }
@@ -33,7 +43,7 @@ export async function markRaceActive(raceId: string, timeoutAtMs: number): Promi
 /** Remove a race from the active set once finalized. Best-effort (reconcile also removes). */
 export async function markRaceInactive(raceId: string): Promise<void> {
   try {
-    await getRedisQueue().zrem(ACTIVE_KEY, raceId);
+    await (await q()).zrem(ACTIVE_KEY, raceId);
   } catch (err) {
     logger.warn({ err, raceId }, "[raceRegistry] markRaceInactive failed (non-fatal)");
   }
@@ -42,7 +52,7 @@ export async function markRaceInactive(raceId: string): Promise<void> {
 /** Mark a race as scheduled so the scheduler will consider it. Best-effort. */
 export async function markRaceScheduled(raceId: string, startAtMs: number): Promise<void> {
   try {
-    await getRedisQueue().zadd(SCHEDULED_KEY, startAtMs, raceId);
+    await (await q()).zadd(SCHEDULED_KEY, startAtMs, raceId);
   } catch (err) {
     logger.warn({ err, raceId }, "[raceRegistry] markRaceScheduled failed (non-fatal)");
   }
@@ -51,7 +61,7 @@ export async function markRaceScheduled(raceId: string, startAtMs: number): Prom
 /** Remove a race from the scheduled set once started/cancelled. Best-effort. */
 export async function unmarkRaceScheduled(raceId: string): Promise<void> {
   try {
-    await getRedisQueue().zrem(SCHEDULED_KEY, raceId);
+    await (await q()).zrem(SCHEDULED_KEY, raceId);
   } catch (err) {
     logger.warn({ err, raceId }, "[raceRegistry] unmarkRaceScheduled failed (non-fatal)");
   }
@@ -60,7 +70,7 @@ export async function unmarkRaceScheduled(raceId: string): Promise<void> {
 /** List active race ids from the registry (best-effort; empty on error). */
 export async function listActiveRaces(): Promise<string[]> {
   try {
-    return await getRedisQueue().zrange(ACTIVE_KEY, 0, -1);
+    return await (await q()).zrange(ACTIVE_KEY, 0, -1);
   } catch (err) {
     logger.warn({ err }, "[raceRegistry] listActiveRaces failed");
     return [];
@@ -70,7 +80,7 @@ export async function listActiveRaces(): Promise<string[]> {
 /** Active race count, or null when the registry is unavailable (caller must fail open). */
 export async function activeRaceCount(): Promise<number | null> {
   try {
-    return await getRedisQueue().zcard(ACTIVE_KEY);
+    return await (await q()).zcard(ACTIVE_KEY);
   } catch (err) {
     logger.warn({ err }, "[raceRegistry] activeRaceCount failed — treat as unknown");
     return null;
@@ -80,7 +90,7 @@ export async function activeRaceCount(): Promise<number | null> {
 /** Scheduled race count, or null when unavailable (caller must fail open). */
 export async function scheduledRaceCount(): Promise<number | null> {
   try {
-    return await getRedisQueue().zcard(SCHEDULED_KEY);
+    return await (await q()).zcard(SCHEDULED_KEY);
   } catch (err) {
     logger.warn({ err }, "[raceRegistry] scheduledRaceCount failed — treat as unknown");
     return null;
@@ -89,7 +99,7 @@ export async function scheduledRaceCount(): Promise<number | null> {
 
 async function reconcile(key: string, currentIds: Map<string, number>): Promise<void> {
   try {
-    const redis = getRedisQueue();
+    const redis = (await q());
     const existing = await redis.zrange(key, 0, -1);
     const stale = existing.filter((id) => !currentIds.has(id));
     const pipeline = redis.multi();
