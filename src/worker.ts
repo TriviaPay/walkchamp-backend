@@ -10,6 +10,8 @@ import { startOutboxDispatcher } from "./lib/outbox.js";
 import { processApprovedRefundJob } from "./lib/refundService.js";
 import { processDepositWebhookEvent } from "./lib/depositWebhookProcessor.js";
 import { evaluateScheduledStart, expireOpenWindow, sendScheduledReminder } from "./lib/waitingRoomJobs.js";
+import { startUnlimitedChallenge } from "./lib/unlimitedChallengeJobs.js";
+import { settleUnlimitedChallenge } from "./lib/unlimitedChallengeSettlement.js";
 
 async function reconcileAllCoinBalances() {
   const users = await db.select({ userId: coinBalancesTable.userId }).from(coinBalancesTable);
@@ -77,17 +79,24 @@ async function main() {
   // T-30 reminder). Exact-time firing; the scheduler's reconcileWaitingRooms tick is the safety net.
   if (config.redis.queueUrl) {
     startQueueWorker("scheduled-jobs", async (job) => {
-      const roomId = String((job.data as { roomId?: unknown }).roomId ?? "");
-      if (!roomId) return;
+      const data = job.data as { roomId?: unknown; challengeId?: unknown };
+      const roomId = String(data.roomId ?? "");
+      const challengeId = String(data.challengeId ?? "");
       switch (job.name) {
         case "waiting_room.scheduled_start":
-          await evaluateScheduledStart(roomId);
+          if (roomId) await evaluateScheduledStart(roomId);
           break;
         case "waiting_room.expire":
-          await expireOpenWindow(roomId);
+          if (roomId) await expireOpenWindow(roomId);
           break;
         case "waiting_room.scheduled_reminder":
-          await sendScheduledReminder(roomId);
+          if (roomId) await sendScheduledReminder(roomId);
+          break;
+        case "unlimited.start":
+          if (challengeId) await startUnlimitedChallenge(challengeId);
+          break;
+        case "unlimited.settle":
+          if (challengeId) await settleUnlimitedChallenge(challengeId);
           break;
         default:
           break;

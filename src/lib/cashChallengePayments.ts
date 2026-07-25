@@ -144,3 +144,64 @@ export async function creditCashChallengePrizes(
 
   return { credited };
 }
+
+/**
+ * Idempotently credit entry-fee refunds back to wallets — used only by the Unlimited Challenge
+ * zero-winner "refund_entry_contributions" policy (nobody completed, so entries are returned). The
+ * fixed platform fee is NOT refunded. Keyed by `refund:{sourceId}:{userId}` so duplicate/retried
+ * settlements never double-refund. Balance snapshots are written so the wallet-ledger reconciliation
+ * stays consistent.
+ */
+export async function creditEntryRefunds(
+  tx: DbTx,
+  input: {
+    sourceId: string; // the unlimited challenge id
+    refunds: Array<{ userId: string; amountCents: number }>;
+  },
+) {
+  let credited = 0;
+  const byUser = new Map<string, number>();
+  for (const r of input.refunds) {
+    if (r.amountCents > 0) byUser.set(r.userId, Math.max(byUser.get(r.userId) ?? 0, r.amountCents));
+  }
+
+  for (const [userId, amountCents] of byUser) {
+    let wallet = await lockWalletByUserId(tx, userId);
+    if (!wallet) {
+      const [created] = await tx.insert(walletsTable).values({ userId, currency: "usd" }).returning();
+      wallet = created;
+    }
+    if (wallet.currency.toLowerCase() !== "usd") continue;
+
+    const before = wallet.availableBalanceCents;
+    const after = before + amountCents;
+    const inserted = await tx
+      .insert(walletTransactionsTable)
+      .values({
+        walletId: wallet.id,
+        userId,
+        transactionType: "race_entry_refund",
+        amountCents,
+        currency: wallet.currency,
+        status: "completed",
+        description: `Entry refund (no qualified winners) for challenge ${input.sourceId}`,
+        source: "cash_challenge",
+        raceRoomId: input.sourceId,
+        idempotencyKey: `refund:${input.sourceId}:${userId}`,
+        balanceBeforeCents: before,
+        balanceAfterCents: after,
+        metadata: { reason: "zero_winner_refund" },
+      })
+      .onConflictDoNothing()
+      .returning({ id: walletTransactionsTable.id });
+    if (inserted.length === 0) continue;
+
+    await tx
+      .update(walletsTable)
+      .set({ availableBalanceCents: after, updatedAt: new Date() })
+      .where(eq(walletsTable.id, wallet.id));
+    credited += 1;
+  }
+
+  return { credited };
+}

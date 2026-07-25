@@ -74,6 +74,9 @@ vi.mock("../lib/raceIntegrity.js", () => ({
 vi.mock("../lib/waitingRoomJobs.js", () => ({
   reconcileWaitingRooms: vi.fn(async () => {}),
 }));
+vi.mock("../lib/unlimitedChallengeJobs.js", () => ({
+  reconcileUnlimitedChallenges: vi.fn(async () => {}),
+}));
 
 async function loadScheduler() {
   return import("../lib/scheduler.js");

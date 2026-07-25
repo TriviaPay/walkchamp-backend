@@ -59,6 +59,11 @@ const envSchema = z
     CASH_FEATURES_ENABLED: z.enum(["true", "false"]).optional(),
     FEATURE_CASH_FEATURES: z.enum(["true", "false"]).optional(),
     FEATURE_COIN_ENTRY_CHALLENGES: z.enum(["true", "false"]).optional(),
+    FEATURE_UNLIMITED_GOAL: z.enum(["true", "false"]).optional(),
+    UNLIMITED_GOAL_GRACE_HOURS: z.string().optional(),
+    UNLIMITED_GOAL_ZERO_WINNER_POLICY: z
+      .enum(["refund_entry_contributions", "rollover_prize_pool", "manual_review"])
+      .optional(),
     PAYMENTS_LIVE_MODE: z.enum(["true", "false"]).optional(),
     REAL_MONEY_PRODUCTION_APPROVED: z.enum(["true", "false"]).optional(),
     REAL_MONEY_LEGAL_APPROVED: z.enum(["true", "false"]).optional(),
@@ -140,6 +145,10 @@ const featureFlags = {
     parseBoolean(rawEnv.CASH_FEATURES_ENABLED)
     && parseBoolean(rawEnv.FEATURE_CASH_FEATURES),
   coinEntryChallengesEnabled: parseBoolean(rawEnv.FEATURE_COIN_ENTRY_CHALLENGES),
+  // Unlimited Challenge (unlimited_goal). Primary rollback switch: setting this false blocks all
+  // create/join (routes 404); worker start/finalize/settle paths are intentionally NOT gated so
+  // any in-flight challenge still completes safely.
+  unlimitedGoalEnabled: parseBoolean(rawEnv.FEATURE_UNLIMITED_GOAL),
   allowTestRoutes: parseBoolean(rawEnv.ALLOW_TEST_ROUTES),
   allowDemoSeeds: parseBoolean(rawEnv.ALLOW_DEMO_SEEDS),
   mockProvidersEnabled: parseBoolean(rawEnv.MOCK_PROVIDERS_ENABLED),
@@ -288,6 +297,15 @@ const parseIntWithFallback = (raw: unknown, fallback: number, min: number): numb
 const waitingRoomOpenWindowMinutes = parseIntWithFallback(rawEnv.ROOM_OPEN_WINDOW_MINUTES, 30, 1);
 const waitingRoomMinimumParticipants = parseIntWithFallback(rawEnv.MINIMUM_ROOM_PARTICIPANTS, 2, 2);
 
+// ── Unlimited Challenge tunables (backend-authoritative; never client-supplied) ──
+const unlimitedGoalGraceHours = parseIntWithFallback(rawEnv.UNLIMITED_GOAL_GRACE_HOURS, 4, 0);
+const unlimitedGoalZeroWinnerPolicy = (() => {
+  const raw = rawEnv.UNLIMITED_GOAL_ZERO_WINNER_POLICY?.trim();
+  return raw === "refund_entry_contributions" || raw === "rollover_prize_pool" || raw === "manual_review"
+    ? raw
+    : "manual_review";
+})();
+
 export const config = {
   nodeEnv,
   isProduction,
@@ -308,6 +326,18 @@ export const config = {
     openWindowMinutes: waitingRoomOpenWindowMinutes,
     openWindowMs: waitingRoomOpenWindowMinutes * 60_000,
     minimumParticipants: waitingRoomMinimumParticipants,
+  },
+  unlimitedGoal: {
+    platformFeeCents: 50,
+    minEntryFeeCents: 1000,
+    maxEntryFeeCents: 100_000,
+    allowedDurationDays: [7, 10, 30, 60, 90] as const,
+    minDailyGoalSteps: 3000,
+    maxDailyGoalSteps: 15000,
+    defaultDailyGoalSteps: 10000,
+    graceHours: unlimitedGoalGraceHours,
+    graceMs: unlimitedGoalGraceHours * 60 * 60_000,
+    zeroWinnerPolicy: unlimitedGoalZeroWinnerPolicy,
   },
   runtime: {
     requestTimeoutMs: 15_000,

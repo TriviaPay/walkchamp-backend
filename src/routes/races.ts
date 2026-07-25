@@ -111,6 +111,7 @@ import { getWinnerSlotCount, selectWinners, type Completer } from "../lib/raceSe
 import { writeAuditLog } from "../lib/auditLog.js";
 import { sendNotification } from "./notifications.js";
 import { computeCanStart, terminateWaitingRoom, enqueueWaitingRoomLifecycleJobs } from "../lib/waitingRoom.js";
+import { getUnlimitedBlockingMembership } from "../lib/challengeMembership.js";
 
 const router = Router();
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -2653,6 +2654,16 @@ router.post("/races/host", requireAuth, async (req, res) => {
   if (existingRegularRace) {
     return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
+  {
+    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
+    if (unlimitedBlock) return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
+  }
+  // One-blocking-challenge also spans Unlimited Challenges.
+  const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
+  if (unlimitedBlock) {
+    return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
+  }
 
   // For paid races validate eligibility
   if (amountCents > 0) {
@@ -3678,6 +3689,11 @@ router.post("/races", requireAuth, async (req, res) => {
   if (existingRegularRace) {
     return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
+  {
+    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
+    if (unlimitedBlock) return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
+  }
 
   if (amountCents > 0) {
     const [profile] = await db
@@ -3761,6 +3777,11 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
   if (existingRegularRace) {
     return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
+  {
+    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
+    if (unlimitedBlock) return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
+  }
 
   const [profile] = await db
     .select({ accountStatus: profilesTable.accountStatus })
@@ -3800,6 +3821,8 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
 
       const lockedRoom = await lockRaceRoom(tx, room.id);
       if (!lockedRoom || (lockedRoom.status !== "open" && lockedRoom.status !== "full")) return;
+      // Reject joins to an open-window room whose 30-minute window has already closed.
+      if (lockedRoom.roomExpiresAt && Date.now() >= lockedRoom.roomExpiresAt.getTime()) return;
       if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) return;
 
       const participantResult = await joinOrReviveParticipant(tx, { raceRoomId: lockedRoom.id, userId });
@@ -3889,6 +3912,11 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId, raceId);
   if (existingRegularRace) {
     return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
+  }
+  {
+    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
+    if (unlimitedBlock) return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
   }
 
   const [room] = await db
@@ -4059,6 +4087,11 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
   if (existingRegularRace) {
     return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
+  {
+    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
+    if (unlimitedBlock) return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
+  }
 
   const [room] = await db
     .select()
@@ -4108,6 +4141,12 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
     if (lockedRoom.status !== "open" && lockedRoom.status !== "full") {
       joinErrorStatus = 409;
       joinErrorBody = { error: "Race is no longer open to join." };
+      return;
+    }
+    // Reject late joins to an open-window room whose 30-minute window has already closed.
+    if (lockedRoom.roomExpiresAt && Date.now() >= lockedRoom.roomExpiresAt.getTime()) {
+      joinErrorStatus = 409;
+      joinErrorBody = { error: "This Waiting Room has expired." };
       return;
     }
     if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
@@ -4232,11 +4271,16 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
     return res.status(404).json({ success: false, code: "INVALID_ROOM_CODE", error: "Invalid room code." });
   }
 
-  if (room.status === "completed" || room.status === "cancelled") {
+  if (room.status === "completed" || room.status === "cancelled" || room.status === "expired") {
     return res.status(409).json({ success: false, code: "ROOM_CODE_EXPIRED", error: "This room code has expired." });
   }
-  if (room.status === "in_progress") {
+  if (room.status === "in_progress" || room.status === "starting") {
     return res.status(409).json({ success: false, code: "RACE_ALREADY_STARTED", error: "This race has already started." });
+  }
+  // Reject joins to an open-window room whose 30-minute window has already closed (before the
+  // reconciler/durable job has flipped its status to "expired").
+  if (room.roomExpiresAt && Date.now() >= room.roomExpiresAt.getTime()) {
+    return res.status(409).json({ success: false, code: "ROOM_EXPIRED", error: "This Waiting Room has expired." });
   }
   if (room.currentPlayers >= room.maxPlayers) {
     return res.status(409).json({ success: false, code: "ROOM_FULL", error: "This room is full." });

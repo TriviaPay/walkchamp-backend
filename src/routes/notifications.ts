@@ -5,7 +5,7 @@ import {
   notificationDevicesTable,
   userNotificationPreferencesTable,
 } from "../../db/src/schema/index.js";
-import { eq, and, desc, lt } from "drizzle-orm";
+import { eq, and, desc, lt, gt, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
 import { sendPushToUser } from "./push.js";
@@ -209,6 +209,25 @@ export async function sendNotification(
   body: string,
   data?: Record<string, unknown>,
 ): Promise<void> {
+  // Durable exactly-once dedup: when a caller supplies a `dedupeKey`, skip (both in-app AND push)
+  // if a notification with the same key was already stored for this user in the last 24h. This
+  // enforces "deduped per user/race/type" for lifecycle events (race started/cancelled/expired,
+  // payouts) even if the emitting path is retried. Notifications without a dedupeKey are unaffected.
+  const dedupeKey = typeof data?.dedupeKey === "string" ? data.dedupeKey : null;
+  if (dedupeKey) {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const [existing] = await db
+      .select({ id: notificationsTable.id })
+      .from(notificationsTable)
+      .where(and(
+        eq(notificationsTable.userId, userId),
+        gt(notificationsTable.createdAt, since),
+        sql`${notificationsTable.data}->>'dedupeKey' = ${dedupeKey}`,
+      ))
+      .limit(1);
+    if (existing) return; // already delivered — do not duplicate in-app or push
+  }
+
   // Always store in-app notification
   await db.insert(notificationsTable).values({ userId, type, title, body, data });
 

@@ -13,6 +13,7 @@ import { logger } from "./logger.js";
 import { lockRaceRoom } from "./raceIntegrity.js";
 import { sendPushToUser } from "../routes/push.js";
 import { reconcileWaitingRooms } from "./waitingRoomJobs.js";
+import { reconcileUnlimitedChallenges } from "./unlimitedChallengeJobs.js";
 
 const DAILY_GOAL_REMINDER_TEMPLATE = "daily_goal_reminder";
 const DAILY_GOAL_REMINDER_SCAN_INTERVAL_MS = 10 * 60 * 1000;
@@ -230,6 +231,10 @@ export async function runSchedulerTick(): Promise<void> {
     // cancel when the minimum isn't met), open-window rooms past their 30-minute window expire,
     // and rooms stuck mid-start are recovered. Idempotent — a safety net behind the durable jobs.
     await reconcileWaitingRooms(now);
+
+    // Unlimited Challenge reconciliation: start past-due challenges, finalize due participant-days,
+    // and settle challenges past their settlement time. Safety net behind the durable jobs.
+    await reconcileUnlimitedChallenges(now);
 
     const dueToEnd = await db
       .select({ id: raceRoomsTable.id })

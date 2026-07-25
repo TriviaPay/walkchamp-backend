@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 // waitingRoom.test.ts; these lock the wiring, atomicity, refunds, and API surface.
 
 const races = readFileSync("src/routes/races.ts", "utf8");
+const notifications = readFileSync("src/routes/notifications.ts", "utf8");
 const waitingRoom = readFileSync("src/lib/waitingRoom.ts", "utf8");
 const waitingRoomJobs = readFileSync("src/lib/waitingRoomJobs.ts", "utf8");
 const scheduler = readFileSync("src/lib/scheduler.ts", "utf8");
@@ -108,6 +109,12 @@ describe("terminal transition, refunds, and exactly-once signalling", () => {
     expect(races).toContain("terminateWaitingRoom(raceId, {");
     expect(races).toContain('reason: "HOST_CANCELLED"');
   });
+
+  it("notifications are durably deduped when a dedupeKey is supplied (real enforcement, not cosmetic)", () => {
+    expect(notifications).toContain("const dedupeKey = typeof data?.dedupeKey === \"string\"");
+    expect(notifications).toContain("->>'dedupeKey' = ${dedupeKey}");
+    expect(notifications).toContain("return; // already delivered — do not duplicate in-app or push");
+  });
 });
 
 describe("API surface + join guards", () => {
@@ -118,8 +125,12 @@ describe("API surface + join guards", () => {
     expect(races).toContain("minimum_participants:");
   });
 
-  it("joins are rejected once the open-window has expired", () => {
-    expect(races).toContain("This Waiting Room has expired.");
+  it("joins are rejected once the open-window has expired — on ALL join paths", () => {
+    // join-paid, free /join, quick-join-free (return-guard), and join-with-code all check expiry.
+    const expiryChecks = races.match(/roomExpiresAt && Date\.now\(\) >= [a-zA-Z.]*roomExpiresAt\.getTime\(\)/g) ?? [];
+    expect(expiryChecks.length).toBeGreaterThanOrEqual(4);
+    // join-with-code must also treat an already-"expired" room as terminal.
+    expect(races).toContain('room.status === "expired"');
   });
 });
 
