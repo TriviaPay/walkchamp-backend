@@ -14,6 +14,7 @@ export const notificationTypeEnum = pgEnum("notification_type", [
   "race_starting",
   "race_started",
   "race_completed",
+  "race_cancelled",
   "race_won",
   "race_lost",
   "reward_pending",

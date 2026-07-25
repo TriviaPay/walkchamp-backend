@@ -69,6 +69,11 @@ vi.mock("../lib/raceIntegrity.js", () => ({
   joinOrReviveParticipant: vi.fn(),
   lockRaceRoom: vi.fn(),
 }));
+// Isolate the daily-goal reminder cadence from the shared Waiting Room reconciliation that
+// also runs inside runSchedulerTick (which performs its own DB queries).
+vi.mock("../lib/waitingRoomJobs.js", () => ({
+  reconcileWaitingRooms: vi.fn(async () => {}),
+}));
 
 async function loadScheduler() {
   return import("../lib/scheduler.js");
@@ -252,6 +257,9 @@ describe("runSchedulerTick daily goal reminder cadence", () => {
     vi.setSystemTime(new Date("2026-07-06T18:05:00.000Z"));
     await runSchedulerTick();
 
-    expect(mocks.db.select).toHaveBeenCalledTimes(5);
+    // Waiting-room reconciliation is mocked out, so runSchedulerTick's own selects are:
+    // tick1 = dueToEnd (1) + daily-goal scan (1); tick2 = dueToEnd (1) + scan skipped (cadence).
+    // The scan running exactly once across both ticks is what proves the 10-minute cadence.
+    expect(mocks.db.select).toHaveBeenCalledTimes(3);
   });
 });

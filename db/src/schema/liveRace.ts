@@ -1,4 +1,5 @@
 import { pgTable, text, integer, boolean, timestamp, bigint, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 // ── Live race step progress snapshots ─────────────────────────────────────────
 export const raceProgressTable = pgTable(
@@ -70,6 +71,10 @@ export const raceResultsTable = pgTable(
     eligibleForPrize: boolean("eligible_for_prize").notNull().default(true),
     goalCompletedAt: timestamp("goal_completed_at", { withTimezone: true }),
     goalCompletedAtMs: bigint("goal_completed_at_ms", { mode: "number" }),
+    // Unique 1..N position for an actual paid winner in a new-logic race. NULL for
+    // non-winners and for legacy races (which may carry tied ranks). The partial unique
+    // index below guarantees no two winners share a position within a race (§14).
+    winnerPosition: integer("winner_position"),
     status: text("status").notNull().default("pending_verification"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -77,5 +82,8 @@ export const raceResultsTable = pgTable(
     index("race_results_room_idx").on(t.raceRoomId),
     index("race_results_user_idx").on(t.userId),
     uniqueIndex("race_results_room_user_uniq").on(t.raceRoomId, t.userId),
+    uniqueIndex("race_results_room_winner_position_uniq")
+      .on(t.raceRoomId, t.winnerPosition)
+      .where(sql`${t.winnerPosition} IS NOT NULL`),
   ],
 );

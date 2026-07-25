@@ -725,15 +725,27 @@ export async function createRefundForRaceLeave(input: {
 
 export async function createRefundBatchForRaceCancellation(input: {
   raceId: string;
-  hostUserId: string;
+  hostUserId?: string | null;
   reasonCode: string;
+  // "host" (default) enforces the caller is the room creator; "system" is used by the
+  // scheduler / open-window expiry workers, which act on the room without a host request.
+  actor?: "host" | "system";
+  // Terminal status to set: "cancelled" (default, host/min-not-met) or "expired" (open-window close).
+  terminalStatus?: "cancelled" | "expired";
+  // Persisted machine-readable reason (HOST_CANCELLED | MINIMUM_PARTICIPANTS_NOT_MET |
+  // HOST_DID_NOT_START_BEFORE_EXPIRATION). Falls back to null.
+  cancellationReason?: string | null;
 }) {
+  const actor = input.actor ?? "host";
+  const terminalStatus = input.terminalStatus ?? "cancelled";
   const batch = await db.transaction(async (tx) => {
     const room = await lockRaceRoom(tx, input.raceId);
     if (!room) throw new Error("RACE_NOT_FOUND");
-    if (room.creatorId !== input.hostUserId) throw new Error("HOST_ONLY");
+    if (actor === "host" && room.creatorId !== input.hostUserId) throw new Error("HOST_ONLY");
     if (room.status !== "open" && room.status !== "full" && room.status !== "scheduled") {
-      if (room.status === "cancelled") {
+      // Idempotent: a room already in a terminal pre-start state returns its existing batch so
+      // duplicate cancel / expire / scheduler retries never create a second batch or re-refund.
+      if (room.status === "cancelled" || room.status === "expired") {
         const [existingBatch] = await tx
           .select()
           .from(refundBatchesTable)
@@ -782,7 +794,12 @@ export async function createRefundBatchForRaceCancellation(input: {
 
     await tx
       .update(raceRoomsTable)
-      .set({ status: "cancelled", updatedAt: new Date() })
+      .set({
+        status: terminalStatus,
+        cancellationReason: input.cancellationReason ?? null,
+        cancelledAt: new Date(),
+        updatedAt: new Date(),
+      })
       .where(eq(raceRoomsTable.id, input.raceId));
 
     const status = failedItems > 0 && succeededItems > 0

@@ -22,7 +22,7 @@ import {
   cashChallengeConsentsTable,
   raceTrackThemesTable,
 } from "../../db/src/schema/index.js";
-import { eq, and, desc, asc, sql, ne, inArray, or, lt } from "drizzle-orm";
+import { eq, and, desc, asc, sql, ne, inArray, notInArray, or, lt } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
 import { generateInviteCode } from "../lib/inviteCodes.js";
@@ -62,6 +62,7 @@ import {
   getPendingFinishes,
   getParticipantsState,
   clearRaceLiveState,
+  removeParticipantLiveState,
   tryAcquireBroadcastLease,
   LIVE_RACE_STATE,
 } from "../lib/raceLiveState.js";
@@ -106,6 +107,10 @@ import {
   SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS,
   SPONSORED_EVENT_TARGET_STEPS,
 } from "../lib/sponsoredEventRules.js";
+import { getWinnerSlotCount, selectWinners, type Completer } from "../lib/raceSettlement.js";
+import { writeAuditLog } from "../lib/auditLog.js";
+import { sendNotification } from "./notifications.js";
+import { computeCanStart, terminateWaitingRoom, enqueueWaitingRoomLifecycleJobs } from "../lib/waitingRoom.js";
 
 const router = Router();
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -559,6 +564,9 @@ interface TiePayoutResult {
   tieGroupSize: number;
   prizeCents: number;
   eligibleForPrize: boolean;
+  // Unique 1..N finishing position for an actual winner (new completion-gated settlement only);
+  // null/undefined for non-winners and for the legacy tie-based path.
+  winnerPosition?: number | null;
 }
 
 /**
@@ -698,6 +706,62 @@ function targetStepsForRoom(room: Pick<typeof raceRoomsTable.$inferSelect, "type
   return room.type === "sponsored" ? SPONSORED_EVENT_TARGET_STEPS : room.targetSteps;
 }
 
+/**
+ * Tie-free payout assignment for the completion-gated settlement path (spec: WINNER SELECTION
+ * AND FORFEIT LOGIC). Winners (pre-selected by `selectWinners`) receive strictly unique positions
+ * ordered by authoritative completion time; every other participant is ranked below them and is
+ * NOT eligible for a prize. No tie groups, no prize splitting, no unfilled-slot redistribution.
+ */
+function assignNewSettlementPayouts(
+  participants: Array<{ id: string; userId: string; currentSteps: number; finishedAt: Date | null }>,
+  positionByUser: Map<string, number>,
+  cashByUser: Map<string, number>,
+): TiePayoutResult[] {
+  const winners = participants
+    .filter((p) => positionByUser.has(p.userId))
+    .sort((a, b) => (positionByUser.get(a.userId) ?? 0) - (positionByUser.get(b.userId) ?? 0));
+  const nonWinners = participants
+    .filter((p) => !positionByUser.has(p.userId))
+    .sort((a, b) => {
+      if (a.finishedAt && b.finishedAt) return a.finishedAt.getTime() - b.finishedAt.getTime();
+      if (a.finishedAt) return -1;
+      if (b.finishedAt) return 1;
+      return b.currentSteps - a.currentSteps;
+    });
+
+  const results: TiePayoutResult[] = [];
+  for (const w of winners) {
+    const pos = positionByUser.get(w.userId) ?? 0;
+    results.push({
+      userId: w.userId,
+      rank: pos,
+      displayRank: pos,
+      isTied: false,
+      tieGroupId: "",
+      tieGroupSize: 1,
+      prizeCents: cashByUser.get(w.userId) ?? 0,
+      eligibleForPrize: true,
+      winnerPosition: pos,
+    });
+  }
+  let nextRank = winners.length + 1;
+  for (const l of nonWinners) {
+    results.push({
+      userId: l.userId,
+      rank: nextRank,
+      displayRank: nextRank,
+      isTied: false,
+      tieGroupId: "",
+      tieGroupSize: 1,
+      prizeCents: 0,
+      eligibleForPrize: false,
+      winnerPosition: null,
+    });
+    nextRank += 1;
+  }
+  return results;
+}
+
 async function autoCompleteRace(raceId: string, endedReason = "time_expired"): Promise<void> {
   const [room] = await db
     .select()
@@ -741,6 +805,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
       currentSteps: raceParticipantsTable.currentSteps,
       finishedAt: raceParticipantsTable.finishedAt,
       finishedAtMs: raceParticipantsTable.finishedAtMs,
+      finishRank: raceParticipantsTable.finishRank,
       username: profilesTable.username,
       avatarColor: profilesTable.avatarColor,
       countryFlag: profilesTable.countryFlag,
@@ -749,7 +814,10 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     .innerJoin(profilesTable, eq(raceParticipantsTable.userId, profilesTable.id))
     .where(and(
       eq(raceParticipantsTable.raceRoomId, raceId),
-      and(ne(raceParticipantsTable.status, "left"), ne(raceParticipantsTable.status, "forfeited")),
+      // Exclude left, forfeited, and disqualified — none may win (§5, §14, §15).
+      ne(raceParticipantsTable.status, "left"),
+      ne(raceParticipantsTable.status, "forfeited"),
+      ne(raceParticipantsTable.status, "disqualified"),
     ))
     .orderBy(desc(raceParticipantsTable.currentSteps));
 
@@ -824,10 +892,92 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   const isSponsored = room.type === "sponsored";
   const sponsoredPlayerCount = uniqueParticipants.length;
   const sponsoredPrizeCents = isSponsored ? getSponsoredPrizePoolCents(sponsoredPlayerCount) : 0;
+
+  // ── New completion-gated settlement (spec: WINNER SELECTION AND FORFEIT LOGIC) ──
+  // Applies to NON-sponsored races that started after this shipped (startingParticipantCount
+  // frozen). Sponsored keeps its existing finisher-gated path; legacy races (null starting
+  // count) keep the historical steps-ranked path. Here ONLY participants who completed the
+  // full target within the race duration can win; winners get unique positions ordered by
+  // authoritative completion time; unfilled winner slots are retained by the platform (§13).
+  const raceEndAtForSettlement = deriveChallengeEndAt(room);
+  const useNewSettlement = !isSponsored && room.startingParticipantCount != null;
+  let newSettlement: {
+    winnerSlotCount: number;
+    positionByUser: Map<string, number>;
+    cashByUser: Map<string, number>;
+    coinsByUser: Map<string, number>;
+    winnersPoolCents: number;
+    totalPoolCents: number;
+    awardedCashCents: number;
+  } | null = null;
+  if (useNewSettlement) {
+    const startCount = room.startingParticipantCount ?? 0;
+    const winnerSlotCount = room.winnerSlotCount ?? getWinnerSlotCount(startCount);
+    const completers: Completer[] = uniqueParticipants
+      .filter((p) =>
+        p.finishedAtMs != null
+        && !simulatedUserIds.has(p.userId)
+        && (raceEndAtForSettlement == null || (p.finishedAtMs as number) <= raceEndAtForSettlement.getTime()),
+      )
+      .map((p) => ({
+        participantId: p.id,
+        userId: p.userId,
+        goalCompletedAtMs: p.finishedAtMs as number,
+        finishRank: p.finishRank ?? null,
+        finalSteps: p.currentSteps,
+      }));
+    const winners = selectWinners(completers, winnerSlotCount, raceId);
+
+    // Pool + percentage splits key off the FROZEN starting count, so forfeited players' retained
+    // entry fees / coins stay in the pool (§9) and slot percentages match the starting size (§13).
+    const pool = calcPrizePool(room.entryAmountCents, startCount);
+    const cashSlots = room.entryAmountCents > 0 ? buildRewardSplitCents(room.entryAmountCents, startCount) : [];
+    const coinSlots = room.entryType === "coins_battle" && room.coinPrizePool > 0
+      ? buildCoinRewardSlots(room.coinPrizePool, startCount)
+      : [];
+
+    const positionByUser = new Map<string, number>();
+    const cashByUser = new Map<string, number>();
+    const coinsByUser = new Map<string, number>();
+    let awardedCashCents = 0;
+    for (const w of winners) {
+      positionByUser.set(w.userId, w.position);
+      const cash = cashSlots.find((s) => s.rank === w.position)?.amountCents ?? 0;
+      const coins = coinSlots.find((s) => s.rank === w.position)?.amountCents ?? 0;
+      if (cash > 0) { cashByUser.set(w.userId, cash); awardedCashCents += cash; }
+      if (coins > 0) coinsByUser.set(w.userId, coins);
+    }
+    newSettlement = {
+      winnerSlotCount,
+      positionByUser,
+      cashByUser,
+      coinsByUser,
+      winnersPoolCents: pool.winners,
+      totalPoolCents: pool.total,
+      awardedCashCents,
+    };
+    logger.info(
+      {
+        raceId, startCount, winnerSlotCount,
+        completerCount: completers.length, winnerCount: winners.length,
+        awardedCashCents, unusedToPlatformCents: pool.winners - awardedCashCents,
+      },
+      "[NewSettlement] completion-gated winners selected: winners=%d/%d slots",
+      winners.length, winnerSlotCount,
+    );
+  }
+
   const { winners: winnersPoolCents, total: totalPoolCents } = isSponsored && sponsoredPrizeCents > 0
     ? { winners: sponsoredPrizeCents, total: sponsoredPrizeCents }
-    : calcPrizePool(room.entryAmountCents, uniqueParticipants.length);
-  const platformFeeCentsVal = isSponsored ? 0 : (totalPoolCents - winnersPoolCents);
+    : newSettlement
+      ? { winners: newSettlement.winnersPoolCents, total: newSettlement.totalPoolCents }
+      : calcPrizePool(room.entryAmountCents, uniqueParticipants.length);
+  const platformFeeCentsVal = isSponsored
+    ? 0
+    : newSettlement
+      // Unfilled winner slots + rounding are retained by the platform (§13) — never redistributed.
+      ? (totalPoolCents - newSettlement.awardedCashCents)
+      : (totalPoolCents - winnersPoolCents);
 
   // ── Sponsored events: only finishers (reached goal) win prizes ──────────────
   // If nobody finished 10k steps the prize goes unclaimed (no award).
@@ -838,7 +988,9 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   // ── Build integer-cent reward slots ─────────────────────────────────────────
   const rewardSlots = isSponsored && sponsoredPrizeCents > 0
     ? buildSponsoredPrizeSlots(sponsoredPlayerCount, sponsoredFinishers.length)
-    : buildRewardSplitCents(room.entryAmountCents, uniqueParticipants.length);
+    : newSettlement
+      ? buildRewardSplitCents(room.entryAmountCents, room.startingParticipantCount ?? 0)
+      : buildRewardSplitCents(room.entryAmountCents, uniqueParticipants.length);
 
   // ── Tie-aware payout assignment ──────────────────────────────────────────────
   const tieParticipants: TieParticipant[] = uniqueParticipants.map((p) => ({
@@ -858,7 +1010,9 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
 
   const payouts = isSponsored
     ? assignSponsoredGiftCardPayouts(tieParticipants, sponsoredPlayerCount)
-    : assignPayoutsWithTies(tieParticipants, rewardSlots);
+    : newSettlement
+      ? assignNewSettlementPayouts(uniqueParticipants, newSettlement.positionByUser, newSettlement.cashByUser)
+      : assignPayoutsWithTies(tieParticipants, rewardSlots);
 
   // Log tie groups
   const stepGroupMap = new Map<number, string[]>();
@@ -893,27 +1047,40 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   // Uses the same assignPayoutsWithTies logic to correctly combine prize slots
   // across tie groups (e.g. 1st+2nd prizes split when tied for 1st in a 3-player race).
   let coinWinnersPool = 0;
-  const coinPlatformFeeCoins = 0;
+  let coinPlatformFeeCoins = 0;
 
   const coinPrizeMap = new Map<string, number>();
   if (room.entryType === "coins_battle" && room.coinPrizePool > 0) {
     coinWinnersPool = room.coinPrizePool;
-    // buildCoinRewardSlots uses getCoinPrizeSplits (70/30 for 3p, 50/30/20 for 4+)
-    const coinSlots = buildCoinRewardSlots(coinWinnersPool, uniqueParticipants.length);
-    // Reuse assignPayoutsWithTies — "amountCents" field = coin amounts here
-    const coinPayouts = assignPayoutsWithTies(tieParticipants, coinSlots);
-    for (const cp of coinPayouts) {
-      if (cp.eligibleForPrize && cp.prizeCents > 0) {
-        coinPrizeMap.set(cp.userId, cp.prizeCents);
+    if (newSettlement) {
+      // Completion-gated: coins already assigned to the unique-position winners only.
+      // Undistributed coins (unfilled slots + rounding) are retained by the platform (§13).
+      for (const [uid, coins] of newSettlement.coinsByUser) coinPrizeMap.set(uid, coins);
+      const totalDistributed = [...coinPrizeMap.values()].reduce((sum, c) => sum + c, 0);
+      coinPlatformFeeCoins = coinWinnersPool - totalDistributed;
+      logger.info(
+        { raceId, coinPrizePool: room.coinPrizePool, coinWinnersPool, coinPlatformFeeCoins, winnerPayouts: Object.fromEntries(coinPrizeMap) },
+        "[CoinsBattle] completion-gated pool: total=%d distributed=%d platform=%d payouts=%j",
+        room.coinPrizePool, totalDistributed, coinPlatformFeeCoins, Object.fromEntries(coinPrizeMap),
+      );
+    } else {
+      // buildCoinRewardSlots uses getCoinPrizeSplits (70/30 for 3p, 50/30/20 for 4+)
+      const coinSlots = buildCoinRewardSlots(coinWinnersPool, uniqueParticipants.length);
+      // Reuse assignPayoutsWithTies — "amountCents" field = coin amounts here
+      const coinPayouts = assignPayoutsWithTies(tieParticipants, coinSlots);
+      for (const cp of coinPayouts) {
+        if (cp.eligibleForPrize && cp.prizeCents > 0) {
+          coinPrizeMap.set(cp.userId, cp.prizeCents);
+        }
       }
+      const totalDistributed = [...coinPrizeMap.values()].reduce((sum, c) => sum + c, 0);
+      const coinRoundingRemainder = coinWinnersPool - totalDistributed;
+      logger.info(
+        { raceId, coinPrizePool: room.coinPrizePool, coinWinnersPool, roundingRemainder: coinRoundingRemainder, winnerPayouts: Object.fromEntries(coinPrizeMap) },
+        "[CoinsBattle] pool: total=%d winners=%d remainder=%d payouts=%j",
+        room.coinPrizePool, coinWinnersPool, coinRoundingRemainder, Object.fromEntries(coinPrizeMap),
+      );
     }
-    const totalDistributed = [...coinPrizeMap.values()].reduce((sum, c) => sum + c, 0);
-    const coinRoundingRemainder = coinWinnersPool - totalDistributed;
-    logger.info(
-      { raceId, coinPrizePool: room.coinPrizePool, coinWinnersPool, roundingRemainder: coinRoundingRemainder, winnerPayouts: Object.fromEntries(coinPrizeMap) },
-      "[CoinsBattle] pool: total=%d winners=%d remainder=%d payouts=%j",
-      room.coinPrizePool, coinWinnersPool, coinRoundingRemainder, Object.fromEntries(coinPrizeMap),
-    );
   }
 
   // [PaidRewards] logging for USD paid challenges
@@ -959,6 +1126,9 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
       tieGroupId: payout.tieGroupId || null,
       tieGroupSize: payout.tieGroupSize,
       eligibleForPrize: isSimulatedUser ? false : payout.eligibleForPrize,
+      // Unique winner position (new settlement). Null for non-winners, simulated users, and
+      // legacy/sponsored rows — enforced unique per race by the partial index.
+      winnerPosition: isSimulatedUser ? null : (payout.winnerPosition ?? null),
       goalCompletedAt: completedAt,
       goalCompletedAtMs,
       status: isSimulatedUser ? "disqualified_simulation" : "verified",
@@ -966,9 +1136,14 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   });
   const actualWinnerCount = isSponsored
     ? resultRows.filter((r) => r.eligibleForPrize && r.prizeCents > 0).length
-    : numWinners(uniqueParticipants.length);
+    : newSettlement
+      ? newSettlement.positionByUser.size
+      : numWinners(uniqueParticipants.length);
 
-  const rewardSplitForRoom = buildRewardSplit(room.entryAmountCents, uniqueParticipants.length);
+  const rewardSplitForRoom = buildRewardSplit(
+    room.entryAmountCents,
+    newSettlement ? (room.startingParticipantCount ?? 0) : uniqueParticipants.length,
+  );
 
   // ── Step 1: Mark the race completed (critical path — must always commit) ─────
   // This is intentionally NOT in the same transaction as the results insert.
@@ -1079,6 +1254,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
             tieGroupSize: sql`excluded.tie_group_size`,
             eligibleForPrize: sql`excluded.eligible_for_prize`,
             prizeCoins: sql`excluded.prize_coins`,
+            winnerPosition: sql`excluded.winner_position`,
             status: sql`excluded.status`,
           },
         });
@@ -1128,14 +1304,18 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     const jobs: Promise<number | null>[] = [];
 
     // Only the top N finishers earn race-win coins: 1 for 2-player, 2 for 3-player, 3 for 4+
-    const winnerSlots = numWinners(uniqueParticipants.length);
+    const winnerSlots = newSettlement ? newSettlement.winnerSlotCount : numWinners(uniqueParticipants.length);
 
     for (const r of resultRows) {
       if (isSponsored && !r.eligibleForPrize) continue;
       // Skip coin rewards for simulation-disqualified participants
       if (!r.eligibleForPrize && r.status === "disqualified_simulation") continue;
+      // New settlement: ONLY actual winners (unique position set) earn coins — a non-completer
+      // holding a display rank ≤ winnerSlots (from an unfilled slot) must NOT be rewarded (§13).
+      const isActualWinner = newSettlement ? (r.winnerPosition != null) : (r.rank <= winnerSlots);
+      const isRoomWinner = newSettlement ? (r.winnerPosition === 1) : (r.rank === 1);
       // Race-win coins: only for top N winners AND 1k-step-goal races
-      if (r.rank <= winnerSlots) {
+      if (isActualWinner) {
         const code = getRaceWinRewardCode(room.entryType, r.rank, targetStepsForRoom(room));
         if (code) {
           const raceLabel = RACE_LABEL[room.entryType] ?? "race";
@@ -1143,8 +1323,8 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
           jobs.push(grantCoinReward(r.userId, code, raceId, `${rankLabel} place in ${raceLabel}`));
         }
       }
-      // Room-win coins: 50 coins to whoever wins a public or private room (any goal)
-      if (r.rank === 1) {
+      // Room-win coins: 50 coins to whoever wins a public or private room (must be an actual winner).
+      if (isRoomWinner) {
         const roomWinCode = room.isPrivate ? "PRIVATE_ROOM_WIN" : "PUBLIC_ROOM_WIN";
         const roomLabel  = room.isPrivate ? "private" : "public";
         jobs.push(grantCoinReward(r.userId, roomWinCode, raceId, `Won a ${roomLabel} room match`));
@@ -2570,6 +2750,11 @@ router.post("/races/host", requireAuth, async (req, res) => {
         isPrivate,
         status: isScheduledFuture ? "scheduled" : "open",
         scheduleType: isScheduledFuture ? "future" : "now",
+        // Shared Waiting Room lifecycle: scheduled rooms auto-start at scheduledStartAt; open-window
+        // rooms stay open exactly 30 min (roomExpiresAt) unless the host starts sooner.
+        mode: isScheduledFuture ? "scheduled" : "open_window",
+        minimumParticipants: config.waitingRoom.minimumParticipants,
+        ...(isScheduledFuture ? {} : { roomExpiresAt: new Date(Date.now() + config.waitingRoom.openWindowMs) }),
         ...(scheduledStartAt ? { scheduledStartAt } : {}),
         ...(challengeEndAt ? { challengeEndAt } : {}),
         ...(durationDays > 0 ? { challengeDurationDays: durationDays } : {}),
@@ -2607,6 +2792,8 @@ router.post("/races/host", requireAuth, async (req, res) => {
   }
 
   req.log.info({ raceId: result.room.id, userId, entryType, isPrivate, isScheduledFuture }, "[ScheduleRoom] createResponse");
+  // Enqueue the durable lifecycle job (scheduled auto-start OR 30-min open-window expiry).
+  void enqueueWaitingRoomLifecycleJobs(result.room);
   if (!isPrivate) {
     if (isScheduledFuture) {
       triggerEvent("public-rooms-available", "room:scheduled", {
@@ -2691,22 +2878,76 @@ router.post("/races/host", requireAuth, async (req, res) => {
 
 // ── POST /api/races/:id/start ─────────────────────────────────────────────────
 // Host starts the race. Requires >= 2 joined participants.
-router.post("/races/:id/start", requireAuth, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
-  const raceId = String(req.params.id);
+// Result of an activation attempt. Non-HTTP so both the host endpoint and the scheduler can use it.
+export type ActivateRoomResult =
+  | { ok: true; room: typeof raceRoomsTable.$inferSelect }
+  | { ok: false; httpStatus: number; body: Record<string, unknown> };
 
-  const [room] = await db
-    .select()
-    .from(raceRoomsTable)
-    .where(eq(raceRoomsTable.id, raceId))
-    .limit(1);
-
-  if (!room) return res.status(404).json({ error: "Race not found" });
-  if (room.creatorId !== userId) return res.status(403).json({ error: "Only the host can start the race." });
-  if (room.status !== "open" && room.status !== "full") return res.status(409).json({ error: "Race cannot be started in its current state." });
-  if (room.currentPlayers < 2) {
-    return res.status(409).json({ error: "Need at least 2 players to start.", code: "insufficient_players" });
+/**
+ * Shared "charge entries + start the race" transition, used by BOTH the host manual-start
+ * endpoint (open_window rooms) and the scheduler's scheduled auto-start. Atomicity vs
+ * expire/cancel is via a compare-and-set claim into the transient `starting` status: while a
+ * room is `starting`, terminate paths (which only act on open/full/scheduled) no-op, so a
+ * host-start and a 30-minute expiry can never both win. On any charge failure the claim is
+ * reverted so the room is startable again (and the reconciler recovers stuck `starting` rooms).
+ *
+ * @param opts.fromStatuses statuses eligible to be claimed (["open","full"] for manual start,
+ *        ["scheduled"] for scheduled auto-start).
+ * @param opts.materializeRegistrations convert scheduled_room_registrations → joined participants
+ *        before charging (scheduled rooms only).
+ */
+export async function activateRoomAndStart(
+  raceId: string,
+  opts: { fromStatuses: Array<"open" | "full" | "scheduled">; materializeRegistrations?: boolean } = { fromStatuses: ["open", "full"] },
+): Promise<ActivateRoomResult> {
+  // ── Materialize scheduled registrations into joined participants (scheduled only) ──
+  if (opts.materializeRegistrations) {
+    await db.transaction(async (tx) => {
+      const lockedRoom = await lockRaceRoom(tx, raceId);
+      if (!lockedRoom || lockedRoom.status !== "scheduled") return;
+      const regs = await tx
+        .select({ userId: scheduledRoomRegistrationsTable.userId })
+        .from(scheduledRoomRegistrationsTable)
+        .where(and(
+          eq(scheduledRoomRegistrationsTable.raceRoomId, raceId),
+          eq(scheduledRoomRegistrationsTable.status, "registered"),
+        ));
+      let activated = 0;
+      for (const reg of regs) {
+        const r = await joinOrReviveParticipant(tx, { raceRoomId: raceId, userId: reg.userId, currentSteps: 0, raceBaselineSteps: 0 });
+        if (r.changed) activated += 1;
+      }
+      await tx
+        .update(scheduledRoomRegistrationsTable)
+        .set({ status: "activated", activatedAt: new Date() })
+        .where(and(
+          eq(scheduledRoomRegistrationsTable.raceRoomId, raceId),
+          eq(scheduledRoomRegistrationsTable.status, "registered"),
+        ));
+      if (activated > 0) {
+        await tx.update(raceRoomsTable).set({ currentPlayers: activated, updatedAt: new Date() }).where(eq(raceRoomsTable.id, raceId));
+      }
+    });
   }
+
+  // ── Compare-and-set claim: <fromStatuses> → "starting" (only one caller wins) ──
+  const [claimed] = await db
+    .update(raceRoomsTable)
+    .set({ status: "starting", updatedAt: new Date() })
+    .where(and(eq(raceRoomsTable.id, raceId), inArray(raceRoomsTable.status, opts.fromStatuses)))
+    .returning();
+  if (!claimed) {
+    return { ok: false, httpStatus: 409, body: { error: "Race cannot be started in its current state." } };
+  }
+  const room = claimed;
+
+  // Revert the claim back to a startable status if charging fails, so the room isn't stuck.
+  const revertClaim = async () => {
+    await db
+      .update(raceRoomsTable)
+      .set({ status: opts.fromStatuses.includes("scheduled") ? "scheduled" : deriveOpenRoomStatus(room.currentPlayers, room.maxPlayers), updatedAt: new Date() })
+      .where(and(eq(raceRoomsTable.id, raceId), eq(raceRoomsTable.status, "starting")));
+  };
 
   // Charge any joined participants who have not yet paid (legacy / scheduled flows).
   if (room.entryAmountCents > 0) {
@@ -2729,11 +2970,12 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
         isCashChallengeUnsupportedForCountry(profile.countryCode)
       );
       if (unsupportedParticipant) {
-        req.log.warn(
+        logger.warn(
           { raceId, userId: unsupportedParticipant.userId, countryCode: unsupportedParticipant.countryCode },
           "[CashChallenge] INR/Razorpay race start participant debit blocked until multi-currency support ships",
         );
-        return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());
+        await revertClaim();
+        return { ok: false, httpStatus: 403, body: cashChallengeUnsupportedForCurrencyBody() };
       }
 
       const [hostProfile] = await db
@@ -2742,36 +2984,43 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
         .where(eq(profilesTable.id, room.creatorId))
         .limit(1);
       if (isCashChallengeUnsupportedForCountry(hostProfile?.countryCode)) {
-        req.log.warn(
+        logger.warn(
           { raceId, hostUserId: room.creatorId, countryCode: hostProfile?.countryCode },
           "[CashChallenge] INR/Razorpay race start debit blocked until multi-currency support ships",
         );
-        return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());
+        await revertClaim();
+        return { ok: false, httpStatus: 403, body: cashChallengeUnsupportedForCurrencyBody() };
       }
       const provider = resolvePaymentProvider(hostProfile?.countryCode);
 
-      await db.transaction(async (tx) => {
-        for (const p of participants) {
-          const paid = await hasCompletedEntryPayment(tx, p.userId, raceId);
-          if (paid) continue;
-          const result = await debitCashChallengeEntry(tx, {
-            userId: p.userId,
-            raceRoomId: raceId,
-            entryFeeCents: room.entryAmountCents,
-            paymentProvider: provider,
-            description: `Entry fee for race: ${room.title}`,
-          });
-          if (!result.ok) {
-            throw new Error(result.error);
+      try {
+        await db.transaction(async (tx) => {
+          for (const p of participants) {
+            const paid = await hasCompletedEntryPayment(tx, p.userId, raceId);
+            if (paid) continue;
+            const result = await debitCashChallengeEntry(tx, {
+              userId: p.userId,
+              raceRoomId: raceId,
+              entryFeeCents: room.entryAmountCents,
+              paymentProvider: provider,
+              description: `Entry fee for race: ${room.title}`,
+            });
+            if (!result.ok) {
+              throw new Error(result.error);
+            }
+            await grantReferralBonusForCashChallenge(tx, {
+              referredUserId: p.userId,
+              raceRoomId: raceId,
+            });
           }
-          await grantReferralBonusForCashChallenge(tx, {
-            referredUserId: p.userId,
-            raceRoomId: raceId,
-          });
-        }
-      });
+        });
+      } catch (err) {
+        logger.error({ raceId, err }, "activateRoomAndStart: cash entry charge failed — reverting claim");
+        await revertClaim();
+        return { ok: false, httpStatus: 402, body: { error: "Entry fee could not be charged.", code: "entry_charge_failed" } };
+      }
 
-      req.log.info(
+      logger.info(
         { raceId, participantCount: participants.length, amountCents: room.entryAmountCents },
         "entry fees charged at race start (unpaid participants only)",
       );
@@ -2794,6 +3043,7 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
       // participant in the race even when that was 0, letting them compete for a
       // pool funded entirely by other players' full entries.
       const disqualifiedUserIds: string[] = [];
+      try {
       await db.transaction(async (tx) => {
         for (const p of coinParticipants) {
           const [bal] = await tx
@@ -2844,6 +3094,11 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
             .where(eq(raceRoomsTable.id, raceId));
         }
       });
+      } catch (err) {
+        logger.error({ raceId, err }, "activateRoomAndStart: coins_battle entry charge failed — reverting claim");
+        await revertClaim();
+        return { ok: false, httpStatus: 402, body: { error: "Coins Battle entry could not be charged.", code: "entry_charge_failed" } };
+      }
       for (const uid of disqualifiedUserIds) {
         void triggerEvent(`private-user-${uid}`, "race:disqualified", {
           raceId,
@@ -2851,7 +3106,7 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
         }).catch(() => {});
       }
       if (disqualifiedUserIds.length > 0) {
-        req.log.info(
+        logger.info(
           { raceId, disqualifiedCount: disqualifiedUserIds.length },
           "[CoinsBattle] participants disqualified for insufficient coins at start",
         );
@@ -2867,13 +3122,29 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
           description: `Coins Battle entry: ${room.coinEntryAmount} coins`,
         }).catch(() => {});
       }
-      req.log.info({ raceId, participantCount: coinParticipants.length, totalCollected }, "[CoinsBattle] entry coins charged at race start");
+      logger.info({ raceId, participantCount: coinParticipants.length, totalCollected }, "[CoinsBattle] entry coins charged at race start");
     }
   }
 
   const startedAt = new Date();
   const challengeEndAt = deriveChallengeEndAt({ ...room, startedAt });
 
+  // ── Freeze winner slots at race start (never recalculated afterwards) ─────────
+  // Count distinct valid participants NOW (after any pre-start coins_battle disqualification).
+  // startingParticipantCount + winnerSlotCount are written once here and drive the new
+  // completion-gated settlement path; races started before this shipped keep them null (legacy).
+  const [{ startingParticipantCount }] = await db
+    .select({ startingParticipantCount: sql<number>`count(distinct ${raceParticipantsTable.userId})::int` })
+    .from(raceParticipantsTable)
+    .where(and(
+      eq(raceParticipantsTable.raceRoomId, raceId),
+      ne(raceParticipantsTable.status, "left"),
+      ne(raceParticipantsTable.status, "disqualified"),
+      ne(raceParticipantsTable.status, "forfeited"),
+    ));
+  const winnerSlotCount = getWinnerSlotCount(startingParticipantCount ?? 0);
+
+  // Compare-and-set: only the caller holding the "starting" claim commits the activation.
   const [updated] = await db
     .update(raceRoomsTable)
     .set({
@@ -2881,10 +3152,21 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
       startedAt,
       ...(challengeEndAt ? { challengeEndAt } : {}),
       liveStateMode: resolveLiveStateModeForNewRace(),
+      startingParticipantCount: startingParticipantCount ?? 0,
+      winnerSlotCount,
       updatedAt: startedAt,
     })
-    .where(eq(raceRoomsTable.id, raceId))
+    .where(and(eq(raceRoomsTable.id, raceId), eq(raceRoomsTable.status, "starting")))
     .returning();
+  if (!updated) {
+    return { ok: false, httpStatus: 409, body: { error: "Race cannot be started in its current state." } };
+  }
+
+  logger.info(
+    { raceId, startingParticipantCount, winnerSlotCount },
+    "[RaceStart] winner slots frozen: startingParticipantCount=%d winnerSlotCount=%d",
+    startingParticipantCount, winnerSlotCount,
+  );
 
   // Register the live race so the safety-net cleanup considers it (opens the idle gate).
   void markRaceActive(raceId, (challengeEndAt?.getTime() ?? startedAt.getTime()) + 30 * 60_000);
@@ -2904,8 +3186,61 @@ router.post("/races/:id/start", requireAuth, async (req, res) => {
     triggerEvent("public-rooms-available", "room:started", { room_id: raceId }).catch(() => {});
   }, 3500);
 
+  // Exactly-once "Your race has started" notification to participants (gated by the CAS above).
+  void (async () => {
+    const parts = await db
+      .select({ userId: raceParticipantsTable.userId })
+      .from(raceParticipantsTable)
+      .where(and(
+        eq(raceParticipantsTable.raceRoomId, raceId),
+        ne(raceParticipantsTable.status, "left"),
+        ne(raceParticipantsTable.status, "disqualified"),
+      ));
+    const userIds = [...new Set(parts.map((p) => p.userId))];
+    for (const uid of userIds) {
+      sendNotification(uid, "race_started", "Your race has started", "Your race has started — start walking!", {
+        raceId,
+        dedupeKey: `race_started:${raceId}`,
+      }).catch(() => {});
+    }
+  })().catch(() => {});
+
+  logger.info({ raceId }, "race activated");
+  return { ok: true, room: updated };
+}
+
+router.post("/races/:id/start", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const raceId = String(req.params.id);
+
+  const [room] = await db
+    .select()
+    .from(raceRoomsTable)
+    .where(eq(raceRoomsTable.id, raceId))
+    .limit(1);
+
+  if (!room) return res.status(404).json({ error: "Race not found" });
+  if (room.creatorId !== userId) return res.status(403).json({ error: "Only the host can start the race." });
+  if (room.status !== "open" && room.status !== "full") {
+    return res.status(409).json({ error: "Race cannot be started in its current state." });
+  }
+  // Scheduled rooms start automatically at their scheduled time — the host cannot start them.
+  if (room.mode === "scheduled") {
+    return res.status(409).json({ error: "Scheduled races start automatically at their scheduled time.", code: "scheduled_auto_start" });
+  }
+  const minParticipants = room.minimumParticipants ?? config.waitingRoom.minimumParticipants;
+  if (room.currentPlayers < minParticipants) {
+    return res.status(409).json({ error: `Need at least ${minParticipants} players to start.`, code: "insufficient_players" });
+  }
+  // Open-window rooms cannot be started after their 30-minute window closes.
+  if (room.roomExpiresAt && Date.now() >= room.roomExpiresAt.getTime()) {
+    return res.status(409).json({ error: "This Waiting Room has expired.", code: "room_expired" });
+  }
+
+  const result = await activateRoomAndStart(raceId, { fromStatuses: ["open", "full"] });
+  if (!result.ok) return res.status(result.httpStatus).json(result.body);
   req.log.info({ raceId, userId }, "race started by host");
-  return res.json({ race: updated });
+  return res.json({ race: result.room });
 });
 
 // ── POST /api/races/:id/cancel ────────────────────────────────────────────────
@@ -2924,24 +3259,17 @@ router.post("/races/:id/cancel", requireAuth, async (req, res) => {
   if (room.creatorId !== userId) return res.status(403).json({ error: "Only the host can cancel the room." });
   if (room.status !== "open" && room.status !== "full" && room.status !== "scheduled") return res.status(409).json({ error: "Only open or scheduled rooms can be cancelled." });
 
-  let refundBatch: Awaited<ReturnType<typeof createRefundBatchForRaceCancellation>> | null = null;
-  if (room.entryAmountCents > 0) {
-    refundBatch = await createRefundBatchForRaceCancellation({
-      raceId,
-      hostUserId: userId,
-      reasonCode: "host_cancelled_room",
-    });
-  } else {
-    await db
-      .update(raceRoomsTable)
-      .set({ status: "cancelled", updatedAt: new Date() })
-      .where(eq(raceRoomsTable.id, raceId));
-  }
-
-  await triggerEvent(`public-live-race-${raceId}`, "race:cancelled", { raceId });
-  triggerEvent("public-rooms-available", "room:cancelled", { room_id: raceId }).catch(() => {});
-  req.log.info({ raceId, userId }, "race room cancelled by host");
-  return res.json({ success: true, ...(refundBatch ? { refundBatch } : {}) });
+  // Authoritative terminal transition + refunds + one realtime event + one notification per user.
+  // Idempotent: a room already terminal/started is a safe no-op. A later start/expire can never
+  // revive a cancelled room (the terminal status is compare-and-set).
+  const result = await terminateWaitingRoom(raceId, {
+    terminalStatus: "cancelled",
+    reason: "HOST_CANCELLED",
+    actor: "host",
+    hostUserId: userId,
+  });
+  req.log.info({ raceId, userId, changed: result.changed }, "race room cancelled by host");
+  return res.json({ success: true, raceStatus: "cancelled", cancellationReason: "HOST_CANCELLED" });
 });
 
 // ── POST /api/races/:id/leave ─────────────────────────────────────────────────
@@ -3005,79 +3333,96 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
     await triggerEvent(`public-live-race-${raceId}`, "race:player-left", { userId, raceId });
     triggerEvent("public-rooms-available", "room:participant_left", { room_id: raceId }).catch(() => {});
   } else {
-    // ── Active race: forfeit this participant ─────────────────────────────
-    await db
-      .update(raceParticipantsTable)
-      .set({
-        status: "forfeited",
-        finalSteps: participant.currentSteps,
-        completedAt: new Date(),
-      })
-      .where(eq(raceParticipantsTable.id, participant.id));
-
-    await triggerEvent(`public-live-race-${raceId}`, "race:participant-forfeited", {
-      userId,
-      raceId,
-      finalSteps: participant.currentSteps,
-      reason: leaveReason,
+    // ── Active race: forfeit this participant (atomic + idempotent) ────────────
+    // A forfeit NEVER refunds, NEVER settles the race, and NEVER declares another
+    // participant the winner. It marks ONLY this participant forfeited; the race stays
+    // active and remaining players must still complete the target to win (§9–§12).
+    const forfeitedAtMs = Date.now();
+    const forfeitChanged = await db.transaction(async (tx) => {
+      const updated = await tx
+        .update(raceParticipantsTable)
+        .set({
+          status: "forfeited",
+          finalSteps: participant.currentSteps,
+          forfeitedAtMs,
+          completedAt: new Date(forfeitedAtMs),
+        })
+        .where(and(
+          eq(raceParticipantsTable.id, participant.id),
+          // Only from a live status — makes duplicate/terminal forfeit requests no-ops (§14).
+          notInArray(raceParticipantsTable.status, ["forfeited", "disqualified", "left", "completed"]),
+        ))
+        .returning({ id: raceParticipantsTable.id });
+      if (updated.length === 0) return false;
+      await writeAuditLog({
+        actorUserId: userId,
+        actorType: "user",
+        action: "race.forfeit",
+        entityType: "race_participant",
+        entityId: participant.id,
+        reason: leaveReason,
+        metadata: { raceId, forfeitedAtMs, finalSteps: participant.currentSteps, refund: "none" },
+      });
+      return true;
     });
 
-    // ── Forfeit winner / no-contest resolution ─────────────────────────────
-    // Sponsored events complete by time — but if ALL participants forfeit, end immediately
-    // with no winners (no one hit the step goal so no prizes are distributed).
-    if (room.type === "sponsored") {
-      const remainingRows = await db
+    if (forfeitChanged) {
+      // Evict from redis-live so queued/delayed ticks can't reactivate the forfeited player (§12).
+      void removeParticipantLiveState(raceId, userId);
+
+      await triggerEvent(`public-live-race-${raceId}`, "race:participant-forfeited", {
+        userId,
+        raceId,
+        finalSteps: participant.currentSteps,
+        reason: leaveReason,
+      });
+
+      // ── No-contest resolution (NOT a winner-by-forfeit) ───────────────────────
+      // A forfeit must not settle the race or crown a survivor. We only auto-complete
+      // when NOBODY is left actively racing (every remaining participant has already
+      // finished or forfeited). That race then settles via the normal completion-gated
+      // rules — zero winners unless someone actually completed the target.
+      const remainingActiveRows = await db
         .select({ userId: raceParticipantsTable.userId })
         .from(raceParticipantsTable)
         .where(and(
           eq(raceParticipantsTable.raceRoomId, raceId),
           ne(raceParticipantsTable.status, "left"),
           ne(raceParticipantsTable.status, "forfeited"),
-        ));
-      if (new Set(remainingRows.map((r) => r.userId)).size === 0) {
-        req.log.info({ raceId, userId }, "[Sponsored] all participants forfeited — ending race with no winners");
-        autoCompleteRace(raceId, "all_forfeited").catch((err) => {
-          req.log.error({ raceId, err }, "forfeit: sponsored all_forfeited autoCompleteRace failed");
-        });
-      }
-    } else {
-      // Count distinct users still actively racing (not left, not forfeited, goal
-      // not yet reached).  If ≤ 1 remain we can resolve the race immediately
-      // rather than waiting for the scheduled end time.
-      // Group by userId to handle duplicate participant rows correctly.
-      const forfeitActiveRows = await db
-        .select({ userId: raceParticipantsTable.userId, finishedGoal: raceParticipantsTable.finishedGoal })
-        .from(raceParticipantsTable)
-        .where(and(
-          eq(raceParticipantsTable.raceRoomId, raceId),
-          ne(raceParticipantsTable.status, "left"),
-          ne(raceParticipantsTable.status, "forfeited"),
+          ne(raceParticipantsTable.status, "disqualified"),
           eq(raceParticipantsTable.finishedGoal, false),
         ));
-      const activeCount = new Set(forfeitActiveRows.map((r) => r.userId)).size;
+      const activeCount = new Set(remainingActiveRows.map((r) => r.userId)).size;
       if (activeCount === 0) {
-        req.log.info({ raceId, userId }, "all participants finished or forfeited — auto-completing race");
+        req.log.info({ raceId, userId }, "no participant still racing (all finished or forfeited) — auto-completing");
         autoCompleteRace(raceId, "all_forfeited").catch((err) => {
           req.log.error({ raceId, err }, "forfeit: autoCompleteRace failed");
         });
-      } else if (activeCount === 1) {
-        // One player still standing — declare them winner immediately so they
-        // don't have to wait until the scheduled race-end timer.
-        req.log.info({ raceId, userId }, "one active participant remains — declaring winner by forfeit");
-        autoCompleteRace(raceId, "winner_by_forfeit").catch((err) => {
-          req.log.error({ raceId, err }, "forfeit: winner_by_forfeit autoCompleteRace failed");
-        });
       }
     }
+
+    req.log.info({ raceId, userId, leaveReason, changed: forfeitChanged }, "participant forfeited race");
+    return res.json({
+      success: true,
+      raceId,
+      room_id: raceId,
+      message: "You quit this race.",
+      participant_status: "forfeited",
+      participantStatus: "forfeited",
+      raceStatus: "active",
+      raceContinues: true,
+      can_rejoin: false,
+      refund: { eligible: false, type: "none", cashAmountMinor: 0, coinAmount: 0 },
+    });
   }
 
-  const isForfeited = room.status === "in_progress";
-  req.log.info({ raceId, userId, roomStatus: room.status, leaveReason, status: isForfeited ? "forfeited" : "left" }, "participant left race");
+  // Waiting-room leave path (open/full): lobby removal + entry-fee refund already applied above.
+  req.log.info({ raceId, userId, roomStatus: room.status, leaveReason, status: "left" }, "participant left race");
   return res.json({
     success: true,
-    message: isForfeited ? "You quit this race." : "You left the race.",
+    message: "You left the race.",
     room_id: raceId,
-    participant_status: isForfeited ? "forfeited" : "left",
+    participant_status: "left",
     can_rejoin: false,
     ...(refundBreakdown ? { refundBreakdown } : {}),
   });
@@ -3372,6 +3717,9 @@ router.post("/races", requireAuth, async (req, res) => {
         countryCode: data.countryCode,
         trackLayout: data.trackLayout,
         inviteCode,
+        mode: "open_window",
+        minimumParticipants: config.waitingRoom.minimumParticipants,
+        roomExpiresAt: new Date(Date.now() + config.waitingRoom.openWindowMs),
       })
       .returning();
   });
@@ -3382,6 +3730,8 @@ router.post("/races", requireAuth, async (req, res) => {
   if (!room) {
     return res.status(409).json({ error: "Unable to create race." });
   }
+
+  void enqueueWaitingRoomLifecycleJobs(room);
 
   try {
     await setUserDefaultTrackTheme(userId, data.trackLayout);
@@ -3494,6 +3844,9 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
           targetSteps,
           maxPlayers,
           currentPlayers: 1,
+          mode: "open_window",
+          minimumParticipants: config.waitingRoom.minimumParticipants,
+          roomExpiresAt: new Date(Date.now() + config.waitingRoom.openWindowMs),
         })
         .returning();
 
@@ -3515,6 +3868,7 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
     targetRoomId = created.newRoom.id;
     participant = created.newParticipant;
 
+    void enqueueWaitingRoomLifecycleJobs(created.newRoom);
     req.log.info({ raceId: targetRoomId, userId }, "user quick-joined (created) free race");
     return res.status(201).json({ raceId: targetRoomId, isHost: true });
   }
@@ -3603,6 +3957,12 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
       if (lockedRoom.status !== "open" && lockedRoom.status !== "full") {
         joinErrorStatus = 409;
         joinErrorBody = { error: "Race is no longer open to join." };
+        return;
+      }
+      // Reject late joins to an open-window room whose 30-minute window has already closed.
+      if (lockedRoom.roomExpiresAt && Date.now() >= lockedRoom.roomExpiresAt.getTime()) {
+        joinErrorStatus = 409;
+        joinErrorBody = { error: "This Waiting Room has expired." };
         return;
       }
       if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
@@ -4533,6 +4893,26 @@ router.get("/races/:id", requireAuth, async (req, res) => {
       tieRulesApplied,
       totalAwarded,
       unawardedAmount,
+      // ── Shared Waiting Room lifecycle surface (camelCase from ...room + snake_case aliases) ──
+      canStart: computeCanStart(room),
+      can_start: computeCanStart(room),
+      minimumParticipants: room.minimumParticipants ?? config.waitingRoom.minimumParticipants,
+      minParticipants: room.minimumParticipants ?? config.waitingRoom.minimumParticipants,
+      minimum_participants: room.minimumParticipants ?? config.waitingRoom.minimumParticipants,
+      min_players: room.minimumParticipants ?? config.waitingRoom.minimumParticipants,
+      participantCount: room.currentPlayers,
+      participant_count: room.currentPlayers,
+      maximumParticipants: room.maxPlayers,
+      roomCreatedAt: room.createdAt,
+      room_created_at: room.createdAt,
+      roomExpiresAt: room.roomExpiresAt,
+      room_expires_at: room.roomExpiresAt,
+      scheduled_start_at: room.scheduledStartAt,
+      started_at: room.startedAt,
+      cancellationReason: room.cancellationReason,
+      cancellation_reason: room.cancellationReason,
+      cancelReason: room.cancellationReason,
+      cancelled_at: room.cancelledAt,
     },
     participants: participantRows.map((p) => ({
       ...p,
@@ -4581,6 +4961,9 @@ async function persistRedisFinish(
     const result = await db.transaction(async (tx) => {
       const room = await lockRaceRoom(tx, raceId);
       if (!room || room.status !== "in_progress") return null;
+      // Within-duration guard (§4/§11): drop a finish whose accepted instant is past the race end.
+      const raceEndAt = deriveChallengeEndAt(room);
+      if (raceEndAt && finishedAtMs > raceEndAt.getTime()) return null;
       const updated = await tx
         .update(raceParticipantsTable)
         .set({
@@ -4906,6 +5289,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
     db
       .select({
         id: raceParticipantsTable.id,
+        status: raceParticipantsTable.status,
         currentSteps: raceParticipantsTable.currentSteps,
         finishedGoal: raceParticipantsTable.finishedGoal,
         lastStepSequenceId: raceParticipantsTable.lastStepSequenceId,
@@ -4970,6 +5354,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
       const newPRows = await db
         .select({
           id: raceParticipantsTable.id,
+          status: raceParticipantsTable.status,
           currentSteps: raceParticipantsTable.currentSteps,
           finishedGoal: raceParticipantsTable.finishedGoal,
           lastStepSequenceId: raceParticipantsTable.lastStepSequenceId,
@@ -4987,6 +5372,25 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
   }
 
   if (!participantData) return res.status(404).json({ error: "Participant not found" });
+
+  // ── Forfeit / removal guard (§12/§23) ─────────────────────────────────────
+  // Once a participant has forfeited, left, or been disqualified, no race-step update is
+  // accepted for this race — including queued/delayed syncs. Their verified race-step history
+  // is preserved; only new writes are blocked. (Daily-step sync is a separate endpoint.)
+  if (
+    participantData.status === "forfeited"
+    || participantData.status === "left"
+    || participantData.status === "disqualified"
+  ) {
+    req.log.info(
+      { raceId, userId, status: participantData.status },
+      "[StepSync] rejected — participant no longer active in this race",
+    );
+    return res.status(409).json({
+      error: "You are no longer an active participant in this race.",
+      participant_status: participantData.status,
+    });
+  }
 
   // ── Sequence-ID deduplication ─────────────────────────────────────────────
   // Skip this sync if the client sent a sequence counter ≤ the one already
@@ -5152,6 +5556,14 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
       const updated = await db.transaction(async (tx) => {
         const lockedRoom = await lockRaceRoom(tx, raceId);
         if (!lockedRoom) return null;
+
+        // ── Within-duration guard (§4/§11) ─────────────────────────────────────
+        // Record a goal completion ONLY while the race is live and the target was
+        // reached at/before the race end time. A late tick after the race ended (but
+        // before finalization flips status) must not create a completer.
+        if (lockedRoom.status !== "in_progress") return null;
+        const raceEndAt = deriveChallengeEndAt(lockedRoom);
+        if (raceEndAt && finishedAtMs > raceEndAt.getTime()) return null;
 
         const [lockedParticipant] = await tx
           .select({

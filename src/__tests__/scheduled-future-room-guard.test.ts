@@ -39,6 +39,11 @@ vi.mock("../lib/config.js", () => ({
       cashFeaturesEnabled: true,
       coinEntryChallengesEnabled: true,
     },
+    waitingRoom: {
+      openWindowMinutes: 30,
+      openWindowMs: 30 * 60_000,
+      minimumParticipants: 2,
+    },
   },
 }));
 

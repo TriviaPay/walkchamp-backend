@@ -480,3 +480,27 @@ export async function clearRaceLiveState(raceId: string, userIds: string[]): Pro
     logger.warn({ err, raceId }, "[raceLiveState] clearRaceLiveState failed (non-fatal)");
   }
 }
+
+/**
+ * Remove a SINGLE participant from a race's live state (used on forfeit). Deletes only that
+ * participant's hash + their leaderboard/name/pending/dirty entries — never the race-level
+ * config or other participants. After removal, subsequent redis ticks for this user return
+ * "not_hydrated" and fall through to the Postgres path, which rejects forfeited step syncs.
+ * This blocks queued/delayed ticks from reactivating a forfeited participant (§12).
+ */
+export async function removeParticipantLiveState(raceId: string, userId: string): Promise<void> {
+  try {
+    await ensureRedisLiveConnected();
+    const redis = getRedisLive();
+    await redis
+      .multi()
+      .del(pKey(raceId, userId))
+      .zrem(lbKey(raceId), userId)
+      .hdel(namesKey(raceId), userId)
+      .zrem(pendingFinishKey(raceId), userId)
+      .srem(dirtyKey(raceId), userId)
+      .exec();
+  } catch (err) {
+    logger.warn({ err, raceId, userId }, "[raceLiveState] removeParticipantLiveState failed (non-fatal)");
+  }
+}

@@ -9,6 +9,7 @@ import { startWorkerOwnedRecurringJobs } from "./lib/backgroundJobs.js";
 import { startOutboxDispatcher } from "./lib/outbox.js";
 import { processApprovedRefundJob } from "./lib/refundService.js";
 import { processDepositWebhookEvent } from "./lib/depositWebhookProcessor.js";
+import { evaluateScheduledStart, expireOpenWindow, sendScheduledReminder } from "./lib/waitingRoomJobs.js";
 
 async function reconcileAllCoinBalances() {
   const users = await db.select({ userId: coinBalancesTable.userId }).from(coinBalancesTable);
@@ -69,6 +70,28 @@ async function main() {
         throw new Error("webhook-processing job missing deposit webhook identity");
       }
       await processDepositWebhookEvent({ provider, providerEventId });
+    }, { concurrency: 4 });
+  }
+
+  // Shared Waiting Room durable delayed jobs (scheduled auto-start / 30-min open-window expiry /
+  // T-30 reminder). Exact-time firing; the scheduler's reconcileWaitingRooms tick is the safety net.
+  if (config.redis.queueUrl) {
+    startQueueWorker("scheduled-jobs", async (job) => {
+      const roomId = String((job.data as { roomId?: unknown }).roomId ?? "");
+      if (!roomId) return;
+      switch (job.name) {
+        case "waiting_room.scheduled_start":
+          await evaluateScheduledStart(roomId);
+          break;
+        case "waiting_room.expire":
+          await expireOpenWindow(roomId);
+          break;
+        case "waiting_room.scheduled_reminder":
+          await sendScheduledReminder(roomId);
+          break;
+        default:
+          break;
+      }
     }, { concurrency: 4 });
   }
 

@@ -10,8 +10,9 @@ import {
 import { eq, and, lte, sql, ne, inArray } from "drizzle-orm";
 import { triggerEvent } from "./pusher.js";
 import { logger } from "./logger.js";
-import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "./raceIntegrity.js";
+import { lockRaceRoom } from "./raceIntegrity.js";
 import { sendPushToUser } from "../routes/push.js";
+import { reconcileWaitingRooms } from "./waitingRoomJobs.js";
 
 const DAILY_GOAL_REMINDER_TEMPLATE = "daily_goal_reminder";
 const DAILY_GOAL_REMINDER_SCAN_INTERVAL_MS = 10 * 60 * 1000;
@@ -199,102 +200,9 @@ export async function runDailyGoalReminderTick(now = new Date()): Promise<DailyG
   return result;
 }
 
-async function startScheduledRoom(roomId: string): Promise<void> {
-  try {
-    let regs: Array<{ userId: string }> = [];
-    let finalStatus: "open" | "full" | "cancelled" = "cancelled";
-    let playerCount = 0;
-
-    const now = new Date();
-    await db.transaction(async (tx) => {
-      const room = await lockRaceRoom(tx, roomId);
-      if (!room || room.status !== "scheduled") return;
-
-      regs = await tx
-        .select({ userId: scheduledRoomRegistrationsTable.userId })
-        .from(scheduledRoomRegistrationsTable)
-        .where(
-          and(
-            eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
-            eq(scheduledRoomRegistrationsTable.status, "registered"),
-          ),
-        );
-
-      if (regs.length < 2) {
-        await tx
-          .update(raceRoomsTable)
-          .set({ status: "cancelled", updatedAt: now })
-          .where(eq(raceRoomsTable.id, roomId));
-        finalStatus = "cancelled";
-        return;
-      }
-
-      await tx
-        .update(scheduledRoomRegistrationsTable)
-        .set({ status: "activated", activatedAt: now })
-        .where(
-          and(
-            eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
-            eq(scheduledRoomRegistrationsTable.status, "registered"),
-          ),
-        );
-
-      let activatedPlayers = 0;
-      for (const reg of regs) {
-        const participantResult = await joinOrReviveParticipant(tx, {
-          raceRoomId: roomId,
-          userId: reg.userId,
-          currentSteps: 0,
-          raceBaselineSteps: 0,
-        });
-        if (participantResult.changed) {
-          activatedPlayers += 1;
-        }
-      }
-
-      playerCount = activatedPlayers;
-      finalStatus = deriveOpenRoomStatus(activatedPlayers, room.maxPlayers);
-
-      await tx
-        .update(raceRoomsTable)
-        .set({
-          status: finalStatus,
-          startedAt: now,
-          currentPlayers: activatedPlayers,
-          updatedAt: now,
-        })
-        .where(eq(raceRoomsTable.id, roomId));
-    });
-
-    if (finalStatus === "cancelled") {
-      logger.info({ roomId, registrations: regs.length }, "[ScheduleRoomJob] roomCancelledInsufficientPlayers");
-
-      triggerEvent("public-rooms-available", "room:cancelled", { room_id: roomId }).catch(() => {});
-      for (const reg of regs) {
-        triggerEvent(`private-user-${reg.userId}`, "notification", {
-          type: "room_cancelled",
-          room_id: roomId,
-          message: "Scheduled challenge was cancelled because not enough players joined.",
-        }).catch(() => {});
-      }
-      return;
-    }
-
-    logger.info({ roomId, players: playerCount }, "[ScheduleRoomJob] roomStarted");
-
-    triggerEvent("public-rooms-available", "room:created", { room_id: roomId }).catch(() => {});
-    triggerEvent("public-presence", "race:started", { raceId: roomId }).catch(() => {});
-    for (const reg of regs) {
-      triggerEvent(`private-user-${reg.userId}`, "notification", {
-        type: "room_started",
-        room_id: roomId,
-        message: "Your challenge has started!",
-      }).catch(() => {});
-    }
-  } catch (err) {
-    logger.error({ err, roomId }, "[ScheduleRoomJob] error starting room");
-  }
-}
+// startScheduledRoom was replaced by the shared Waiting Room lifecycle: scheduled rooms now
+// auto-start into an ACTIVE race (or cancel when the minimum isn't met) via
+// waitingRoomJobs.evaluateScheduledStart, invoked by reconcileWaitingRooms + the durable job.
 
 async function finalizeDurationRoom(roomId: string): Promise<void> {
   try {
@@ -318,23 +226,10 @@ export async function runSchedulerTick(): Promise<void> {
   try {
     const now = new Date();
 
-    const dueToStart = await db
-      .select({ id: raceRoomsTable.id })
-      .from(raceRoomsTable)
-      .where(
-        and(
-          eq(raceRoomsTable.status, "scheduled"),
-          ne(raceRoomsTable.type, "sponsored"),
-          lte(raceRoomsTable.scheduledStartAt, now)
-        )
-      );
-
-    if (dueToStart.length > 0) {
-      logger.info({ count: dueToStart.length }, "[ScheduleRoomJob] roomsDueToStart");
-    }
-    for (const room of dueToStart) {
-      await startScheduledRoom(room.id);
-    }
+    // Shared Waiting Room reconciliation: scheduled rooms past their start time auto-start (or
+    // cancel when the minimum isn't met), open-window rooms past their 30-minute window expire,
+    // and rooms stuck mid-start are recovered. Idempotent — a safety net behind the durable jobs.
+    await reconcileWaitingRooms(now);
 
     const dueToEnd = await db
       .select({ id: raceRoomsTable.id })

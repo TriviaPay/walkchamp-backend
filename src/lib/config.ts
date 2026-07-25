@@ -277,6 +277,17 @@ if (configErrors.length > 0) {
   throw new Error(`Invalid runtime configuration:\n- ${configErrors.join("\n- ")}`);
 }
 
+// ── Shared Waiting Room lifecycle tunables ───────────────────────────────────
+// Backend-authoritative; never hardcoded in clients. openWindowMinutes drives the
+// open-window (non-scheduled) 30-minute expiry; minimumParticipants is the minimum
+// valid players required to start any non-sponsored room (frozen onto the room at creation).
+const parseIntWithFallback = (raw: unknown, fallback: number, min: number): number => {
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= min ? value : fallback;
+};
+const waitingRoomOpenWindowMinutes = parseIntWithFallback(rawEnv.ROOM_OPEN_WINDOW_MINUTES, 30, 1);
+const waitingRoomMinimumParticipants = parseIntWithFallback(rawEnv.MINIMUM_ROOM_PARTICIPANTS, 2, 2);
+
 export const config = {
   nodeEnv,
   isProduction,
@@ -293,6 +304,11 @@ export const config = {
   features: featureFlags,
   realMoneyReadiness,
   processRole,
+  waitingRoom: {
+    openWindowMinutes: waitingRoomOpenWindowMinutes,
+    openWindowMs: waitingRoomOpenWindowMinutes * 60_000,
+    minimumParticipants: waitingRoomMinimumParticipants,
+  },
   runtime: {
     requestTimeoutMs: 15_000,
     responseTimeoutMs: 20_000,

@@ -27,6 +27,12 @@ export const raceStatusEnum = pgEnum("race_status", [
   "completed",
   "cancelled",
   "scheduled",
+  // Shared Waiting Room lifecycle. "starting" is the atomic claim state between a startable
+  // room and an active race (prevents duplicate start processing). "expired" is a terminal
+  // state distinct from "cancelled" for open-window rooms that closed after 30 minutes.
+  // Spec waiting/ready/active map to existing open/full/in_progress.
+  "starting",
+  "expired",
 ]);
 
 export const participantStatusEnum = pgEnum("participant_status", [
@@ -82,6 +88,27 @@ export const raceRoomsTable = pgTable("race_rooms", {
   challengeDurationDays: integer("challenge_duration_days").notNull().default(0),
   challengeEndAt: timestamp("challenge_end_at"),
   registeredCount: integer("registered_count").notNull().default(0),
+  // ── Shared Waiting Room lifecycle (non-sponsored rooms) ───────────────────────
+  // mode: "scheduled" (auto-starts at scheduledStartAt) or "open_window" (stays open
+  //   exactly 30 min unless the host starts sooner). NULL for legacy/sponsored rooms,
+  //   which keep their historical behavior.
+  // roomExpiresAt: authoritative UTC close time for open_window rooms (createdAt + 30 min);
+  //   NULL for scheduled rooms. Never reset/extended after creation.
+  // cancellationReason: HOST_CANCELLED | MINIMUM_PARTICIPANTS_NOT_MET |
+  //   HOST_DID_NOT_START_BEFORE_EXPIRATION.
+  // minimumParticipants: minimum valid players to start, frozen from backend config at creation.
+  mode: text("mode"),
+  roomExpiresAt: timestamp("room_expires_at", { withTimezone: true }),
+  cancellationReason: text("cancellation_reason"),
+  cancelledAt: timestamp("cancelled_at", { withTimezone: true }),
+  minimumParticipants: integer("minimum_participants"),
+  // ── Winner-slot freeze (set once at race start) ───────────────────────────────
+  // startingParticipantCount: count of valid participants at the moment the race
+  // transitions to in_progress. NULL for races started before this feature shipped
+  // (they settle via legacy logic). winnerSlotCount = getWinnerSlotCount(startingParticipantCount)
+  // and is fixed at start — never recalculated from live/remaining/forfeited counts.
+  startingParticipantCount: integer("starting_participant_count"),
+  winnerSlotCount: integer("winner_slot_count"),
   // ── Live-state storage engine (Phase 2 canary) ───────────────────────────────
   // Authoritative record of how a race's LIVE step state is stored: "postgres" (legacy,
   // per-tick writes) or "redis" (redis-live ZSET/hash, periodic checkpoint). Fixed at race
@@ -112,6 +139,9 @@ export const raceParticipantsTable = pgTable("race_participants", {
   finishedAt: timestamp("finished_at", { withTimezone: true }),
   finishedAtMs: bigint("finished_at_ms", { mode: "number" }),
   finishRank: integer("finish_rank"),
+  // Authoritative server timestamp (ms) at the moment this participant forfeited.
+  // Set once by the forfeit endpoint; never overwritten.
+  forfeitedAtMs: bigint("forfeited_at_ms", { mode: "number" }),
   joinedAt: timestamp("joined_at").notNull().defaultNow(),
   completedAt: timestamp("completed_at"),
   // ── Step-sync deduplication & baseline ──────────────────────────────────────
