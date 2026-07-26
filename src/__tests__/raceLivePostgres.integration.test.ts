@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS race_participants (
   status text NOT NULL DEFAULT 'joined', current_steps integer NOT NULL DEFAULT 0,
   finished_goal boolean NOT NULL DEFAULT false, finished_at timestamptz, finished_at_ms bigint,
   finish_rank integer, race_baseline_steps integer NOT NULL DEFAULT 0,
-  last_step_sequence_id integer NOT NULL DEFAULT 0
+  last_step_sequence_id integer NOT NULL DEFAULT 0,
+  live_session_id text, live_source text
 );
 `;
 

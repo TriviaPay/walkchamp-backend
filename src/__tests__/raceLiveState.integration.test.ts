@@ -220,4 +220,49 @@ describe.skipIf(!HAS_REDIS)("raceLiveState (integration, real redis)", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("not_hydrated");
   });
+
+  // ── §7/§8/§17: session, sequence, offline replay ──────────────────────────────
+  it("a new session preserves accepted progress and bypasses the stale-sequence guard", async () => {
+    await live.hydrateRace(RACE, cfg({ targetSteps: 1_000_000 }), [seed("a")]);
+    await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 500, clientSeq: 1, deviceTotal: null, nowMs: LATE, sessionId: "s1", liveSource: "android_step_counter" });
+    // New session restarts the client counter at 1 — normally a stale reject, but the session change
+    // legitimately restarts it. Progress is preserved (never lowered).
+    const rotated = await ok(await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 0, clientSeq: 1, deviceTotal: null, nowMs: LATE, sessionId: "s2" }));
+    expect(rotated.accepted).toBe(true);
+    expect(rotated.newSteps).toBe(500); // preserved, not reset to 0
+    // The new session then advances normally.
+    const adv = await ok(await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 600, clientSeq: 2, deviceTotal: null, nowMs: LATE, sessionId: "s2" }));
+    expect(adv.newSteps).toBe(600);
+  });
+
+  it("Android reboot: a new session re-registers the device baseline without lowering progress", async () => {
+    await live.hydrateRace(RACE, cfg({ targetSteps: 1_000_000 }), [seed("a")]);
+    await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 0, clientSeq: 1, deviceTotal: 5000, nowMs: LATE, sessionId: "s1" });
+    await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 0, clientSeq: 2, deviceTotal: 5300, nowMs: LATE, sessionId: "s1" }); // derived 300
+    // Reboot: device counter reset, new session, new (unrelated) device total. Baseline re-registers
+    // from the new total; race progress is preserved at 300 (monotonic max), never derived downward.
+    const reboot = await ok(await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 0, clientSeq: 1, deviceTotal: 80, nowMs: LATE, sessionId: "s2" }));
+    expect(reboot.newSteps).toBe(300);
+    const after = await ok(await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 0, clientSeq: 2, deviceTotal: 380, nowMs: LATE, sessionId: "s2" }));
+    expect(after.newSteps).toBe(300); // derived 380-80=300, still preserved
+  });
+
+  it("offline replay compaction keeps the highest cumulative value (1000, 1250, retry 1000 ⇒ 1250)", async () => {
+    await live.hydrateRace(RACE, cfg({ targetSteps: 1_000_000 }), [seed("a")]);
+    const a = await ok(await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 1000, clientSeq: 1, deviceTotal: null, nowMs: LATE }));
+    expect(a.newSteps).toBe(1000);
+    const b = await ok(await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 1250, clientSeq: 2, deviceTotal: null, nowMs: LATE }));
+    expect(b.newSteps).toBe(1250);
+    const retryA = await ok(await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 1000, clientSeq: 1, deviceTotal: null, nowMs: LATE }));
+    expect(retryA.accepted).toBe(false); // stale sequence
+    expect(retryA.newSteps).toBe(1250); // final accepted total unchanged
+  });
+
+  it("persists live source + session id on the participant hash", async () => {
+    await live.hydrateRace(RACE, cfg(), [seed("a")]);
+    await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 100, clientSeq: 1, deviceTotal: null, nowMs: LATE, sessionId: "sess-xyz", liveSource: "ios_pedometer" });
+    const [hash] = await live.getParticipantsState(RACE, ["a"]);
+    expect(hash.liveSessionId).toBe("sess-xyz");
+    expect(hash.liveSource).toBe("ios_pedometer");
+  });
 });

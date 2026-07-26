@@ -18,6 +18,7 @@
     "test:http": "VITEST_HTTP_LISTENERS=1 vitest run src/__tests__/integration-http.test.ts && VITEST_HTTP_LISTENERS=1 vitest run src/__tests__/object-media-proxy.test.ts",
     "test:integration": "node ./build.mjs && vitest run ./src/__tests__/integration-http.test.ts",
     "test:load": "node ./build.mjs && tsx ./scripts/src/loadSmoke.ts",
+    "test:load:hybrid": "tsx ./scripts/src/loadHybridRace.ts",
     "db:generate": "drizzle-kit generate --config ./db/drizzle.config.ts",
     "db:migrate": "drizzle-kit migrate --config ./db/drizzle.config.ts",
     "db:adopt-existing": "tsx ./scripts/src/adoptExistingDb.ts",

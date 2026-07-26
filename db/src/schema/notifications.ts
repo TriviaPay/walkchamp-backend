@@ -27,6 +27,10 @@ export const notificationTypeEnum = pgEnum("notification_type", [
   "country_battle_update",
   "friend_daily_goal_completed",
   "group_daily_goal_completed",
+  // Hybrid step reconciliation tiers (§24). Distinct from the final race_won/race_completed
+  // notifications so a provisional/pending state is never confused with an authoritative result.
+  "race_verification_pending",
+  "race_reconciliation_complete",
 ]);
 
 // ── In-app notifications ───────────────────────────────────────────────────────

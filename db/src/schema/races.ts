@@ -1,4 +1,4 @@
-import { pgTable, text, integer, bigint, timestamp, pgEnum, uuid, boolean, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, timestamp, pgEnum, uuid, boolean, jsonb, index } from "drizzle-orm/pg-core";
 import { createInsertSchema, createSelectSchema } from "drizzle-zod";
 import { z } from "zod/v4";
 import { profilesTable } from "./profiles.js";
@@ -42,6 +42,27 @@ export const participantStatusEnum = pgEnum("participant_status", [
   "disqualified",
   "left",
   "forfeited",
+]);
+
+// ── Hybrid live + verified step processing (ENABLE_HYBRID_RECONCILIATION) ──────
+// Closed domains, so pgEnum (vs the open-ended text race_results.status).
+export const reconciliationStatusEnum = pgEnum("reconciliation_status", [
+  "pending",              // reconciliation not yet computed / verification not yet available
+  "matched",              // live == verified
+  "within_tolerance",     // divergence inside configured tolerance band
+  "verification_delayed", // verification never arrived within window; settled on live
+  "review_required",      // divergence beyond tolerance; needs human review before payout
+  "finalized",            // consumed by settlement — authoritative total locked in
+]);
+
+// Source class for the provisional LIVE steps a participant reported during a race.
+export const liveStepSourceEnum = pgEnum("live_step_source", [
+  "healthkit",
+  "health_connect",
+  "android_step_counter",
+  "ios_pedometer",
+  "simulation",
+  "unknown",
 ]);
 
 // ── Race Rooms ────────────────────────────────────────────────────────────────
@@ -116,6 +137,9 @@ export const raceRoomsTable = pgTable("race_rooms", {
   // Postgres owns this value; redis-live only caches it.
   liveStateMode: text("live_state_mode").notNull().default("postgres"),
   liveStateVersion: integer("live_state_version").notNull().default(0),
+  // Hybrid settlement lifecycle (nullable; only set for hybrid races): awaiting_verification |
+  // partially_verified | review_required | ready_to_finalize | finalizing | finalized | payout_pending | paid
+  settlementStatus: text("settlement_status"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
@@ -155,6 +179,20 @@ export const raceParticipantsTable = pgTable("race_participants", {
   // A sync is rejected (skipped) when its sequenceId ≤ lastStepSequenceId.
   lastStepSyncAt: timestamp("last_step_sync_at"),
   lastStepSequenceId: integer("last_step_sequence_id").notNull().default(0),
+  // ── Hybrid step separation (ENABLE_HYBRID_RECONCILIATION; all additive, nullable) ──
+  // (1) provisional live steps ARE currentSteps above — these only annotate them.
+  liveSource: liveStepSourceEnum("live_source"),
+  liveSessionId: text("live_session_id"),
+  // (2) verified race steps — periodic Health Connect / HealthKit race-window totals.
+  verifiedCumulativeSteps: integer("verified_cumulative_steps"),
+  verificationSource: text("verification_source"),
+  verifiedMeasuredAt: timestamp("verified_measured_at", { withTimezone: true }),
+  verifiedUpdatedAt: timestamp("verified_updated_at", { withTimezone: true }),
+  // (3) reconciled authoritative steps + audit trail.
+  reconciledSteps: integer("reconciled_steps"),
+  reconciliationStatus: reconciliationStatusEnum("reconciliation_status").notNull().default("pending"),
+  reconciledAt: timestamp("reconciled_at", { withTimezone: true }),
+  reconciliationReasonCodes: jsonb("reconciliation_reason_codes").$type<string[]>(),
 });
 
 export const insertRaceRoomSchema = createInsertSchema(raceRoomsTable).omit({
@@ -251,3 +289,27 @@ export const raceStepSyncLogsTable = pgTable("race_step_sync_logs", {
 });
 
 export type RaceStepSyncLog = typeof raceStepSyncLogsTable.$inferSelect;
+
+// ── Verification Decision Audit (§ strict verification) ───────────────────────
+// One durable row per verification/reconciliation decision on a race participant — both
+// system-issued (finalize / hold) and ops-issued (approve / reject / resync). Preserves both
+// source step values so a held/paid decision can always be explained after the fact.
+export const verificationDecisionAuditTable = pgTable("verification_decision_audit", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  raceId: uuid("race_id").notNull(),
+  userId: text("user_id").notNull(),
+  liveSteps: integer("live_steps"),
+  verifiedSteps: integer("verified_steps"),
+  reconciledSteps: integer("reconciled_steps"),
+  verificationStatus: text("verification_status"),
+  // verified | held | approved_manually | rejected | excluded
+  decision: text("decision").notNull(),
+  reasonCode: text("reason_code"),
+  decidedBy: text("decided_by").notNull().default("system"), // system | operations
+  decidedAt: timestamp("decided_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  index("verification_decision_audit_race_idx").on(t.raceId),
+  index("verification_decision_audit_user_idx").on(t.userId),
+]);
+
+export type VerificationDecisionAudit = typeof verificationDecisionAuditTable.$inferSelect;

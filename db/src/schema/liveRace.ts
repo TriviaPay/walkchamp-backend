@@ -76,6 +76,10 @@ export const raceResultsTable = pgTable(
     // index below guarantees no two winners share a position within a race (§14).
     winnerPosition: integer("winner_position"),
     status: text("status").notNull().default("pending_verification"),
+    // Denormalized mirror of the participant's reconciliation outcome so clients read it off the
+    // settled row (text, for parity with `status`). NULL for legacy/pre-hybrid rows.
+    reconciliationStatus: text("reconciliation_status"),
+    authoritativeStepSource: text("authoritative_step_source"), // "live" | "reconciled"
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

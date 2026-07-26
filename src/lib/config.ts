@@ -35,6 +35,20 @@ const envSchema = z
     // Phase 2 canary: route live race step state through redis-live instead of Postgres.
     // OFF by default; only races that START while this is true adopt redis storage mode.
     ENABLE_REDIS_LIVE_RACE: z.enum(["true", "false"]).optional(),
+    // Hybrid live + verified step processing. OFF by default; when off every live/verified/
+    // reconcile/finalize path falls through to today's exact behavior. Backend-authoritative
+    // reconciliation tolerances live in config.hybridReconciliation (never client-supplied).
+    ENABLE_HYBRID_RECONCILIATION: z.enum(["true", "false"]).optional(),
+    HYBRID_RECON_ABS_TOLERANCE: z.string().optional(),
+    HYBRID_VERIFICATION_WINDOW_MINUTES: z.string().optional(),
+    HYBRID_FINALIZE_TIMEOUT_MINUTES: z.string().optional(),
+    // Strict verification for participant-funded (real-money) races: never finalize/pay a winner
+    // from provisional live progress — require a verified/reconciled total or an ops decision.
+    ENABLE_HYBRID_STRICT_VERIFICATION: z.enum(["true", "false"]).optional(),
+    HYBRID_REQUIRE_VERIFICATION_FOR_PAYOUT: z.enum(["true", "false"]).optional(),
+    ABSENT_VERIFICATION_POLICY: z.enum(["strict_hold", "pragmatic_fallback", "strict_cash_only"]).optional(),
+    HYBRID_VERIFICATION_GRACE_HOURS: z.string().optional(),   // 2–6h sync grace before review
+    HYBRID_REVIEW_WINDOW_HOURS: z.string().optional(),        // 24–72h ops SLA (informational)
     BLOOM_GUARDS_MODE: z.enum(["off", "monitor", "enforce"]).optional(),
     TRUST_PROXY_HOPS: z.coerce.number().int().min(1).optional(),
     TRUST_PROXY_CIDRS: z.string().optional(),
@@ -140,6 +154,8 @@ const featureFlags = {
     : false,
   edgeStrictModeEnabled: parseBoolean(rawEnv.ENABLE_EDGE_STRICT_MODE),
   redisLiveRaceEnabled: parseBoolean(rawEnv.ENABLE_REDIS_LIVE_RACE),
+  hybridReconciliationEnabled: parseBoolean(rawEnv.ENABLE_HYBRID_RECONCILIATION),
+  hybridStrictVerificationEnabled: parseBoolean(rawEnv.ENABLE_HYBRID_STRICT_VERIFICATION),
   bloomGuardsMode: parseBloomGuardsMode(rawEnv.BLOOM_GUARDS_MODE),
   cashFeaturesEnabled:
     parseBoolean(rawEnv.CASH_FEATURES_ENABLED)
@@ -306,6 +322,28 @@ const unlimitedGoalZeroWinnerPolicy = (() => {
     : "manual_review";
 })();
 
+// ── Hybrid reconciliation tunables (backend-authoritative; never client-supplied) ──
+// These bound how provisional live steps and verified health steps are reconciled into an
+// authoritative total. Anti-cheat thresholds are never exposed to clients.
+const hybridVerificationWindowMinutes = parseIntWithFallback(rawEnv.HYBRID_VERIFICATION_WINDOW_MINUTES, 10, 1);
+const hybridFinalizeTimeoutMinutes = parseIntWithFallback(rawEnv.HYBRID_FINALIZE_TIMEOUT_MINUTES, 10, 1);
+const hybridAbsoluteToleranceSteps = parseIntWithFallback(rawEnv.HYBRID_RECON_ABS_TOLERANCE, 100, 0);
+// Strict-verification workflow windows (participant-funded races). Grace = health-sync grace
+// before a missing verification becomes reviewable; review window = the ops SLA (informational —
+// the race stays held until an ops decision, it is never auto-paid from live).
+const hybridVerificationGraceHours = parseIntWithFallback(rawEnv.HYBRID_VERIFICATION_GRACE_HOURS, 4, 1);
+const hybridReviewWindowHours = parseIntWithFallback(rawEnv.HYBRID_REVIEW_WINDOW_HOURS, 48, 1);
+// Server-controlled absent-verification policy. Explicit ABSENT_VERIFICATION_POLICY wins; otherwise
+// derive from the legacy boolean switches so existing deployments keep working.
+const absentVerificationPolicy: "strict_hold" | "pragmatic_fallback" | "strict_cash_only" = (() => {
+  const raw = rawEnv.ABSENT_VERIFICATION_POLICY;
+  if (raw === "strict_hold" || raw === "pragmatic_fallback" || raw === "strict_cash_only") return raw;
+  if (parseBoolean(rawEnv.HYBRID_REQUIRE_VERIFICATION_FOR_PAYOUT) || parseBoolean(rawEnv.ENABLE_HYBRID_STRICT_VERIFICATION)) {
+    return "strict_hold";
+  }
+  return "pragmatic_fallback";
+})();
+
 export const config = {
   nodeEnv,
   isProduction,
@@ -338,6 +376,18 @@ export const config = {
     graceHours: unlimitedGoalGraceHours,
     graceMs: unlimitedGoalGraceHours * 60 * 60_000,
     zeroWinnerPolicy: unlimitedGoalZeroWinnerPolicy,
+  },
+  hybridReconciliation: {
+    absoluteToleranceSteps: hybridAbsoluteToleranceSteps,
+    percentTolerance: 0.03,        // ≤3% divergence counts as within tolerance
+    reviewThresholdPercent: 0.15,  // >15% divergence always routes to manual review
+    verificationWindowMs: hybridVerificationWindowMinutes * 60_000,
+    finalizeTimeoutMs: hybridFinalizeTimeoutMinutes * 60_000,
+    // Strict (participant-funded) races: hold, never pay from live.
+    absentVerificationPolicy,
+    strictEnabled: absentVerificationPolicy !== "pragmatic_fallback",
+    graceMs: hybridVerificationGraceHours * 60 * 60_000,
+    reviewWindowMs: hybridReviewWindowHours * 60 * 60_000,
   },
   runtime: {
     requestTimeoutMs: 15_000,

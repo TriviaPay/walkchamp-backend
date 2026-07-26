@@ -12,6 +12,10 @@ export const stepDailyTotalsTable = pgTable(
     caloriesBurned: integer("calories_burned").notNull().default(0),
     activeMinutes: integer("active_minutes").notNull().default(0),
     goal: integer("goal").notNull().default(10000),
+    // Verified-daily separation: "verified" (all sessions from Health Connect/HealthKit),
+    // "unverified" (all provisional sensor sources), or "mixed". Provisional Walk-screen
+    // estimates never mark a day as verified.
+    sourceClass: text("source_class").notNull().default("unverified"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -36,6 +40,8 @@ export const stepSessionsTable = pgTable(
     isSynced: boolean("is_synced").notNull().default(false),
     /** Step data source: ios_healthkit | android_health_connect | android_step_counter */
     source: text("source"),
+    // True only when `source` normalizes to a verified health source (health_connect | healthkit).
+    isVerifiedSource: boolean("is_verified_source").notNull().default(false),
   },
   (t) => [
     index("step_sessions_user_idx").on(t.userId),

@@ -57,6 +57,9 @@ export type LiveParticipantSeed = {
   finishedGoal: boolean;
   /** Authoritative finish rank/ordinal from Postgres (for rehydrating an already-finished user). */
   finishRank: number | null;
+  /** Optional live session/source binding so recovery doesn't lose §8 session continuity. */
+  liveSessionId?: string | null;
+  liveSource?: string | null;
 };
 
 export type ApplyProgressInput = {
@@ -69,6 +72,10 @@ export type ApplyProgressInput = {
   /** Device-wide total steps for baseline/backfill, or null. */
   deviceTotal: number | null;
   nowMs: number;
+  /** Optional device live-tracking session id (§8). A change ⇒ baseline recovery, progress preserved. */
+  sessionId?: string | null;
+  /** Optional normalized provisional live source (§3), annotates currentSteps. */
+  liveSource?: string | null;
 };
 
 export type ApplyProgressResult =
@@ -90,7 +97,7 @@ export type LiveStanding = { userId: string; steps: number; rank: number };
 // ── Lua: atomic step acceptance ───────────────────────────────────────────────
 // KEYS: 1 cfg, 2 participant, 3 leaderboard, 4 dirty-set, 5 finish-ordinal, 6 pending-finish
 // ARGV: 1 userId, 2 requestedSteps, 3 clientSeq(-1=none), 4 deviceTotal(-1=none),
-//       5 nowMs, 6 stepsPerSec, 7 burst
+//       5 nowMs, 6 stepsPerSec, 7 burst, 8 sessionId(""=none), 9 liveSource(""=none)
 const APPLY_PROGRESS_LUA = `
 local function tomap(flat)
   local m = {}
@@ -125,8 +132,20 @@ local finishedGoal = p.finishedGoal == "1"
 local targetSteps = tonumber(cfg.targetSteps) or 0
 local startedAtMs = tonumber(cfg.startedAtMs) or nowMs
 
+-- Session change (§8): a device reboot / reinstall / sensor-session rotation presents a NEW
+-- sessionId. Treat it as baseline recovery, NOT a reset — reset the sequence counter and baseline
+-- so the new session re-registers, but never lower currentSteps (monotonic max below preserves it).
+local incomingSession = ARGV[8]
+local storedSession = p.liveSessionId or ""
+local sessionChanged = (incomingSession ~= "" and storedSession ~= "" and incomingSession ~= storedSession)
+if sessionChanged then
+  lastSeq = -1
+  baseline = 0
+end
+
 -- Sequence dedup: stale/duplicate syncs are ignored (matches Postgres monotonic guard).
-if clientSeq >= 0 and clientSeq <= lastSeq then
+-- Skipped on a legitimate session change, whose counter legitimately restarts.
+if (not sessionChanged) and clientSeq >= 0 and clientSeq <= lastSeq then
   return cjson.encode({ ok = true, accepted = false, reason = "stale_sequence",
     newSteps = currentSteps, pendingReconciliation = false, justFinished = false,
     finishOrdinal = tonumber(p.finishAcceptOrdinal or "-1"), finishedGoal = finishedGoal,
@@ -178,6 +197,11 @@ redis.call("HSET", KEYS[2],
   "lastStepSyncAtMs", nowMs,
   "lastServerAcceptMs", nowMs)
 if clientSeq >= 0 then redis.call("HSET", KEYS[2], "lastStepSequenceId", clientSeq) end
+-- On a session change with no client sequence, clear the stored counter so the new session's
+-- lower sequence numbers are not rejected as stale on the next tick.
+if sessionChanged and clientSeq < 0 then redis.call("HSET", KEYS[2], "lastStepSequenceId", -1) end
+if incomingSession ~= "" then redis.call("HSET", KEYS[2], "liveSessionId", incomingSession) end
+if ARGV[9] ~= "" then redis.call("HSET", KEYS[2], "liveSource", ARGV[9]) end
 if deviceTotal >= 0 then
   redis.call("HSET", KEYS[2], "lastDeviceTotalSteps", deviceTotal, "lastDeviceTimeMs", nowMs)
 end
@@ -226,6 +250,8 @@ export async function hydrateRace(
       lastStepSequenceId: String(p.lastStepSequenceId),
       finishedGoal: p.finishedGoal ? "1" : "0",
     };
+    if (p.liveSessionId) fields.liveSessionId = p.liveSessionId;
+    if (p.liveSource) fields.liveSource = p.liveSource;
     // Restore finish ordinal/status for an already-finished participant so the live board orders
     // them correctly and the Lua won't re-finish them.
     if (p.finishedGoal && p.finishRank != null) {
@@ -259,6 +285,8 @@ export async function addParticipant(raceId: string, seed: LiveParticipantSeed):
     lastStepSequenceId: String(seed.lastStepSequenceId),
     finishedGoal: seed.finishedGoal ? "1" : "0",
   };
+  if (seed.liveSessionId) fields.liveSessionId = seed.liveSessionId;
+  if (seed.liveSource) fields.liveSource = seed.liveSource;
   if (seed.finishedGoal && seed.finishRank != null) {
     fields.finishAcceptOrdinal = String(seed.finishRank);
     fields.finishStatus = "official";
@@ -291,6 +319,8 @@ export async function applyProgress(input: ApplyProgressInput): Promise<ApplyPro
     String(input.nowMs),
     String(LIVE_STEPS_PER_SECOND),
     String(LIVE_STEP_BURST),
+    input.sessionId ?? "",
+    input.liveSource ?? "",
   );
   return JSON.parse(raw as string) as ApplyProgressResult;
 }

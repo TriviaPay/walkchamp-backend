@@ -61,6 +61,8 @@ async function loadParticipantSeeds(raceId: string): Promise<LiveParticipantSeed
       lastStepSequenceId: raceParticipantsTable.lastStepSequenceId,
       finishedGoal: raceParticipantsTable.finishedGoal,
       finishRank: raceParticipantsTable.finishRank,
+      liveSessionId: raceParticipantsTable.liveSessionId,
+      liveSource: raceParticipantsTable.liveSource,
     })
     .from(raceParticipantsTable)
     .innerJoin(profilesTable, eq(profilesTable.id, raceParticipantsTable.userId))
@@ -82,6 +84,8 @@ async function loadParticipantSeeds(raceId: string): Promise<LiveParticipantSeed
       lastStepSequenceId: r.lastStepSequenceId ?? -1,
       finishedGoal: r.finishedGoal,
       finishRank: r.finishRank ?? null,
+      liveSessionId: r.liveSessionId ?? null,
+      liveSource: r.liveSource ?? null,
     };
     if (!prev || seed.currentSteps > prev.currentSteps) byUser.set(r.userId, seed);
   }
@@ -142,6 +146,8 @@ export async function ensureParticipantHydrated(raceId: string, userId: string):
         finishedGoal: raceParticipantsTable.finishedGoal,
         finishRank: raceParticipantsTable.finishRank,
         status: raceParticipantsTable.status,
+        liveSessionId: raceParticipantsTable.liveSessionId,
+        liveSource: raceParticipantsTable.liveSource,
       })
       .from(raceParticipantsTable)
       .innerJoin(profilesTable, eq(profilesTable.id, raceParticipantsTable.userId))
@@ -158,6 +164,8 @@ export async function ensureParticipantHydrated(raceId: string, userId: string):
       lastStepSequenceId: row.lastStepSequenceId ?? -1,
       finishedGoal: row.finishedGoal,
       finishRank: row.finishRank ?? null,
+      liveSessionId: row.liveSessionId ?? null,
+      liveSource: row.liveSource ?? null,
     });
   } catch (err) {
     logger.error({ err, raceId, userId }, "[raceLiveHydration] ensureParticipantHydrated failed");

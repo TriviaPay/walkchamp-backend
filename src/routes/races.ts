@@ -4,6 +4,7 @@ import {
   raceRoomsTable,
   raceParticipantsTable,
   raceStepSyncLogsTable,
+  verificationDecisionAuditTable,
   profilesTable,
   walletsTable,
   walletTransactionsTable,
@@ -108,6 +109,8 @@ import {
   SPONSORED_EVENT_TARGET_STEPS,
 } from "../lib/sponsoredEventRules.js";
 import { getWinnerSlotCount, selectWinners, type Completer } from "../lib/raceSettlement.js";
+import { toLiveStepSource } from "../lib/stepSources.js";
+import { reconcileParticipant, finalizationDecision } from "../lib/raceReconciliation.js";
 import { writeAuditLog } from "../lib/auditLog.js";
 import { sendNotification } from "./notifications.js";
 import { computeCanStart, terminateWaitingRoom, enqueueWaitingRoomLifecycleJobs } from "../lib/waitingRoom.js";
@@ -763,6 +766,20 @@ function assignNewSettlementPayouts(
   return results;
 }
 
+/** Durable, non-fatal audit of a verification/reconciliation decision (system or operations). */
+async function writeVerificationAudit(row: {
+  raceId: string; userId: string; liveSteps: number | null; verifiedSteps: number | null;
+  reconciledSteps: number | null; verificationStatus: string;
+  decision: "verified" | "held" | "approved_manually" | "rejected" | "excluded";
+  reasonCode: string; decidedBy: "system" | "operations";
+}): Promise<void> {
+  try {
+    await db.insert(verificationDecisionAuditTable).values(row);
+  } catch (err) {
+    logger.warn({ err, raceId: row.raceId, userId: row.userId }, "verification audit write failed (non-fatal)");
+  }
+}
+
 async function autoCompleteRace(raceId: string, endedReason = "time_expired"): Promise<void> {
   const [room] = await db
     .select()
@@ -810,6 +827,11 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
       username: profilesTable.username,
       avatarColor: profilesTable.avatarColor,
       countryFlag: profilesTable.countryFlag,
+      // Hybrid reconciliation state — read for authoritative-step selection (§15).
+      reconciledSteps: raceParticipantsTable.reconciledSteps,
+      reconciliationStatus: raceParticipantsTable.reconciliationStatus,
+      verifiedCumulativeSteps: raceParticipantsTable.verifiedCumulativeSteps,
+      reconciliationReasonCodes: raceParticipantsTable.reconciliationReasonCodes,
     })
     .from(raceParticipantsTable)
     .innerJoin(profilesTable, eq(raceParticipantsTable.userId, profilesTable.id))
@@ -822,12 +844,151 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     ))
     .orderBy(desc(raceParticipantsTable.currentSteps));
 
+  // ── Authoritative step total (§15) ─────────────────────────────────────────
+  // Winner/payout logic is UNCHANGED — it just receives this integer. When the hybrid flag is on
+  // and a participant's reconciliation has been finalized, the reconciled total is authoritative;
+  // otherwise (flag off, or reconciliation not finalized) we use currentSteps exactly as before.
+  const useHybrid = config.features.hybridReconciliationEnabled;
+  const authoritativeSteps = (p: {
+    currentSteps: number;
+    reconciledSteps: number | null;
+    reconciliationStatus: string | null;
+  }): number => {
+    if (useHybrid && p.reconciliationStatus === "finalized" && p.reconciledSteps != null) {
+      return p.reconciledSteps;
+    }
+    return p.currentSteps;
+  };
+
   // ── Simulation guard: for any prize-bearing race, strip simulation participants ─
   // A participant who sent ANY "simulation" step-source sync for this race is
   // disqualified from prizes.  Free races are unaffected.
   const isPrizedRace = room.entryAmountCents > 0
     || room.entryType === "coins_battle"
     || room.type === "sponsored";
+
+  // ── Finalization reconciliation pass (§13/§14/§15) ──────────────────────────
+  //   • verified present → reconcile; matched/within_tolerance ⇒ finalize on reconciled,
+  //                        review_required ⇒ hold (not finalized).
+  //   • verified absent  → within grace ⇒ DEFER (retry); after grace ⇒ strict: hold for review,
+  //                        non-strict: settle on the capped live total (approved timeout).
+  // Session conflicts (§18) force review. Both source values are preserved for audit.
+  // STRICT verification applies to participant-funded (real-money) races: their winners/payouts
+  // must NEVER come from provisional live progress. A missing verification is held (pending →
+  // review), never auto-settled on live. Non-strict races (coins/sponsored, or strict flag off)
+  // keep the pragmatic fallback: settle on the server-capped live total after the short timeout.
+  const strictRace = useHybrid && config.hybridReconciliation.strictEnabled && room.entryAmountCents > 0;
+  // Participants held (review_required) on a strict race — used for selective payout below.
+  const heldUserIds = new Set<string>();
+  if (useHybrid && isPrizedRace) {
+    const anyVerificationInUse = participants.some(
+      (p) => p.verifiedCumulativeSteps != null || (p.reconciliationReasonCodes ?? []).includes("session_conflict"),
+    );
+    // Strict races always run the pass (even with zero verification — they must be held, not paid).
+    if (anyVerificationInUse || strictRace) {
+      const raceEndedAtMs = (durationCompletion.challengeEndAt ?? room.startedAt ?? new Date()).getTime();
+      const nowMs = Date.now();
+      const elapsedMs = nowMs - raceEndedAtMs;
+      const graceMs = strictRace ? config.hybridReconciliation.graceMs : config.hybridReconciliation.finalizeTimeoutMs;
+      let anyPendingInGrace = false; // verification may still arrive → defer + retry
+      let anyHeldForReview = false;  // grace elapsed, still unresolved → hold for ops (strict only)
+      const reconWrites: Array<Promise<unknown>> = [];
+      for (const p of participants) {
+        if (p.reconciliationStatus === "finalized") continue; // already consumed — idempotent
+        const hasVerification = p.verifiedCumulativeSteps != null;
+        const sessionConflict = (p.reconciliationReasonCodes ?? []).includes("session_conflict");
+
+        // ── Missing verification ────────────────────────────────────────────────
+        if (!hasVerification && !sessionConflict) {
+          if (elapsedMs <= graceMs) { anyPendingInGrace = true; continue; } // within grace → wait
+          if (strictRace) {
+            // Grace elapsed on a funded race: HOLD for review — never settle on live.
+            anyHeldForReview = true;
+            heldUserIds.add(p.userId);
+            p.reconciliationStatus = "review_required";
+            reconWrites.push(
+              db.update(raceParticipantsTable)
+                .set({ reconciliationStatus: "review_required", reconciledAt: new Date(nowMs),
+                  reconciliationReasonCodes: ["verification_missing", "held_for_review"] })
+                .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, p.userId),
+                  ne(raceParticipantsTable.reconciliationStatus, "finalized")))
+                .catch(() => {}),
+            );
+            void writeVerificationAudit({ raceId, userId: p.userId, liveSteps: p.currentSteps, verifiedSteps: null,
+              reconciledSteps: null, verificationStatus: "review_required", decision: "held",
+              reasonCode: "verification_missing", decidedBy: "system" });
+            void triggerEvent(`public-live-race-${raceId}`, "race:review_required", { userId: p.userId });
+            void sendNotification(p.userId, "race_verification_pending", "Verifying your steps",
+              "We're confirming your race steps with your health app before finalizing.",
+              { raceId, dedupeKey: `verif_pending:${raceId}:${p.userId}` }).catch(() => {});
+            continue;
+          }
+          // Non-strict: approved timeout behaviour — settle on the capped live total.
+          p.reconciledSteps = p.currentSteps;
+          p.reconciliationStatus = "finalized";
+          reconWrites.push(
+            db.update(raceParticipantsTable)
+              .set({ reconciledSteps: p.currentSteps, reconciliationStatus: "finalized", reconciledAt: new Date(nowMs),
+                reconciliationReasonCodes: ["verification_window_elapsed", "fallback_to_live"] })
+              .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, p.userId),
+                ne(raceParticipantsTable.reconciliationStatus, "finalized")))
+              .catch(() => {}),
+          );
+          void triggerEvent(`public-live-race-${raceId}`, "race:verification_delayed", { userId: p.userId });
+          continue;
+        }
+
+        // ── Verification present (or session conflict) → reconcile ────────────────
+        const result = reconcileParticipant({
+          liveSteps: p.currentSteps,
+          verifiedSteps: p.verifiedCumulativeSteps ?? null,
+          raceEndedAtMs,
+          nowMs,
+          tolerances: config.hybridReconciliation,
+        });
+        const decision = finalizationDecision(result, { sessionConflict });
+        if (decision.defer) { anyPendingInGrace = true; continue; }
+        p.reconciledSteps = decision.reconciledSteps;
+        p.reconciliationStatus = decision.finalize ? "finalized" : decision.status;
+        if (!decision.finalize) { anyHeldForReview = true; heldUserIds.add(p.userId); } // review blocks strict payout
+        void writeVerificationAudit({ raceId, userId: p.userId, liveSteps: p.currentSteps,
+          verifiedSteps: p.verifiedCumulativeSteps ?? null, reconciledSteps: decision.reconciledSteps,
+          verificationStatus: p.reconciliationStatus, decision: decision.finalize ? "verified" : "held",
+          reasonCode: decision.reasonCodes[0] ?? "reconciled", decidedBy: "system" });
+        reconWrites.push(
+          db.update(raceParticipantsTable)
+            .set({ reconciledSteps: decision.reconciledSteps, reconciliationStatus: p.reconciliationStatus,
+              reconciledAt: new Date(nowMs), reconciliationReasonCodes: decision.reasonCodes })
+            .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, p.userId),
+              ne(raceParticipantsTable.reconciliationStatus, "finalized")))
+            .catch((err) => logger.error({ err, raceId, userId: p.userId }, "reconciliation persist failed")),
+        );
+        if (decision.status === "review_required") {
+          void triggerEvent(`public-live-race-${raceId}`, "race:review_required", { userId: p.userId });
+        } else if (decision.finalize && decision.reconciledSteps !== p.currentSteps) {
+          void sendNotification(p.userId, "race_reconciliation_complete", "Race steps confirmed",
+            "Your verified race steps have been reconciled.", { raceId, dedupeKey: `recon_done:${raceId}:${p.userId}` })
+            .catch(() => {});
+        }
+        void triggerEvent(`public-live-race-${raceId}`, "participant:reconciled_progress_changed", {
+          userId: p.userId, reconciledSteps: decision.reconciledSteps, reconciliationStatus: p.reconciliationStatus,
+        });
+      }
+      await Promise.allSettled(reconWrites);
+
+      // Grace-window deferral: verification may still arrive → wait and retry.
+      if (anyPendingInGrace) {
+        void db.update(raceRoomsTable).set({ settlementStatus: "awaiting_verification" })
+          .where(eq(raceRoomsTable.id, raceId)).catch(() => {});
+        logger.info({ raceId, strictRace }, "autoCompleteRace: deferring — awaiting verification within grace window");
+        return; // scheduler retries; verification may still arrive
+      }
+      if (strictRace && anyHeldForReview) {
+        void db.update(raceRoomsTable).set({ settlementStatus: "review_required" })
+          .where(eq(raceRoomsTable.id, raceId)).catch(() => {});
+      }
+    }
+  }
 
   const simulatedUserIds = new Set<string>();
   if (isPrizedRace) {
@@ -860,11 +1021,11 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     }
   }
 
-  // Deduplicate by userId — keep highest step count per user
+  // Deduplicate by userId — keep highest step count per user (authoritative total)
   const seenUsers = new Map<string, typeof participants[number]>();
   for (const p of participants) {
     const existing = seenUsers.get(p.userId);
-    if (!existing || p.currentSteps > existing.currentSteps) {
+    if (!existing || authoritativeSteps(p) > authoritativeSteps(existing)) {
       seenUsers.set(p.userId, p);
     }
   }
@@ -880,10 +1041,10 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
       if (a.finishedAt) return -1;
       if (b.finishedAt) return 1;
       // Neither finished → more steps ranks higher
-      return b.currentSteps - a.currentSteps;
+      return authoritativeSteps(b) - authoritativeSteps(a);
     }
     // Default: steps DESC, then finishedAt ASC as tiebreaker
-    if (b.currentSteps !== a.currentSteps) return b.currentSteps - a.currentSteps;
+    if (authoritativeSteps(b) !== authoritativeSteps(a)) return authoritativeSteps(b) - authoritativeSteps(a);
     if (a.finishedAt && b.finishedAt) return a.finishedAt.getTime() - b.finishedAt.getTime();
     if (a.finishedAt) return -1;
     if (b.finishedAt) return 1;
@@ -925,7 +1086,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
         userId: p.userId,
         goalCompletedAtMs: p.finishedAtMs as number,
         finishRank: p.finishRank ?? null,
-        finalSteps: p.currentSteps,
+        finalSteps: authoritativeSteps(p),
       }));
     const winners = selectWinners(completers, winnerSlotCount, raceId);
 
@@ -999,7 +1160,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     username: p.username,
     avatarColor: p.avatarColor ?? "#00E676",
     countryFlag: p.countryFlag ?? "🏳️",
-    finalSteps: p.currentSteps,
+    finalSteps: authoritativeSteps(p),
     finishedAt: p.finishedAt ?? null,
   }));
 
@@ -1111,6 +1272,10 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     const tp = tieParticipants.find((p) => p.userId === payout.userId);
     const completedAt = tp?.finishedAt ?? null;
     const isSimulatedUser = simulatedUserIds.has(payout.userId);
+    // A held (review_required) participant on a funded race is out of the money by the selective
+    // check below — record them as under review with no prize, never as a verified winner.
+    const isHeld = heldUserIds.has(payout.userId);
+    const ineligible = isSimulatedUser || isHeld;
     // Prefer the explicitly stored finishedAtMs (bigint, set at JS Date.now() when goal crossed)
     // over deriving from the timestamp column — avoids precision loss on old rows that predate the column.
     const participant = participants.find((p) => p.userId === payout.userId);
@@ -1121,18 +1286,26 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
       rank: payout.rank,
       displayRank: payout.displayRank,
       steps: tp?.finalSteps ?? 0,
-      prizeCents: isSimulatedUser ? 0 : payout.prizeCents,
-      prizeCoins: isSimulatedUser ? 0 : (coinPrizeMap.get(payout.userId) ?? 0),
+      prizeCents: ineligible ? 0 : payout.prizeCents,
+      prizeCoins: ineligible ? 0 : (coinPrizeMap.get(payout.userId) ?? 0),
       isTied: payout.isTied,
       tieGroupId: payout.tieGroupId || null,
       tieGroupSize: payout.tieGroupSize,
-      eligibleForPrize: isSimulatedUser ? false : payout.eligibleForPrize,
+      eligibleForPrize: ineligible ? false : payout.eligibleForPrize,
       // Unique winner position (new settlement). Null for non-winners, simulated users, and
       // legacy/sponsored rows — enforced unique per race by the partial index.
-      winnerPosition: isSimulatedUser ? null : (payout.winnerPosition ?? null),
+      winnerPosition: ineligible ? null : (payout.winnerPosition ?? null),
       goalCompletedAt: completedAt,
       goalCompletedAtMs,
-      status: isSimulatedUser ? "disqualified_simulation" : "verified",
+      status: isSimulatedUser ? "disqualified_simulation" : (isHeld ? "review_required" : "verified"),
+      // Denormalized reconciliation mirror (§4). Null when the hybrid flag is off → flag-off writes
+      // are unchanged. authoritativeStepSource records whether `steps` came from live or reconciled.
+      reconciliationStatus: useHybrid ? (participant?.reconciliationStatus ?? null) : null,
+      authoritativeStepSource: useHybrid
+        && participant?.reconciliationStatus === "finalized"
+        && participant?.reconciledSteps != null
+        ? "reconciled"
+        : (useHybrid ? "live" : null),
     };
   });
   const actualWinnerCount = isSponsored
@@ -1145,6 +1318,40 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     room.entryAmountCents,
     newSettlement ? (room.startingParticipantCount ?? 0) : uniqueParticipants.length,
   );
+
+  // ── Selective payout hold (strict funded races, § race-level behavior) ──────
+  // An out-of-money unresolved participant must NOT block the winners; but a held participant who
+  // could still reach a paid slot holds the entire settlement (never pay a slot whose occupant or
+  // amount could change once verification resolves). The ops serverCap guard bounds a held
+  // participant's final total to (live + tolerance), so this ceiling is a true upper bound.
+  if (strictRace && heldUserIds.size > 0) {
+    const tol = config.hybridReconciliation.absoluteToleranceSteps;
+    const stepsOf = (uid: string) => tieParticipants.find((t) => t.userId === uid)?.finalSteps ?? 0;
+    const paidWinners = payouts.filter((w) => w.prizeCents > 0 && !heldUserIds.has(w.userId));
+    const lowestPaidSteps = paidWinners.length > 0 ? Math.min(...paidWinners.map((w) => stepsOf(w.userId))) : 0;
+    const heldParticipantRows = participants.filter((p) => heldUserIds.has(p.userId));
+    const heldCeiling = (uid: string) =>
+      heldParticipantRows.filter((p) => p.userId === uid).reduce((m, p) => Math.max(m, p.currentSteps + tol), 0);
+    const contested =
+      payouts.some((w) => w.prizeCents > 0 && heldUserIds.has(w.userId))         // a held user is provisionally winning
+      || heldParticipantRows.some((p) => p.finishedAt != null)                    // a held goal-finisher could win
+      || [...heldUserIds].some((uid) => heldCeiling(uid) >= lowestPaidSteps)      // step-ranking promotion within tolerance
+      || paidWinners.length === 0;                                                // no resolved winner yet → a held user could be it
+    if (contested) {
+      void db.update(raceRoomsTable).set({ settlementStatus: "review_required" })
+        .where(eq(raceRoomsTable.id, raceId)).catch(() => {});
+      logger.warn({ raceId, heldUserIds: [...heldUserIds] },
+        "autoCompleteRace: HELD — an unresolved participant could affect a paid slot; awaiting ops decision");
+      void triggerEvent(`public-live-race-${raceId}`, "race:review_required", { raceId, held: true });
+      return; // ops resolves via /verification-resolve; the next pass settles
+    }
+    // Safe: every held participant is provably out of the money. Finalize now; they are recorded as
+    // review_required with no payout (above), and the winners below are all verified/reconciled.
+    void db.update(raceRoomsTable).set({ settlementStatus: "partially_verified" })
+      .where(eq(raceRoomsTable.id, raceId)).catch(() => {});
+    logger.info({ raceId, heldUserIds: [...heldUserIds] },
+      "autoCompleteRace: proceeding — held participants are out of the money, paying verified winners");
+  }
 
   // ── Step 1: Mark the race completed (critical path — must always commit) ─────
   // This is intentionally NOT in the same transaction as the results insert.
@@ -1171,6 +1378,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
           status: "completed",
           completedAt: payoutFinalizedAt,
           updatedAt: payoutFinalizedAt,
+          ...(useHybrid && { settlementStatus: "paid" }),
           ...(!isSponsored && { prizePoolCents: totalPoolCents }),
           winnersPoolCents,
           platformFeeCents: platformFeeCentsVal,
@@ -1409,6 +1617,11 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
     winnersPoolCents,
     unawardedAmountCents,
   });
+  // §20: final authoritative progress confirmed. Emitted only for hybrid races so existing
+  // clients see no new event unless the feature is on. Carries no raw health/payment data.
+  if (config.features.hybridReconciliationEnabled) {
+    void triggerEvent(`public-live-race-${raceId}`, "race:final_progress_confirmed", { raceId });
+  }
 }
 
 async function checkPaidEligibility(userId: string, res: ReturnType<Router["get"]> extends (...args: infer _) => void ? never : unknown): Promise<boolean> {
@@ -5146,9 +5359,11 @@ async function tryHandleRedisProgress(
     deviceTotal: number | null;
     srcLabel: string | null;
     devTime: Date | null;
+    liveSessionId: string | null;
+    liveSource: string | null;
   },
 ): Promise<boolean> {
-  const { raceId, userId, steps, clientSeq, deviceTotal, srcLabel, devTime } = args;
+  const { raceId, userId, steps, clientSeq, deviceTotal, srcLabel, devTime, liveSessionId, liveSource } = args;
 
   let cfg = await getRaceConfig(raceId).catch(() => null);
   if (!cfg) {
@@ -5173,14 +5388,14 @@ async function tryHandleRedisProgress(
     return true;
   }
 
-  let result = await applyProgress({ raceId, userId, requestedSteps: steps, clientSeq, deviceTotal, nowMs });
+  let result = await applyProgress({ raceId, userId, requestedSteps: steps, clientSeq, deviceTotal, nowMs, sessionId: liveSessionId, liveSource });
   if (!result.ok && result.reason === "not_hydrated") {
     // Participant not yet in live state (late join / sponsored auto-create / post-restart).
     // Hydrate them from Postgres once and retry; if they don't exist yet, fall through to the
     // Postgres path (which auto-creates them — the next tick then lands here).
     const added = await ensureParticipantHydrated(raceId, userId);
     if (!added) return false;
-    result = await applyProgress({ raceId, userId, requestedSteps: steps, clientSeq, deviceTotal, nowMs });
+    result = await applyProgress({ raceId, userId, requestedSteps: steps, clientSeq, deviceTotal, nowMs, sessionId: liveSessionId, liveSource });
   }
   if (!result.ok) {
     if (result.reason === "not_active") {
@@ -5289,12 +5504,13 @@ async function sendRedisProgressResponse(
 router.post("/races/:id/progress", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const raceId = String(req.params.id);
-  const { steps, sequenceId, deviceTotalSteps, stepSource, deviceTime } = req.body as {
+  const { steps, sequenceId, deviceTotalSteps, stepSource, deviceTime, sessionId } = req.body as {
     steps?: unknown;
     sequenceId?: unknown;
     deviceTotalSteps?: unknown;
     stepSource?: unknown;
     deviceTime?: unknown;
+    sessionId?: unknown;
   };
 
   if (typeof steps !== "number" || !Number.isFinite(steps) || steps < 0) {
@@ -5317,10 +5533,19 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
   // Optional: device-reported sync timestamp
   const devTime = typeof deviceTime === "string" ? new Date(deviceTime) : null;
 
+  // Optional live-tracking session id (§8). Only consulted under the hybrid flag; a change binds a
+  // new device session and triggers baseline recovery without lowering accepted progress.
+  const liveSessionId = config.features.hybridReconciliationEnabled
+    && typeof sessionId === "string" && sessionId.length > 0
+    ? sessionId.slice(0, 64)
+    : null;
+  // Normalized provisional live source for the live_source enum column (audit `srcLabel` is kept raw).
+  const liveSource = config.features.hybridReconciliationEnabled ? toLiveStepSource(srcLabel) : null;
+
   // Redis-live canary: for redis-mode races, handle the tick entirely off redis-live (zero
   // SQL). Falls through to the legacy Postgres path for postgres-mode races or if unavailable.
   if (config.features.redisLiveRaceEnabled) {
-    const handled = await tryHandleRedisProgress(res, { raceId, userId, steps, clientSeq, deviceTotal, srcLabel, devTime })
+    const handled = await tryHandleRedisProgress(res, { raceId, userId, steps, clientSeq, deviceTotal, srcLabel, devTime, liveSessionId, liveSource })
       .catch((err) => {
         req.log.error({ err, raceId, userId }, "[redisProgress] handler error — falling back to Postgres");
         return false;
@@ -5339,6 +5564,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
         lastStepSequenceId: raceParticipantsTable.lastStepSequenceId,
         raceBaselineSteps: raceParticipantsTable.raceBaselineSteps,
         lastStepSyncAt: raceParticipantsTable.lastStepSyncAt,
+        liveSessionId: raceParticipantsTable.liveSessionId,
       })
       .from(raceParticipantsTable)
       .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId)))
@@ -5404,6 +5630,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
           lastStepSequenceId: raceParticipantsTable.lastStepSequenceId,
           raceBaselineSteps: raceParticipantsTable.raceBaselineSteps,
           lastStepSyncAt: raceParticipantsTable.lastStepSyncAt,
+          liveSessionId: raceParticipantsTable.liveSessionId,
         })
         .from(raceParticipantsTable)
         .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId)))
@@ -5436,10 +5663,48 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
     });
   }
 
+  // ── Session change (§8): device reboot / reinstall / sensor-session rotation ──
+  // A new sessionId is baseline recovery, NOT a reset: reset the sequence counter and baseline so
+  // the new session re-registers from its next deviceTotal, but never lower currentSteps (the
+  // monotonic max below preserves accepted progress). Scoped to (raceId, userId) — a session id
+  // minted for another race/user is simply a "new" session here and can never import steps.
+  const sessionChanged = liveSessionId !== null
+    && participantData.liveSessionId != null
+    && participantData.liveSessionId !== liveSessionId;
+  if (sessionChanged) {
+    req.log.info(
+      { raceId, userId, oldSession: participantData.liveSessionId, newSession: liveSessionId },
+      "[StepSync] live session changed — baseline recovery, progress preserved",
+    );
+    // Multi-device conflict signal (§18): a session flip within seconds of the last sync suggests
+    // two devices alternating rather than a genuine reboot. We never combine device totals; we flag
+    // it for review via an audit row. The replacement still preserves accepted progress.
+    const lastSyncMs = participantData.lastStepSyncAt ? participantData.lastStepSyncAt.getTime() : 0;
+    if (lastSyncMs > 0 && Date.now() - lastSyncMs < 5_000) {
+      req.log.warn({ raceId, userId }, "[StepSync] rapid live-session switch — possible multi-device conflict");
+      void db.insert(raceStepSyncLogsTable).values({
+        raceId, userId, stepSource: srcLabel, suspicious: true, reason: "session_conflict", deviceTime: devTime,
+      }).catch(() => { /* audit best-effort */ });
+      // Flag the participant so the finalization reconciliation pass routes them to review (§18):
+      // simultaneous conflicting sessions must never auto-finalize on a possibly-tainted total.
+      void db.update(raceParticipantsTable)
+        .set({ reconciliationReasonCodes: ["session_conflict"] })
+        .where(and(
+          eq(raceParticipantsTable.raceRoomId, raceId),
+          eq(raceParticipantsTable.userId, userId),
+          ne(raceParticipantsTable.reconciliationStatus, "finalized"),
+        ))
+        .catch(() => {});
+    }
+    participantData.lastStepSequenceId = 0;
+    participantData.raceBaselineSteps = 0;
+  }
+
   // ── Sequence-ID deduplication ─────────────────────────────────────────────
   // Skip this sync if the client sent a sequence counter ≤ the one already
   // stored. Prevents redundant DB writes on duplicate / retry requests.
-  if (clientSeq !== null && clientSeq <= (participantData.lastStepSequenceId ?? 0)) {
+  // Skipped on a legitimate session change (its counter legitimately restarts).
+  if (!sessionChanged && clientSeq !== null && clientSeq <= (participantData.lastStepSequenceId ?? 0)) {
     req.log.debug(
       { raceId, userId, clientSeq, lastSeq: participantData.lastStepSequenceId },
       "[StepSync] skipped — duplicate sequenceId",
@@ -5556,8 +5821,9 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
     "[RaceStepsSync] step sync received",
   );
 
-  // Skip no-change writes — saves a DB round-trip
-  if (newSteps === participantData.currentSteps && clientSeq === null && !baselineNeedsRegistration) {
+  // Skip no-change writes — saves a DB round-trip. A session change must still persist the new
+  // binding, so it is never treated as a no-op.
+  if (newSteps === participantData.currentSteps && clientSeq === null && !baselineNeedsRegistration && !sessionChanged) {
     return respondWithLiveProgress(res, raceId, userId, newSteps, { skipped: "no_change" });
   }
 
@@ -5565,8 +5831,14 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
   const syncCols = {
     lastStepSyncAt: new Date(),
     ...(clientSeq !== null ? { lastStepSequenceId: clientSeq } : {}),
+    // On a session change with no client sequence, clear the stored counter so the new session's
+    // lower sequence numbers are not rejected as stale on the next tick.
+    ...(sessionChanged && clientSeq === null ? { lastStepSequenceId: 0 } : {}),
     ...(baselineToStore !== null ? { raceBaselineSteps: baselineToStore } : {}),
     ...(deviceTotal !== null ? { latestDeviceSteps: deviceTotal } : {}),
+    // Hybrid live annotations (only when the flag surfaced a value; otherwise omitted → no-op).
+    ...(liveSessionId !== null ? { liveSessionId } : {}),
+    ...(liveSource !== null ? { liveSource } : {}),
   };
 
   // Fire-and-forget audit log — never block the response on this
@@ -5842,6 +6114,11 @@ router.post("/races/:id/reconcile-steps", requireAuth, async (req, res) => {
   const reconcileSchema = z.object({
     steps: z.number().int().min(0).max(500000),
     source: z.enum(["healthkit", "health_connect", "pedometer"]).default("pedometer"),
+    // Additive hybrid verification fields (§12/§13). Ignored unless the hybrid flag is on AND at
+    // least one of these is present; otherwise the endpoint behaves exactly as before.
+    verificationSource: z.enum(["healthkit", "health_connect"]).optional(),
+    measuredAtStart: z.string().datetime().optional(),
+    measuredAtEnd: z.string().datetime().optional(),
   });
 
   const parsed = reconcileSchema.safeParse(req.body);
@@ -5850,6 +6127,8 @@ router.post("/races/:id/reconcile-steps", requireAuth, async (req, res) => {
   }
 
   const { steps, source } = parsed.data;
+  const wantsHybridVerification = config.features.hybridReconciliationEnabled
+    && (parsed.data.verificationSource != null || parsed.data.measuredAtEnd != null);
 
   // Fetch race and existing result in parallel
   const [[room], [existingResult]] = await Promise.all([
@@ -5892,6 +6171,84 @@ router.post("/races/:id/reconcile-steps", requireAuth, async (req, res) => {
     .limit(1);
 
   const serverSteps = Math.max(participant?.currentSteps ?? 0, participant?.finalSteps ?? 0);
+
+  // ── Hybrid verification ingestion (§12/§13/§14) ───────────────────────────────
+  // When the client submits a verified Health Connect / HealthKit total, persist it separately
+  // from live progress and run the reconciliation policy. Unlike the legacy path, a verified
+  // total that exceeds server-tracked live steps is NOT hard-rejected — it is routed to review by
+  // the policy (possible backfill), so a legitimate offline device backfill is not silently lost.
+  if (wantsHybridVerification) {
+    const result = reconcileParticipant({
+      liveSteps: serverSteps,
+      verifiedSteps: steps,
+      raceEndedAtMs: completedAt.getTime(),
+      nowMs: Date.now(),
+      tolerances: config.hybridReconciliation,
+    });
+
+    // Persist verified values + reconciliation outcome on the participant (idempotent: never
+    // overwrite a row already consumed by settlement).
+    await db
+      .update(raceParticipantsTable)
+      .set({
+        verifiedCumulativeSteps: steps,
+        verificationSource: parsed.data.verificationSource ?? source,
+        verifiedMeasuredAt: parsed.data.measuredAtEnd ? new Date(parsed.data.measuredAtEnd) : new Date(),
+        verifiedUpdatedAt: new Date(),
+        reconciledSteps: result.reconciledSteps,
+        reconciliationStatus: result.status,
+        reconciledAt: new Date(result.reconciledAtUtc),
+        reconciliationReasonCodes: result.reasonCodes,
+      })
+      .where(and(
+        eq(raceParticipantsTable.raceRoomId, raceId),
+        eq(raceParticipantsTable.userId, userId),
+        ne(raceParticipantsTable.reconciliationStatus, "finalized"),
+      ));
+
+    // Mirror the outcome onto the settled result row for display. Only a matched / within-tolerance
+    // reconciliation marks the recorded steps "verified"; delayed/review stay pending_verification.
+    // This never re-issues a payout (that already ran at completion and is idempotency-guarded).
+    const verifiedOutcome = result.status === "matched" || result.status === "within_tolerance";
+    const resultSteps = verifiedOutcome
+      ? Math.max(existingResult.steps, result.reconciledSteps)
+      : existingResult.steps;
+    const resultStatus = verifiedOutcome ? "verified" : "pending_verification";
+    await db
+      .update(raceResultsTable)
+      .set({
+        steps: resultSteps,
+        status: resultStatus,
+        reconciliationStatus: result.status,
+        authoritativeStepSource: verifiedOutcome ? "reconciled" : "live",
+      })
+      .where(and(eq(raceResultsTable.raceRoomId, raceId), eq(raceResultsTable.userId, userId)));
+
+    req.log.info(
+      { raceId, userId, verifiedSteps: steps, liveSteps: serverSteps, reconciledSteps: result.reconciledSteps,
+        status: result.status, reasonCodes: result.reasonCodes },
+      "race steps reconciled (hybrid)",
+    );
+
+    // Emit the verification-status-changed event (§20) — no raw health data, only status.
+    void triggerEvent(`public-live-race-${raceId}`, "participant:verification_status_changed", {
+      userId,
+      reconciliationStatus: result.status,
+      reconciledSteps: result.reconciledSteps,
+    });
+    if (result.status === "review_required") {
+      void triggerEvent(`public-live-race-${raceId}`, "race:review_required", { userId });
+    }
+
+    return res.json({
+      reconciled: resultSteps > existingResult.steps,
+      steps: resultSteps,
+      rank: existingResult.rank,
+      reconciliationStatus: result.status,
+    });
+  }
+
+  // ── Legacy reconcile path (flag off, or no verification fields) ────────────────
   const RECONCILE_TOLERANCE = 100; // absorb a few last un-synced steps
   const serverCap = serverSteps + RECONCILE_TOLERANCE;
   if (steps > serverCap) {
@@ -5915,6 +6272,200 @@ router.post("/races/:id/reconcile-steps", requireAuth, async (req, res) => {
 
   req.log.info({ raceId, userId, steps, source, serverSteps, status, prev: existingResult.steps }, "race steps reconciled");
   return res.json({ reconciled: true, steps, rank: existingResult.rank });
+});
+
+// ── POST /api/races/:id/verify ────────────────────────────────────────────────
+// Periodic VERIFIED race-window total from Health Connect / HealthKit (§12). Stored separately
+// from provisional live progress; it never overwrites live state and does not itself reconcile —
+// reconciliation runs at finalization (§14/§15). Flag-gated: 404 when hybrid reconciliation is off,
+// so the surface is invisible until the feature is enabled. No raw health records are accepted.
+router.post("/races/:id/verify", requireAuth, async (req, res) => {
+  if (!config.features.hybridReconciliationEnabled) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const raceId = String(req.params.id);
+
+  const verifySchema = z.object({
+    verifiedCumulativeSteps: z.number().int().min(0).max(500000),
+    source: z.enum(["healthkit", "health_connect"]),
+    intervalStartUtc: z.string().datetime().optional(),
+    intervalEndUtc: z.string().datetime().optional(),
+    measuredAtUtc: z.string().datetime(),
+    clientLiveCumulativeSteps: z.number().int().min(0).max(500000).optional(),
+    verificationSessionId: z.string().max(64).optional(),
+  });
+  const parsed = verifySchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid verification data", details: parsed.error.issues });
+  }
+  const { verifiedCumulativeSteps, source, measuredAtUtc, intervalEndUtc } = parsed.data;
+
+  const [[room], [participant]] = await Promise.all([
+    db.select({ status: raceRoomsTable.status, startedAt: raceRoomsTable.startedAt, completedAt: raceRoomsTable.completedAt,
+      challengeEndAt: raceRoomsTable.challengeEndAt, challengeDurationDays: raceRoomsTable.challengeDurationDays,
+      scheduledStartAt: raceRoomsTable.scheduledStartAt })
+      .from(raceRoomsTable).where(eq(raceRoomsTable.id, raceId)).limit(1),
+    db.select({ status: raceParticipantsTable.status, verifiedCumulativeSteps: raceParticipantsTable.verifiedCumulativeSteps,
+      verifiedMeasuredAt: raceParticipantsTable.verifiedMeasuredAt })
+      .from(raceParticipantsTable)
+      .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId))).limit(1),
+  ]);
+
+  if (!room) return res.status(404).json({ error: "Race not found" });
+  if (!participant) return res.status(404).json({ error: "Participant not found" });
+  // Membership: left/forfeited/disqualified users cannot submit verification (§19).
+  if (participant.status === "left" || participant.status === "forfeited" || participant.status === "disqualified") {
+    return res.status(409).json({ error: "You are no longer an active participant in this race.", participant_status: participant.status });
+  }
+  // Race window: accept while in progress, or within the verification window after completion.
+  const endAtMs = (room.completedAt ? new Date(room.completedAt) : deriveChallengeEndAt(room))?.getTime() ?? null;
+  const withinPostWindow = endAtMs != null && Date.now() - endAtMs <= config.hybridReconciliation.verificationWindowMs;
+  if (room.status !== "in_progress" && !withinPostWindow) {
+    return res.status(409).json({ error: "Verification window is not open for this race" });
+  }
+
+  // Stale-verification guard: ignore a measurement older than the one already stored.
+  const measuredAt = new Date(measuredAtUtc);
+  if (participant.verifiedMeasuredAt && measuredAt.getTime() < participant.verifiedMeasuredAt.getTime()) {
+    return res.json({ accepted: false, reason: "stale_verification", verifiedCumulativeSteps: participant.verifiedCumulativeSteps ?? 0 });
+  }
+  // Verified totals are cumulative and non-decreasing within the race — never lower the stored value.
+  const acceptedVerified = Math.max(participant.verifiedCumulativeSteps ?? 0, verifiedCumulativeSteps);
+
+  await db.update(raceParticipantsTable)
+    .set({
+      verifiedCumulativeSteps: acceptedVerified,
+      verificationSource: source,
+      verifiedMeasuredAt: intervalEndUtc ? new Date(intervalEndUtc) : measuredAt,
+      verifiedUpdatedAt: new Date(),
+    })
+    .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId)));
+
+  req.log.info({ raceId, userId, verifiedCumulativeSteps: acceptedVerified, source }, "race verification stored");
+  void triggerEvent(`public-live-race-${raceId}`, "participant:verification_status_changed", {
+    userId, verificationStatus: "received",
+  });
+  return res.json({ accepted: true, verifiedCumulativeSteps: acceptedVerified });
+});
+
+// ── GET /api/races/:id/result-status ──────────────────────────────────────────
+// Authoritative per-user result status for the app (§ frontend handling). The backend — never the
+// client — decides whether a result is final. Provisional live steps are returned only as
+// `liveSteps` (clearly provisional); `steps`/`rank`/`payout` are populated ONLY when finalized.
+router.get("/races/:id/result-status", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const raceId = String(req.params.id);
+  const [[room], [participant], [result]] = await Promise.all([
+    db.select({ status: raceRoomsTable.status, settlementStatus: raceRoomsTable.settlementStatus })
+      .from(raceRoomsTable).where(eq(raceRoomsTable.id, raceId)).limit(1),
+    db.select({ status: raceParticipantsTable.status, currentSteps: raceParticipantsTable.currentSteps,
+      reconciledSteps: raceParticipantsTable.reconciledSteps, reconciliationStatus: raceParticipantsTable.reconciliationStatus })
+      .from(raceParticipantsTable)
+      .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId))).limit(1),
+    db.select({ rank: raceResultsTable.rank, steps: raceResultsTable.steps, prizeCents: raceResultsTable.prizeCents,
+      status: raceResultsTable.status })
+      .from(raceResultsTable)
+      .where(and(eq(raceResultsTable.raceRoomId, raceId), eq(raceResultsTable.userId, userId))).limit(1),
+  ]);
+  if (!room) return res.status(404).json({ error: "Race not found" });
+  if (!participant) return res.status(404).json({ error: "Participant not found" });
+
+  const recon = participant.reconciliationStatus;
+  const verificationStatus =
+    participant.status === "disqualified" ? "verification_rejected"
+    : recon === "finalized" ? "finalized"
+    : recon === "review_required" ? "review_required"
+    : room.status === "in_progress" ? "live"
+    : "verification_pending";
+
+  // resolveRaceResult contract: authoritative fields only when finalized; provisional otherwise.
+  const finalized = recon === "finalized" && room.status === "completed" && result != null;
+  return res.json({
+    raceStatus: room.status,
+    settlementStatus: room.settlementStatus ?? null,
+    verificationStatus,
+    // Provisional — never label as final/verified on the client.
+    liveSteps: participant.currentSteps,
+    // Authoritative — populated only once finalized.
+    steps: finalized ? (result!.steps ?? participant.reconciledSteps) : null,
+    rank: finalized ? result!.rank : null,
+    payoutCents: finalized ? result!.prizeCents : null,
+  });
+});
+
+// ── POST /api/races/:id/verification-resolve (OPS, admin-key) ──────────────────
+// Only the backend issues the final decision for a held (review_required) participant in a strict
+// funded race (§13/§15). Ops can:
+//   approve → set an authoritative reconciled total and finalize (participant may win/be paid)
+//   reject  → disqualify the participant from prizes (excluded from winner selection)
+//   resync  → reset to pending so the client can re-submit a verification
+// After a decision, completion is re-attempted so a now-fully-resolved race can settle.
+router.post("/races/:id/verification-resolve", requireAuth, requireAdminKey, async (req, res) => {
+  const raceId = String(req.params.id);
+  const schema = z.object({
+    userId: z.string().min(1),
+    decision: z.enum(["approve", "reject", "resync"]),
+    steps: z.number().int().min(0).max(500000).optional(),
+    note: z.string().max(500).optional(),
+  });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid resolution", details: parsed.error.issues });
+  const { userId, decision, steps, note } = parsed.data;
+
+  const [participant] = await db
+    .select({ currentSteps: raceParticipantsTable.currentSteps, verifiedCumulativeSteps: raceParticipantsTable.verifiedCumulativeSteps,
+      reconciliationStatus: raceParticipantsTable.reconciliationStatus })
+    .from(raceParticipantsTable)
+    .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId)))
+    .limit(1);
+  if (!participant) return res.status(404).json({ error: "Participant not found" });
+  // Idempotency: an already-finalized participant is not re-decided.
+  if (participant.reconciliationStatus === "finalized") {
+    return res.json({ resolved: false, reason: "already_finalized" });
+  }
+
+  if (decision === "approve") {
+    // Prefer the ops-supplied total, else the participant's own verified total, else capped live.
+    // Bound by serverCap (live + tolerance): even an ops decision cannot exceed server-tracked
+    // progress — this keeps the selective-payout ceiling (live + tolerance) a true upper bound, so
+    // an approved participant can never retroactively displace an already-paid safe winner.
+    const serverCap = participant.currentSteps + config.hybridReconciliation.absoluteToleranceSteps;
+    const requested = steps ?? participant.verifiedCumulativeSteps ?? participant.currentSteps;
+    const finalSteps = Math.min(requested, serverCap);
+    await db.update(raceParticipantsTable)
+      .set({ reconciledSteps: finalSteps, reconciliationStatus: "finalized", reconciledAt: new Date(),
+        reconciliationReasonCodes: ["ops_approved", ...(note ? [`note:${note}`] : [])] })
+      .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId),
+        ne(raceParticipantsTable.reconciliationStatus, "finalized")));
+    void writeVerificationAudit({
+      raceId, userId, liveSteps: participant.currentSteps, verifiedSteps: participant.verifiedCumulativeSteps ?? null,
+      reconciledSteps: finalSteps, verificationStatus: "finalized", decision: "approved_manually",
+      reasonCode: "ops_approved", decidedBy: "operations",
+    });
+  } else if (decision === "reject") {
+    // Disqualified participants are excluded from winner selection by the finalization query.
+    await db.update(raceParticipantsTable)
+      .set({ status: "disqualified", reconciliationStatus: "review_required",
+        reconciliationReasonCodes: ["ops_rejected", ...(note ? [`note:${note}`] : [])] })
+      .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId)));
+    void writeVerificationAudit({
+      raceId, userId, liveSteps: participant.currentSteps, verifiedSteps: participant.verifiedCumulativeSteps ?? null,
+      reconciledSteps: null, verificationStatus: "verification_rejected", decision: "rejected",
+      reasonCode: "ops_rejected", decidedBy: "operations",
+    });
+  } else { // resync
+    await db.update(raceParticipantsTable)
+      .set({ reconciliationStatus: "pending", reconciliationReasonCodes: ["ops_resync", ...(note ? [`note:${note}`] : [])] })
+      .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, userId),
+        ne(raceParticipantsTable.reconciliationStatus, "finalized")));
+  }
+
+  req.log.info({ raceId, userId, decision, steps }, "[VerificationResolve] ops decision applied");
+  // Best-effort: re-attempt completion so a now-resolved funded race can settle. No-op if still held.
+  void autoCompleteRace(raceId, "verification_resolved").catch(
+    (err) => req.log.error({ err, raceId }, "verification-resolve: completion retry failed"));
+  return res.json({ resolved: true, decision });
 });
 
 // ── POST /api/races/:id/force-complete (TESTING ONLY) ─────────────────────────

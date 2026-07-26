@@ -15,6 +15,12 @@ import { getChallengeCardsForUser, getRoomCountsSummary } from "./races.js";
 import { getSponsoredEventsForUser } from "./sponsoredEvents.js";
 import { getTrackThemeSummaryForUser } from "./trackThemes.js";
 import { validateRecentLocalDate } from "../lib/localDate.js";
+import {
+  normalizeSource,
+  isVerifiedDailySource,
+  isRejectedDailySource,
+  classifyDailySource,
+} from "../lib/stepSources.js";
 
 const router = Router();
 
@@ -176,13 +182,13 @@ router.get("/walk/today", requireAuth, async (req, res) => {
 
 // ── POST /api/walk/steps ──────────────────────────────────────────────────────
 // Submit a completed walk session.
-const VALID_SOURCES = [
-  "ios_healthkit",
-  "android_health_connect",
-  "android_step_counter",
-] as const;
-type StepSource = (typeof VALID_SOURCES)[number];
-
+//
+// Source handling (§5 verified-daily separation): the raw `source` string is normalized via the
+// central step-source contract. Verified health sources (health_connect/healthkit, plus their
+// legacy aliases ios_healthkit/android_health_connect) mark the session/day as verified.
+// Provisional sensor sources (android_step_counter/ios_pedometer) are ACCEPTED but flagged
+// unverified so a provisional estimate never becomes verified daily state. Clearly-fake sources
+// are safely ignored (200 no-op), never a hard error that would break the client's sync loop.
 const submitStepsSchema = z.object({
   steps: z.number().int().min(1).max(200000),
   // Absolute daily total from Health app — used for GREATEST upsert so restarts never double-count.
@@ -192,15 +198,23 @@ const submitStepsSchema = z.object({
   caloriesBurned: z.number().int().min(0).optional(),
   durationSeconds: z.number().int().min(0).optional(),
   activeMinutes: z.number().int().min(0).optional(),
-  /** Step data source — must be a known real source; fake/mock/random sources are rejected. */
-  source: z
-    .enum(VALID_SOURCES as unknown as [StepSource, ...StepSource[]])
-    .optional(),
+  /** Step data source (canonical or legacy). Classified by the step-source contract, not an enum. */
+  source: z.string().max(50).optional(),
   /** Client's local calendar date (YYYY-M-D). Avoids UTC midnight boundary issues. */
   localDate: z.string().regex(/^\d{4}-\d{1,2}-\d{1,2}$/).optional(),
   /** Opt-in cheaper response when absolute total has not increased. */
   shortUnchanged: z.boolean().optional(),
 });
+
+/** Combine a day's existing source_class with a newly-submitted session's class. */
+function combineDaySourceClass(
+  prev: string | null | undefined,
+  incoming: "verified" | "unverified",
+): "verified" | "mixed" | "unverified" {
+  if (!prev) return incoming;
+  if (prev === "mixed") return "mixed";
+  return prev === incoming ? (prev as "verified" | "unverified") : "mixed";
+}
 
 router.post("/walk/steps", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
@@ -209,7 +223,22 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "Invalid step data", details: parsed.error.issues });
   }
 
-  const { steps, durationSeconds = 0, source } = parsed.data;
+  const { steps, durationSeconds = 0, source: rawSource } = parsed.data;
+
+  // Normalize + classify the source. Clearly-fake sources are safely ignored (no write),
+  // so a mock/random provider can never poison verified daily state, and the client's
+  // periodic sync loop is not broken by a 4xx.
+  const source = normalizeSource(rawSource);
+  if (isRejectedDailySource(source)) {
+    const [existing] = await db
+      .select({ steps: stepDailyTotalsTable.steps })
+      .from(stepDailyTotalsTable)
+      .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, localDateStr(parsed.data.localDate))))
+      .limit(1);
+    return res.json({ submitted: 0, ignored: true, today: { steps: existing?.steps ?? 0 } });
+  }
+  const sessionVerified = isVerifiedDailySource(source);
+  const incomingDayClass = classifyDailySource(source);
 
   // Reject backdated / post-dated submissions. Milestone rewards are date-scoped
   // (e.g. daily_walk_2020-01-01) and only dedupe within the SAME date, so an
@@ -234,11 +263,13 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
       distanceMeters: stepDailyTotalsTable.distanceMeters,
       caloriesBurned: stepDailyTotalsTable.caloriesBurned,
       activeMinutes: stepDailyTotalsTable.activeMinutes,
+      sourceClass: stepDailyTotalsTable.sourceClass,
     })
     .from(stepDailyTotalsTable)
     .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, today)))
     .limit(1);
   const previousSteps = prevStepRow?.steps ?? 0;
+  const nextDaySourceClass = combineDaySourceClass(prevStepRow?.sourceClass, incomingDayClass);
 
   // `totalSteps` is the absolute HealthKit/Health Connect total for today.
   // When present we use GREATEST(existing, totalSteps) so app restarts never
@@ -289,6 +320,7 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
         caloriesBurned: totalCals,
         activeMinutes,
         goal: DAILY_GOAL,
+        sourceClass: nextDaySourceClass,
       })
       .onConflictDoUpdate({
         target: [stepDailyTotalsTable.userId, stepDailyTotalsTable.date],
@@ -301,6 +333,9 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
               distanceMeters: sql`GREATEST(${stepDailyTotalsTable.distanceMeters}, ${totalDistMeters})`,
               caloriesBurned: sql`GREATEST(${stepDailyTotalsTable.caloriesBurned}, ${totalCals})`,
               activeMinutes: sql`GREATEST(${stepDailyTotalsTable.activeMinutes}, ${activeMinutes})`,
+              // A provisional submission can only ever ADD unverified-ness (→ "mixed"), never
+              // upgrade a mixed/unverified day back to verified.
+              sourceClass: nextDaySourceClass,
               updatedAt: new Date(),
             }
           : {
@@ -309,6 +344,7 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
               distanceMeters: sql`${stepDailyTotalsTable.distanceMeters} + ${totalDistMeters}`,
               caloriesBurned: sql`${stepDailyTotalsTable.caloriesBurned} + ${totalCals}`,
               activeMinutes: sql`GREATEST(${stepDailyTotalsTable.activeMinutes}, ${activeMinutes})`,
+              sourceClass: nextDaySourceClass,
               updatedAt: new Date(),
             },
       });
@@ -323,6 +359,7 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
       endedAt: new Date(),
       isSynced: true,
       source: source ?? null,
+      isVerifiedSource: sessionVerified,
     });
 
     // Recompute lifetime total from daily totals — prevents double-counting across
