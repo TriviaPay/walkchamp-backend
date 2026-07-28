@@ -192,6 +192,23 @@ export async function recoverStaleRaces(): Promise<void> {
         continue;
       }
       if (isDurationChallengeRoom(race)) {
+        // All-forfeit safety net (crash recovery): if NOBODY is left in the race (everyone
+        // forfeited/left/disqualified), complete now with all_forfeited instead of waiting days
+        // for the challenge end date. Matches the /leave early-completion path.
+        const durationActive = await db
+          .select({ userId: raceParticipantsTable.userId })
+          .from(raceParticipantsTable)
+          .where(and(
+            eq(raceParticipantsTable.raceRoomId, race.id),
+            ne(raceParticipantsTable.status, "left"),
+            ne(raceParticipantsTable.status, "forfeited"),
+            ne(raceParticipantsTable.status, "disqualified"),
+          ));
+        if (durationActive.length === 0) {
+          logger.info({ raceId: race.id }, "[recoverStaleRaces] duration challenge — all forfeited, completing");
+          autoCompleteRace(race.id, "all_forfeited").catch(() => {});
+          continue;
+        }
         const completion = canAutoCompleteDurationChallenge(race, "duration_expired");
         if (completion.allowed) {
           logger.info({ raceId: race.id, challengeEndAt: completion.challengeEndAt?.toISOString() ?? null }, "[recoverStaleRaces] duration expired — completing");
@@ -416,6 +433,12 @@ function buildChallengeTimeFields(room: Pick<typeof raceRoomsTable.$inferSelect,
 }
 
 const MANUAL_COMPLETION_REASONS = new Set(["admin_force_complete", "manual_force_complete"]);
+// Reasons that bypass the duration-challenge end-date wait. In addition to explicit admin/manual
+// force-completes, "all_forfeited" is included: it is only ever passed once the caller has verified
+// NOBODY is still racing (every participant forfeited or finished), so there is nothing to wait for
+// and a duration challenge must not stay stuck LIVE until its natural end date. Winners/payouts are
+// still gated by actual completion, so a true all-quit settles with zero winners.
+const FORCED_COMPLETION_REASONS = new Set([...MANUAL_COMPLETION_REASONS, "all_forfeited"]);
 
 function isDurationChallengeRoom(room: Pick<typeof raceRoomsTable.$inferSelect, "type" | "challengeDurationDays">): boolean {
   return room.type !== "sponsored" && room.challengeDurationDays > 0;
@@ -426,7 +449,7 @@ function canAutoCompleteDurationChallenge(
   endedReason: string,
 ): { allowed: boolean; challengeEndAt: Date | null } {
   if (!isDurationChallengeRoom(room)) return { allowed: true, challengeEndAt: null };
-  if (MANUAL_COMPLETION_REASONS.has(endedReason)) return { allowed: true, challengeEndAt: deriveChallengeEndAt(room) };
+  if (FORCED_COMPLETION_REASONS.has(endedReason)) return { allowed: true, challengeEndAt: deriveChallengeEndAt(room) };
 
   const challengeEndAt = deriveChallengeEndAt(room);
   if (!challengeEndAt) return { allowed: false, challengeEndAt: null };
@@ -1361,7 +1384,7 @@ async function autoCompleteRace(raceId: string, endedReason = "time_expired"): P
   try {
     await db.transaction(async (tx) => {
       const payoutFinalizedAt = new Date();
-      const completionAllowedSql = MANUAL_COMPLETION_REASONS.has(endedReason)
+      const completionAllowedSql = FORCED_COMPLETION_REASONS.has(endedReason)
         ? sql`true`
         : sql`(
             ${raceRoomsTable.type} = 'sponsored'
