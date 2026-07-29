@@ -135,3 +135,20 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
     expect(router).toContain(".limit(limit)");
   });
 });
+
+describe("USD Unlimited strict midnight scheduling", () => {
+  it("create path routes through the shared validateUnlimitedSchedule (no ad-hoc date checks)", () => {
+    expect(service).toContain("validateUnlimitedSchedule({");
+    expect(service).not.toContain("MIN_START_LEAD_MS"); // old ≥1h lead check removed
+  });
+  it("persists the resolved challenge timezone (optional input, host fallback)", () => {
+    expect(service).toContain("input.challengeTimezone?.trim()");
+    expect(service).toContain("challengeTimezone: timezone");
+    expect(schema).toContain('challengeTimezone: text("challenge_timezone")');
+    expect(router).toContain("challengeTimezone: z.string()");
+    expect(router).toContain("challengeTimezone: c.challengeTimezone");
+  });
+  it("scheduling rules stay scoped to the unlimited path — the race engine is untouched", () => {
+    expect(races).not.toContain("validateUnlimitedSchedule");
+  });
+});

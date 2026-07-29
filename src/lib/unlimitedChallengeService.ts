@@ -11,7 +11,7 @@ import { debitWalletForCashChallenge } from "./refundService.js";
 import { computeIsAdult } from "./dateOfBirth.js";
 import { isCashChallengeUnsupportedForCountry } from "./cashChallengeFees.js";
 import { generateInviteCode } from "./inviteCodes.js";
-import { computeChallengeEndUtc, isValidTimezone } from "./challengeDayWindow.js";
+import { isValidTimezone, validateUnlimitedSchedule } from "./challengeDayWindow.js";
 import {
   UNLIMITED_PLATFORM_FEE_CENTS,
   computeTotalChargeCents,
@@ -27,8 +27,6 @@ import { config } from "./config.js";
 import { logger } from "./logger.js";
 
 export type ServiceResult<T> = { ok: true; data: T } | { ok: false; httpStatus: number; body: Record<string, unknown> };
-
-const MIN_START_LEAD_MS = 60 * 60_000; // must schedule at least 1h out
 
 /** Eligibility for paid challenges — mirrors the cash-challenge gates (adult/paid/active/country/fraud). */
 async function checkPaidEligibility(userId: string, isCreate: boolean): Promise<ServiceResult<{ countryCode: string | null }>> {
@@ -72,6 +70,8 @@ export interface CreateInput {
   dailyGoalSteps: number;
   durationDays: number;
   startAtIso: string;
+  /** IANA timezone the schedule is anchored to. Optional — falls back to the host's saved timezone. */
+  challengeTimezone?: string;
 }
 
 /**
@@ -85,16 +85,28 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
   if (!goalCheck.ok) return { ok: false, httpStatus: 400, body: { error: goalCheck.error } };
   if (!isAllowedDuration(input.durationDays)) return { ok: false, httpStatus: 400, body: { error: "Duration must be one of 7, 10, 30, 60, or 90 days." } };
 
-  const startAtUtc = new Date(input.startAtIso);
-  if (Number.isNaN(startAtUtc.getTime()) || startAtUtc.getTime() < Date.now() + MIN_START_LEAD_MS) {
-    return { ok: false, httpStatus: 400, body: { error: "Start time must be a valid time at least 1 hour in the future." } };
-  }
+  // Resolve the challenge timezone: an explicit request value wins; otherwise fall back to the
+  // host's saved timezone. The schedule is validated + normalized in this zone. hostTz stays the
+  // host participant's own locked timezone (daily-window behavior unchanged).
+  const hostTz = await lockUserTimezone(userId);
+  const requestedTz = input.challengeTimezone?.trim();
+  const timezone = requestedTz ? requestedTz : hostTz;
+
+  // Strict USD-Unlimited schedule validation (public + private parity): start must be local midnight
+  // in the challenge timezone, tomorrow-or-later, with a supported duration; end is backend-computed
+  // as start-local-date + duration at local midnight (DST-correct). Supersedes the old ≥1h lead check.
+  const schedule = validateUnlimitedSchedule({
+    startAtIso: input.startAtIso,
+    durationDays: input.durationDays,
+    timezone,
+    nowMs: Date.now(),
+  });
+  if (!schedule.ok) return { ok: false, httpStatus: 400, body: { error: schedule.error } };
+  const { startAtUtc, challengeEndAtUtc } = schedule;
 
   const elig = await checkPaidEligibility(userId, true);
   if (!elig.ok) return elig;
 
-  const hostTz = await lockUserTimezone(userId);
-  const challengeEndAtUtc = computeChallengeEndUtc(startAtUtc, hostTz, input.durationDays);
   // Settlement waits until all days are finalized; the timer just needs to be past the last window +
   // grace. Add a timezone safety margin so far-east/west participants' last days are covered.
   const settlementNotBeforeUtc = new Date(challengeEndAtUtc.getTime() + config.unlimitedGoal.graceMs + 26 * 60 * 60_000);
@@ -117,6 +129,7 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
         platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS,
         dailyGoalSteps: input.dailyGoalSteps,
         durationDays: input.durationDays,
+        challengeTimezone: timezone,
         startAtUtc,
         registrationClosesAtUtc: startAtUtc,
         challengeEndAtUtc,

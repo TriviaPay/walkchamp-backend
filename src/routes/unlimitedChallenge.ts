@@ -37,6 +37,8 @@ const createSchema = z.object({
   dailyGoalSteps: z.number().int().default(config.unlimitedGoal.defaultDailyGoalSteps),
   durationDays: z.number().int(),
   startAtIso: z.string(),
+  // Optional IANA timezone the schedule is anchored to; falls back to the host's saved timezone.
+  challengeTimezone: z.string().min(1).max(64).optional(),
 });
 
 function serializeChallenge(c: typeof unlimitedChallengesTable.$inferSelect) {
@@ -55,6 +57,7 @@ function serializeChallenge(c: typeof unlimitedChallengesTable.$inferSelect) {
     currency: c.currency,
     dailyGoalSteps: c.dailyGoalSteps,
     durationDays: c.durationDays,
+    challengeTimezone: c.challengeTimezone,
     startAtUtc: c.startAtUtc,
     registrationClosesAtUtc: c.registrationClosesAtUtc,
     challengeEndAtUtc: c.challengeEndAtUtc,

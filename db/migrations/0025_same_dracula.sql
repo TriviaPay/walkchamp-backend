@@ -1,0 +1,1 @@
+ALTER TABLE "unlimited_challenges" ADD COLUMN "challenge_timezone" text;

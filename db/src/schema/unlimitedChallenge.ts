@@ -26,6 +26,9 @@ export const unlimitedChallengesTable = pgTable(
     // ── Goal & schedule ─────────────────────────────────────────────────────
     dailyGoalSteps: integer("daily_goal_steps").notNull().default(10000), // 3000–15000
     durationDays: integer("duration_days").notNull(), // 7 | 10 | 30 | 60 | 90
+    // IANA timezone the schedule is anchored to. start/end are local midnight in this zone.
+    // Nullable for pre-existing rows (no backfill); always set on newly created challenges.
+    challengeTimezone: text("challenge_timezone"),
     startAtUtc: timestamp("start_at_utc", { withTimezone: true }).notNull(),
     registrationClosesAtUtc: timestamp("registration_closes_at_utc", { withTimezone: true }).notNull(),
     challengeEndAtUtc: timestamp("challenge_end_at_utc", { withTimezone: true }).notNull(),

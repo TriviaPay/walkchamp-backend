@@ -125,3 +125,72 @@ export function computeChallengeEndUtc(startAtUtc: Date, timezone: string, durat
   const windows = buildDayWindows(startAtUtc, timezone, durationDays, 0);
   return windows[windows.length - 1].windowEndUtc;
 }
+
+// ── USD Unlimited Challenge schedule validation (public + private parity) ──────
+// A USD Unlimited Players challenge must start on a FUTURE calendar date at exactly local midnight
+// in the challenge timezone, run a supported whole-day duration, and end at local midnight
+// (start local date + duration). The end instant is backend-authoritative. Shared by the create
+// path for both public and private rooms so the rules can never diverge or be bypassed via the API.
+
+export type UnlimitedScheduleError =
+  | "invalid_timezone"
+  | "invalid_start"
+  | "invalid_duration"
+  | "start_not_midnight"
+  | "start_not_future";
+
+export type UnlimitedScheduleResult =
+  | { ok: true; startAtUtc: Date; challengeEndAtUtc: Date; timezone: string }
+  | { ok: false; code: UnlimitedScheduleError; error: string };
+
+const ALLOWED_UNLIMITED_DURATIONS = new Set([7, 10, 30, 60, 90]);
+
+/** Civil-date ordinal (days since epoch) for a (y,m,d) — lets us compare calendar dates directly. */
+function civilOrdinal(year: number, month: number, day: number): number {
+  return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
+}
+
+/**
+ * Validate + normalize a USD Unlimited Challenge schedule. Pure and DST-correct (delegates the
+ * end-date math to computeChallengeEndUtc, which uses zoned midnight arithmetic).
+ */
+export function validateUnlimitedSchedule(input: {
+  startAtIso: string;
+  durationDays: number;
+  timezone: string;
+  nowMs: number;
+}): UnlimitedScheduleResult {
+  const { startAtIso, durationDays, timezone, nowMs } = input;
+
+  if (!isValidTimezone(timezone)) {
+    return { ok: false, code: "invalid_timezone", error: "Select a valid challenge timezone." };
+  }
+  const startAtUtc = new Date(startAtIso);
+  if (Number.isNaN(startAtUtc.getTime())) {
+    return { ok: false, code: "invalid_start", error: "Provide a valid challenge start date." };
+  }
+  if (!ALLOWED_UNLIMITED_DURATIONS.has(durationDays)) {
+    return { ok: false, code: "invalid_duration", error: "Unlimited challenge duration must be 7, 10, 30, 60 or 90 days." };
+  }
+
+  // Start must be EXACTLY local midnight (00:00:00.000) in the challenge timezone. IANA offsets are
+  // whole-minute, so a non-zero UTC millisecond implies a non-zero local millisecond.
+  const startLocal = localPartsInZone(startAtUtc, timezone);
+  const isLocalMidnight = startLocal.hour === 0 && startLocal.minute === 0 && startLocal.second === 0
+    && startAtUtc.getUTCMilliseconds() === 0;
+  if (!isLocalMidnight) {
+    return { ok: false, code: "start_not_midnight", error: "Unlimited challenges must start at 12:00 AM in the selected timezone." };
+  }
+
+  // Start local calendar date must be strictly after today's local date (tomorrow or later).
+  const todayLocal = localPartsInZone(new Date(nowMs), timezone);
+  const startOrdinal = civilOrdinal(startLocal.year, startLocal.month, startLocal.day);
+  const todayOrdinal = civilOrdinal(todayLocal.year, todayLocal.month, todayLocal.day);
+  if (startOrdinal <= todayOrdinal) {
+    return { ok: false, code: "start_not_future", error: "Unlimited challenges must start tomorrow or later." };
+  }
+
+  // Authoritative end = start local date + durationDays at local midnight (DST-correct).
+  const challengeEndAtUtc = computeChallengeEndUtc(startAtUtc, timezone, durationDays);
+  return { ok: true, startAtUtc, challengeEndAtUtc, timezone };
+}
