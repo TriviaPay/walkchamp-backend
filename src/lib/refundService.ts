@@ -590,7 +590,7 @@ export async function createRefundForPaymentRecordTx(
   return withItems;
 }
 
-async function createRefundForRaceParticipantTx(
+export async function createRefundForRaceParticipantTx(
   tx: DbTx,
   input: {
     raceId: string;
@@ -598,12 +598,15 @@ async function createRefundForRaceParticipantTx(
     reasonCode: string;
     requestSource: string;
     idempotencyKey: string;
+    /** Refund source type — "race" (default) or "unlimited_challenge". The wallet-debit lookup is
+     *  identical: unlimited entries are stored as race_entry_wallet_debit keyed by raceRoomId=challengeId. */
+    sourceType?: string;
   },
 ) {
   const reasonCode = sanitizeReason(input.reasonCode);
   const parent = await createRefundIntent(tx, {
     userId: input.userId,
-    sourceType: "race",
+    sourceType: input.sourceType ?? "race",
     sourceId: input.raceId,
     requestSource: input.requestSource,
     reasonCode,
@@ -665,6 +668,11 @@ export async function createRefundForRaceLeave(input: {
     if (room.status !== "open" && room.status !== "full" && room.status !== "scheduled") {
       throw new Error("RACE_ALREADY_STARTED");
     }
+    // Server-authoritative refund boundary: a scheduled room whose start instant has passed is
+    // post-start (non-refundable) even if the scheduler hasn't flipped its status yet.
+    if (room.scheduledStartAt && Date.now() >= room.scheduledStartAt.getTime()) {
+      throw new Error("RACE_ALREADY_STARTED");
+    }
 
     await tx.execute(sql`
       select id from race_participants
@@ -694,7 +702,11 @@ export async function createRefundForRaceLeave(input: {
       }
       throw new Error("PARTICIPANT_NOT_FOUND");
     }
-    if (room.status === "open" && room.creatorId === input.userId) throw new Error("HOST_MUST_CANCEL");
+    // Paid challenges cannot be cancelled, so the host LEAVES (and is refunded) like any participant.
+    // Only a FREE open room still forces the host to cancel instead of leave.
+    if (room.status === "open" && room.creatorId === input.userId && room.entryAmountCents === 0) {
+      throw new Error("HOST_MUST_CANCEL");
+    }
 
     const refund = await createRefundForRaceParticipantTx(tx, {
       raceId: input.raceId,

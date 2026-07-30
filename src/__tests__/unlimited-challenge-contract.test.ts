@@ -42,9 +42,12 @@ describe("money safety (integer cents, fixed $0.50, no double charge)", () => {
     expect(service).toContain("You cannot rejoin a challenge you left.");
   });
 
-  it("prize pool only grows (never decremented on leave)", () => {
-    expect(service).toContain("paidParticipantCount is NOT decremented");
-    expect(service).not.toContain("paidParticipantCount - 1");
+  it("pre-start leave decrements the pool + count (post-start leave leaves them intact)", () => {
+    // Pre-start USD leave refunds the entry and removes the contribution from the pool.
+    expect(service).toContain("GREATEST(${unlimitedChallengesTable.prizePoolCents} - ${participant.entryContributionCents}, 0)");
+    expect(service).toContain("GREATEST(${unlimitedChallengesTable.paidParticipantCount} - 1, 0)");
+    // Post-start still keeps the contribution in the pool (guarded by the preStart branch).
+    expect(service).toContain("Post-start: contribution stays in the pool");
   });
 });
 
@@ -68,11 +71,19 @@ describe("one-blocking-challenge spans both systems", () => {
   });
 });
 
-describe("leave = no refund, never cancels", () => {
-  it("leave returns an explicit no-refund body and no host-cancel endpoint exists", () => {
-    expect(router).toContain('refund: { eligible: false, type: "none"');
+describe("leave: pre-start refund, post-start no refund, never cancels", () => {
+  it("leave never cancels the challenge and there is no host-cancel endpoint", () => {
     expect(router).not.toContain("/cancel");
-    expect(service).toContain("Contribution stays in the pool (no refund)");
+    expect(router).toContain("challengeContinues: true");
+  });
+  it("server-authoritative refund boundary + idempotent refund key", () => {
+    expect(service).toContain("challenge.status === \"waiting\" && Date.now() < challenge.startAtUtc.getTime()");
+    expect(service).toContain("`unlimited_leave:${challengeId}:${userId}`");
+    expect(service).toContain('sourceType: "unlimited_challenge"');
+  });
+  it("entry is debited as refundable (entry fee), enabling the pre-start refund", () => {
+    expect(service).toContain("refundableAmountCents: input.entryFeeCents");   // host auto-join
+    expect(service).toContain("refundableAmountCents: challenge.entryFeeCents"); // joiner
   });
 });
 

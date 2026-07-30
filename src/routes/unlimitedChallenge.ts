@@ -93,7 +93,20 @@ router.post("/unlimited-challenges/:id/leave", requireAuth, async (req, res) => 
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const result = await leaveUnlimitedChallenge(userId, String(req.params.id));
   if (!result.ok) return res.status(result.httpStatus).json(result.body);
-  return res.json({ success: true, raceContinues: true, refund: { eligible: false, type: "none", cashAmountMinor: 0, coinAmount: 0 }, ...result.data });
+  // Leaving never cancels the challenge; the original host/creator is preserved for display.
+  return res.json({
+    success: true,
+    challengeId: result.data.challengeId,
+    raceContinues: true,
+    challengeContinues: true,
+    participationStatus: "left",
+    participantStatus: "left",
+    prizeEligible: false,
+    refundEligible: result.data.refundIssued,
+    refundIssued: result.data.refundIssued,
+    refundAmount: result.data.refundAmountCents,
+    activeChallengeReleased: true,
+  });
 });
 
 // ── GET /unlimited-challenges (paginated public listing) ──────────────────────

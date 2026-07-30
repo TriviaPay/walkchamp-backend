@@ -7,7 +7,7 @@ import {
   unlimitedChallengeParticipantsTable,
   type UnlimitedChallenge,
 } from "../../db/src/schema/unlimitedChallenge.js";
-import { debitWalletForCashChallenge } from "./refundService.js";
+import { debitWalletForCashChallenge, createRefundForRaceParticipantTx } from "./refundService.js";
 import { computeIsAdult } from "./dateOfBirth.js";
 import { isCashChallengeUnsupportedForCountry } from "./cashChallengeFees.js";
 import { generateInviteCode } from "./inviteCodes.js";
@@ -146,7 +146,7 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
       debitAmountCents: computeTotalChargeCents(input.entryFeeCents),
       idempotencyKey: `unlimited_entry:${challenge.id}:${userId}`,
       description: `Unlimited Challenge entry: ${challenge.title}`,
-      metadata: { entryFeeCents: input.entryFeeCents, platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS, refundableAmountCents: 0 },
+      metadata: { entryFeeCents: input.entryFeeCents, platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS, refundableAmountCents: input.entryFeeCents },
     });
     if (!charge.ok) return { ok: false as const, kind: "charge" as const, error: charge.error };
 
@@ -227,7 +227,7 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
       debitAmountCents: computeTotalChargeCents(challenge.entryFeeCents),
       idempotencyKey: `unlimited_entry:${challengeId}:${userId}`,
       description: `Unlimited Challenge entry: ${challenge.title}`,
-      metadata: { entryFeeCents: challenge.entryFeeCents, platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS, refundableAmountCents: 0 },
+      metadata: { entryFeeCents: challenge.entryFeeCents, platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS, refundableAmountCents: challenge.entryFeeCents },
     });
     if (!charge.ok) return { ok: false as const, httpStatus: 402, body: { error: charge.error ?? "Entry fee could not be charged.", code: "entry_charge_failed" } };
 
@@ -259,8 +259,14 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
   return { ok: true, data: { challengeId } };
 }
 
-/** Leave a challenge. No refund ever. Before start → left; after start → left + disqualified. */
-export async function leaveUnlimitedChallenge(userId: string, challengeId: string): Promise<ServiceResult<{ challengeId: string; participantStatus: string }>> {
+/**
+ * Leave a challenge. Host and regular participants may leave; leaving NEVER cancels the challenge
+ * and NEVER reassigns the host (hostUserId is preserved so the original creator name still shows).
+ * Server-authoritative refund boundary: leaveRequestedAt < startAtUtc → pre-start refund (entry fee
+ * per policy, pool + count decremented); at/after start → no refund, contribution stays in the pool.
+ * Idempotent: a repeated leave is a no-op and the refund idempotency key prevents a double refund.
+ */
+export async function leaveUnlimitedChallenge(userId: string, challengeId: string): Promise<ServiceResult<{ challengeId: string; participantStatus: string; refundIssued: boolean; refundAmountCents: number }>> {
   const result = await db.transaction(async (tx) => {
     const [challenge] = await tx.select().from(unlimitedChallengesTable).where(eq(unlimitedChallengesTable.id, challengeId)).limit(1).for("update");
     if (!challenge) return { ok: false as const, httpStatus: 404, body: { error: "Challenge not found." } };
@@ -271,31 +277,58 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
       .limit(1)
       .for("update");
     if (!participant) return { ok: false as const, httpStatus: 404, body: { error: "You are not a participant in this challenge." } };
-    if (participant.qualificationStatus === "left") return { ok: true as const }; // idempotent
+    if (participant.qualificationStatus === "left") return { ok: true as const, refundIssued: false, refundAmountCents: 0 }; // idempotent
 
-    const started = challenge.status !== "waiting";
+    // Pre-start iff still waiting AND server time is before the authoritative start instant.
+    const preStart = challenge.status === "waiting" && Date.now() < challenge.startAtUtc.getTime();
     const now = new Date();
+
     await tx
       .update(unlimitedChallengeParticipantsTable)
       .set({
         qualificationStatus: "left",
         leftAt: now,
-        // Leaving after start also removes prize eligibility (disqualified for payout).
-        disqualifiedAt: started ? now : null,
-        disqualificationReason: started ? "left_after_start" : null,
+        // Leaving at/after start also removes prize eligibility (disqualified for payout).
+        disqualifiedAt: preStart ? null : now,
+        disqualificationReason: preStart ? null : "left_after_start",
         updatedAt: now,
       })
       .where(eq(unlimitedChallengeParticipantsTable.id, participant.id));
-    // Contribution stays in the pool (no refund). paidParticipantCount is NOT decremented (pool basis).
-    return { ok: true as const };
+
+    if (!preStart) {
+      // Post-start: contribution stays in the pool (no refund); pool/count unchanged.
+      return { ok: true as const, refundIssued: false, refundAmountCents: 0 };
+    }
+
+    // Pre-start refund: refund the entry fee per policy (refundableAmountCents), remove the user's
+    // contribution from the pool, and decrement the paid count. Idempotency key guards double refunds.
+    await createRefundForRaceParticipantTx(tx, {
+      raceId: challengeId,
+      userId,
+      reasonCode: "unlimited_leave",
+      requestSource: "unlimited_leave",
+      idempotencyKey: `unlimited_leave:${challengeId}:${userId}`,
+      sourceType: "unlimited_challenge",
+    });
+    await tx
+      .update(unlimitedChallengesTable)
+      .set({
+        prizePoolCents: sql`GREATEST(${unlimitedChallengesTable.prizePoolCents} - ${participant.entryContributionCents}, 0)`,
+        paidParticipantCount: sql`GREATEST(${unlimitedChallengesTable.paidParticipantCount} - 1, 0)`,
+        updatedAt: now,
+      })
+      .where(eq(unlimitedChallengesTable.id, challengeId));
+    return { ok: true as const, refundIssued: true, refundAmountCents: participant.entryContributionCents };
   });
 
   if (!result.ok) return { ok: false, httpStatus: result.httpStatus, body: result.body };
   void triggerEvent(`unlimited-challenge-${challengeId}`, "participant_left", { challengeId, userId });
-  // No refund notification — leaving is explicitly no-refund.
-  void sendNotification(userId, "race_cancelled", "You left the challenge", "You left the challenge. Entry fees are non-refundable.", {
+  const msg = result.refundIssued
+    ? "You left the challenge. Your entry fee has been refunded."
+    : "You left the challenge. Entry fees are non-refundable after it starts.";
+  void sendNotification(userId, "race_cancelled", "You left the challenge", msg, {
     challengeId,
     dedupeKey: `unlimited_left:${challengeId}:${userId}`,
   }).catch(() => {});
-  return { ok: true, data: { challengeId, participantStatus: "left" } };
+  return { ok: true, data: { challengeId, participantStatus: "left", refundIssued: result.refundIssued, refundAmountCents: result.refundAmountCents } };
 }

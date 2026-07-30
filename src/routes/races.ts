@@ -3504,6 +3504,14 @@ router.post("/races/:id/cancel", requireAuth, async (req, res) => {
 
   if (!room) return res.status(404).json({ error: "Race not found" });
   if (room.creatorId !== userId) return res.status(403).json({ error: "Only the host can cancel the room." });
+  // A successfully-created paid (USD cash-entry) challenge can NEVER be cancelled by a normal user —
+  // the host must LEAVE instead (pre-start leave still refunds). Free/coins rooms keep cancel.
+  if (room.entryAmountCents > 0) {
+    return res.status(409).json({
+      code: "PAID_CHALLENGE_CANNOT_BE_CANCELLED",
+      error: "Cash challenges cannot be cancelled after creation.",
+    });
+  }
   if (room.status !== "open" && room.status !== "full" && room.status !== "scheduled") return res.status(409).json({ error: "Only open or scheduled rooms can be cancelled." });
 
   // Authoritative terminal transition + refunds + one realtime event + one notification per user.
@@ -3539,9 +3547,19 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
     return res.status(409).json({ error: "Race is already finished." });
   }
 
-  // Host cannot leave an open (waiting) room — they must cancel it instead.
-  // But a host CAN leave an in-progress race (they forfeit as a player; race continues).
-  if (room.status === "open" && room.creatorId === userId) {
+  const isHost = room.creatorId === userId;
+  const isPaid = room.entryAmountCents > 0;
+  // Server-authoritative refund boundary (§): a race is PRE-START until it actually starts. An
+  // open/full room hasn't started until the host starts it; a scheduled room starts at
+  // scheduledStartAt. leaveRequestedAt >= startAt (server time) is the non-refundable side.
+  const startAtMs = room.startedAt?.getTime() ?? room.scheduledStartAt?.getTime() ?? null;
+  const isPreStart = (room.status === "open" || room.status === "full" || room.status === "scheduled")
+    && (startAtMs === null || Date.now() < startAtMs);
+
+  // Free rooms keep the "host cancels" rule. Paid challenges CANNOT be cancelled, so the host must
+  // LEAVE instead (pre-start still refunds). Leaving never cancels the challenge or reassigns the
+  // host — creatorId is preserved so the original host name still displays; the slot is just emptied.
+  if (isPreStart && isHost && !isPaid) {
     return res.status(400).json({ error: "Host cannot leave — use Cancel Room instead." });
   }
 
@@ -3561,26 +3579,47 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
     return res.status(404).json({ error: "You are not an active participant in this race." });
   }
 
-  let refundBreakdown: Record<string, unknown> | null = null;
+  if (isPreStart) {
+    // ── Pre-start leave: remove from lobby + refund per policy (idempotent). Works for the host
+    // (paid) and regular participants. The refund txn re-validates server time + refund idempotency.
+    try {
+      const leaveResult = await createRefundForRaceLeave({ raceId, userId, reasonCode: leaveReason });
+      const refund = leaveResult.refund;
+      await triggerEvent(`public-live-race-${raceId}`, "race:player-left", { userId, raceId });
+      triggerEvent("public-rooms-available", "room:participant_left", { room_id: raceId }).catch(() => {});
+      const refundAmount = refund.succeededCashCents ?? 0;
+      req.log.info({ raceId, userId, isHost, refundAmount }, "participant left race (pre-start, refunded)");
+      return res.json({
+        success: true,
+        room_id: raceId,
+        message: "You left the race.",
+        participationStatus: "left",
+        participant_status: "left",
+        prizeEligible: false,
+        refundEligible: true,
+        refundIssued: refundAmount > 0,
+        refundStatus: refund.status ?? null,
+        refundAmount,
+        activeChallengeReleased: true,
+        challengeStatus: room.status, // unchanged — leaving never cancels the challenge
+        hostLeft: isHost,
+        can_rejoin: false,
+        refundBreakdown: { refund },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "";
+      if (msg === "HOST_MUST_CANCEL") return res.status(400).json({ error: "Host cannot leave — use Cancel Room instead." });
+      if (msg !== "RACE_ALREADY_STARTED") {
+        req.log.error({ raceId, userId, err }, "race leave refund failed");
+        return res.status(409).json({ error: "Could not process your leave right now. Please try again." });
+      }
+      // The race started between our pre-check and the refund transaction → fall through to the
+      // no-refund forfeit path (server-authoritative time was re-checked inside the refund txn).
+    }
+  }
 
-  if (room.status === "open" || room.status === "full") {
-    // ── Waiting room: remove from lobby + refund entry fee to wallet ───────
-    const leaveResult = await createRefundForRaceLeave({
-      raceId,
-      userId,
-      reasonCode: leaveReason,
-    });
-    refundBreakdown = {
-      refund: leaveResult.refund,
-      message: leaveResult.refund.succeededCashCents > 0
-        ? "refund completed"
-        : "refund requested and pending review",
-    };
-
-    await triggerEvent(`public-live-race-${raceId}`, "race:player-left", { userId, raceId });
-    triggerEvent("public-rooms-available", "room:participant_left", { room_id: raceId }).catch(() => {});
-  } else {
-    // ── Active race: forfeit this participant (atomic + idempotent) ────────────
+  {
+    // ── Post-start leave: forfeit this participant (atomic + idempotent) ────────────
     // A forfeit NEVER refunds, NEVER settles the race, and NEVER declares another
     // participant the winner. It marks ONLY this participant forfeited; the race stays
     // active and remaining players must still complete the target to win (§9–§12).
@@ -3654,25 +3693,22 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
       raceId,
       room_id: raceId,
       message: "You quit this race.",
+      participationStatus: "left",
       participant_status: "forfeited",
       participantStatus: "forfeited",
+      prizeEligible: false,
+      refundEligible: false,
+      refundIssued: false,
+      refundAmount: 0,
+      activeChallengeReleased: true,
       raceStatus: "active",
+      challengeStatus: room.status, // unchanged — leaving never cancels the challenge
       raceContinues: true,
+      hostLeft: isHost,
       can_rejoin: false,
       refund: { eligible: false, type: "none", cashAmountMinor: 0, coinAmount: 0 },
     });
   }
-
-  // Waiting-room leave path (open/full): lobby removal + entry-fee refund already applied above.
-  req.log.info({ raceId, userId, roomStatus: room.status, leaveReason, status: "left" }, "participant left race");
-  return res.json({
-    success: true,
-    message: "You left the race.",
-    room_id: raceId,
-    participant_status: "left",
-    can_rejoin: false,
-    ...(refundBreakdown ? { refundBreakdown } : {}),
-  });
 });
 
 // ── GET /api/races ────────────────────────────────────────────────────────────
