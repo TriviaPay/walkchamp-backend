@@ -28,10 +28,11 @@ export function validateEntryFeeCents(entryFeeCents: number): EntryValidation {
   return { ok: true };
 }
 
-/** Validate a daily step goal against the configured 3,000–15,000 bounds. */
+/** Validate a daily step goal against the configured production bounds plus explicit test options. */
 export function validateDailyGoalSteps(dailyGoalSteps: number): EntryValidation {
-  const { minDailyGoalSteps, maxDailyGoalSteps } = config.unlimitedGoal;
+  const { minDailyGoalSteps, maxDailyGoalSteps, testingDailyGoalSteps } = config.unlimitedGoal;
   if (!Number.isInteger(dailyGoalSteps)) return { ok: false, error: "Daily goal must be a whole number of steps." };
+  if ((testingDailyGoalSteps as readonly number[]).includes(dailyGoalSteps)) return { ok: true };
   if (dailyGoalSteps < minDailyGoalSteps) return { ok: false, error: `Daily goal must be at least ${minDailyGoalSteps} steps.` };
   if (dailyGoalSteps > maxDailyGoalSteps) return { ok: false, error: `Daily goal must be at most ${maxDailyGoalSteps} steps.` };
   return { ok: true };

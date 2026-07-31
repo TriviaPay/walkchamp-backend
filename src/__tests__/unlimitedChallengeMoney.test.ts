@@ -23,12 +23,15 @@ describe("unlimited challenge money", () => {
     expect(validateEntryFeeCents(10_050.5).ok).toBe(false); // non-integer cents
   });
 
-  it("validates the 3,000–15,000 daily goal bounds", () => {
+  it("validates the 3,000-20,000 daily goal bounds plus the 100-step test option", () => {
+    expect(validateDailyGoalSteps(100).ok).toBe(true);
     expect(validateDailyGoalSteps(3000).ok).toBe(true);
     expect(validateDailyGoalSteps(10000).ok).toBe(true);
-    expect(validateDailyGoalSteps(15000).ok).toBe(true);
+    expect(validateDailyGoalSteps(20000).ok).toBe(true);
+    expect(validateDailyGoalSteps(99).ok).toBe(false);
+    expect(validateDailyGoalSteps(101).ok).toBe(false);
     expect(validateDailyGoalSteps(2999).ok).toBe(false);
-    expect(validateDailyGoalSteps(15001).ok).toBe(false);
+    expect(validateDailyGoalSteps(20001).ok).toBe(false);
   });
 
   it("only allows 7/10/30/60/90-day durations", () => {
