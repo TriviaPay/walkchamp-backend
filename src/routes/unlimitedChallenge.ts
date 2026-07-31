@@ -1,6 +1,6 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
-import { and, desc, eq, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ne, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { profilesTable } from "../../db/src/schema/profiles.js";
 import {
@@ -67,6 +67,57 @@ function serializeChallenge(c: typeof unlimitedChallengesTable.$inferSelect) {
     settlementStatus: c.settlementStatus,
     createdAt: c.createdAt,
   };
+}
+
+async function loadChallengePlayers(challengeId: string, currentUserId: string, hostUserId: string) {
+  const rows = await db
+    .select({
+      participantId: unlimitedChallengeParticipantsTable.id,
+      userId: unlimitedChallengeParticipantsTable.userId,
+      qualificationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
+      joinedAt: unlimitedChallengeParticipantsTable.joinedAt,
+      username: profilesTable.username,
+      fullName: profilesTable.fullName,
+      country: profilesTable.country,
+      countryFlag: profilesTable.countryFlag,
+      avatarColor: profilesTable.avatarColor,
+      avatarUrl: profilesTable.avatarUrl,
+      updatedAt: profilesTable.updatedAt,
+    })
+    .from(unlimitedChallengeParticipantsTable)
+    .innerJoin(profilesTable, eq(profilesTable.id, unlimitedChallengeParticipantsTable.userId))
+    .where(and(eq(unlimitedChallengeParticipantsTable.challengeId, challengeId), ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left")))
+    .orderBy(
+      sql`(${unlimitedChallengeParticipantsTable.userId} = ${hostUserId}) desc`,
+      asc(unlimitedChallengeParticipantsTable.joinedAt),
+      asc(unlimitedChallengeParticipantsTable.id),
+    );
+
+  return rows.map((p, i) => ({
+    id: p.participantId,
+    participantId: p.participantId,
+    userId: p.userId,
+    username: p.username,
+    fullName: p.fullName,
+    displayName: p.fullName || p.username,
+    country: p.country ?? null,
+    countryFlag: p.countryFlag ?? null,
+    avatarColor: p.avatarColor ?? null,
+    avatarUrl: p.avatarUrl ?? null,
+    avatarVersion: p.updatedAt?.getTime() ?? 0,
+    qualificationStatus: p.qualificationStatus,
+    status: p.qualificationStatus,
+    joinedAt: p.joinedAt,
+    rank: i + 1,
+    isHost: p.userId === hostUserId,
+    isCurrentUser: p.userId === currentUserId,
+    friendStatus: "none",
+    friendRequestId: null,
+    activeTitle: null,
+    currentSteps: 0,
+    completedDays: 0,
+    totalChallengeSteps: 0,
+  }));
 }
 
 // ── POST /unlimited-challenges/host ───────────────────────────────────────────
@@ -137,10 +188,13 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
     .limit(1);
 
   const canJoin = !membership && challenge.status === "waiting" && Date.now() < challenge.startAtUtc.getTime();
+  const players = await loadChallengePlayers(challengeId, userId, challenge.hostUserId);
   return res.json({
     challenge: serializeChallenge(challenge),
     membership: membership ? { status: membership.status } : null,
     canJoin,
+    players,
+    participants: players,
   });
 });
 

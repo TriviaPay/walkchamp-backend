@@ -145,6 +145,12 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
     expect(router).toContain("pagination: { limit, offset");
     expect(router).toContain(".limit(limit)");
   });
+  it("detail response includes all non-left players for waiting room rendering", () => {
+    expect(router).toContain("async function loadChallengePlayers");
+    expect(router).toContain("players,");
+    expect(router).toContain("participants: players");
+    expect(router).toContain("isCurrentUser: p.userId === currentUserId");
+  });
 });
 
 describe("USD Unlimited strict midnight scheduling", () => {
