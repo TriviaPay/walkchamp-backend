@@ -451,8 +451,39 @@ async function addUnlimitedParticipants(client: pg.Client, args: Args) {
     if (!args.forceTerminal && !["waiting", "active"].includes(challenge.status)) {
       throw new Error(`Unlimited challenge is ${challenge.status}. Re-run with --force-terminal only if you intentionally want dummy rows on this status.`);
     }
+    const totalChargeCents = Number(challenge.entry_fee_cents) + Number(challenge.platform_fee_cents);
 
     await ensureDummyUsers(client, args.batch, args.count);
+
+    await client.query(
+      `
+      insert into wallets (
+        user_id,
+        available_balance_cents,
+        pending_balance_cents,
+        withdrawable_balance_cents,
+        total_earned_cents,
+        currency,
+        created_at,
+        updated_at
+      )
+      select
+        p.id,
+        1000000,
+        0,
+        0,
+        0,
+        'usd',
+        now(),
+        now()
+      from profiles p
+      where p.id like $1
+      order by p.id
+      limit $2::int
+      on conflict (user_id) do nothing
+      `,
+      [userIdExpr(args.batch), args.count],
+    );
 
     const inserted = await client.query(
       `
@@ -491,6 +522,83 @@ async function addUnlimitedParticipants(client: pg.Client, args: Args) {
       [args.raceId, userIdExpr(args.batch), args.count, challenge.entry_fee_cents, challenge.platform_fee_cents],
     );
 
+    const walletDebits = await client.query(
+      `
+      with dummy_users as (
+        select p.id as user_id
+        from profiles p
+        where p.id like $2
+        order by p.id
+        limit $3::int
+      ),
+      inserted_debits as (
+        insert into wallet_transactions (
+          wallet_id,
+          user_id,
+          transaction_type,
+          amount_cents,
+          currency,
+          status,
+          description,
+          source,
+          idempotency_key,
+          race_room_id,
+          balance_before_cents,
+          balance_after_cents,
+          metadata,
+          created_at
+        )
+        select
+          w.id,
+          d.user_id,
+          'race_entry_wallet_debit',
+          -$6::int,
+          w.currency,
+          'completed',
+          'Dummy Unlimited Challenge entry: ' || $1,
+          'dummy_seed',
+          'dummy_unlimited_wallet_debit:' || $1 || ':' || d.user_id,
+          $1::uuid,
+          w.available_balance_cents,
+          w.available_balance_cents - $6::int,
+          jsonb_build_object(
+            'dummyData', true,
+            'batch', $4::text,
+            'entryFeeCents', $5::int,
+            'platformFeeCents', $7::int,
+            'refundableAmountCents', $5::int
+          ),
+          now()
+        from dummy_users d
+        inner join wallets w on w.user_id = d.user_id
+        where not exists (
+          select 1
+          from wallet_transactions wt
+          where wt.user_id = d.user_id
+            and wt.race_room_id = $1::uuid
+            and wt.transaction_type = 'race_entry_wallet_debit'
+            and wt.status = 'completed'
+        )
+        returning wallet_id, amount_cents
+      )
+      update wallets w
+      set available_balance_cents = w.available_balance_cents + inserted_debits.amount_cents,
+          updated_at = now()
+      from inserted_debits
+      where w.id = inserted_debits.wallet_id
+      returning w.id
+      `,
+      [
+        args.raceId,
+        userIdExpr(args.batch),
+        args.count,
+        args.batch,
+        challenge.entry_fee_cents,
+        totalChargeCents,
+        challenge.platform_fee_cents,
+      ],
+    );
+
     const counts = await client.query(
       `
       select
@@ -514,7 +622,7 @@ async function addUnlimitedParticipants(client: pg.Client, args: Args) {
     );
 
     await client.query("commit");
-    console.log(`inserted_unlimited_participants=${inserted.rowCount ?? 0} challenge_id=${args.raceId} batch=${args.batch}`);
+    console.log(`inserted_unlimited_participants=${inserted.rowCount ?? 0} inserted_dummy_wallet_debits=${walletDebits.rowCount ?? 0} challenge_id=${args.raceId} batch=${args.batch}`);
   } catch (err) {
     await client.query("rollback");
     throw err;
@@ -529,6 +637,26 @@ async function removeUnlimitedParticipants(client: pg.Client, args: Args) {
       [args.raceId],
     );
     if (!challengeResult.rows[0]) throw new Error(`Unlimited challenge not found: ${args.raceId}`);
+
+    const walletDebits = await client.query(
+      `
+      with deleted_debits as (
+        delete from wallet_transactions wt
+        where wt.race_room_id = $1::uuid
+          and wt.user_id like $2
+          and wt.idempotency_key like 'dummy_unlimited_wallet_debit:%'
+          and wt.source = 'dummy_seed'
+        returning wt.wallet_id, wt.amount_cents
+      )
+      update wallets w
+      set available_balance_cents = w.available_balance_cents - deleted_debits.amount_cents,
+          updated_at = now()
+      from deleted_debits
+      where w.id = deleted_debits.wallet_id
+      returning w.id
+      `,
+      [args.raceId, userIdExpr(args.batch)],
+    );
 
     const deleted = await client.query(
       `
@@ -564,7 +692,7 @@ async function removeUnlimitedParticipants(client: pg.Client, args: Args) {
     );
 
     await client.query("commit");
-    console.log(`deleted_unlimited_participants=${deleted.rowCount ?? 0} challenge_id=${args.raceId} batch=${args.batch}`);
+    console.log(`deleted_unlimited_participants=${deleted.rowCount ?? 0} deleted_dummy_wallet_debits=${walletDebits.rowCount ?? 0} challenge_id=${args.raceId} batch=${args.batch}`);
   } catch (err) {
     await client.query("rollback");
     throw err;
