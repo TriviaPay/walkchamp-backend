@@ -1,6 +1,6 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
-import { and, asc, desc, eq, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { profilesTable } from "../../db/src/schema/profiles.js";
 import {
@@ -152,10 +152,12 @@ router.post("/unlimited-challenges/:id/leave", requireAuth, async (req, res) => 
     challengeContinues: true,
     participationStatus: "left",
     participantStatus: "left",
+    currentUserRegistered: false,
     prizeEligible: false,
     refundEligible: result.data.refundIssued,
     refundIssued: result.data.refundIssued,
     refundAmount: result.data.refundAmountCents,
+    refundAmountCents: result.data.refundAmountCents,
     activeChallengeReleased: true,
   });
 });
@@ -164,6 +166,7 @@ router.post("/unlimited-challenges/:id/leave", requireAuth, async (req, res) => 
 router.get("/unlimited-challenges", requireAuth, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const userId = (req as AuthenticatedRequest).descopeUserId;
   const rows = await db
     .select()
     .from(unlimitedChallengesTable)
@@ -171,7 +174,26 @@ router.get("/unlimited-challenges", requireAuth, async (req, res) => {
     .orderBy(desc(unlimitedChallengesTable.startAtUtc))
     .limit(limit)
     .offset(offset);
-  return res.json({ challenges: rows.map(serializeChallenge), pagination: { limit, offset, count: rows.length } });
+
+  // Overlay the viewer's own membership so clients can tell "is this mine?" by
+  // participation rather than falling back to hostUserId. One batched lookup for all listed rows.
+  const memberships = rows.length
+    ? await db
+        .select({ challengeId: unlimitedChallengeParticipantsTable.challengeId, status: unlimitedChallengeParticipantsTable.qualificationStatus })
+        .from(unlimitedChallengeParticipantsTable)
+        .where(and(eq(unlimitedChallengeParticipantsTable.userId, userId), inArray(unlimitedChallengeParticipantsTable.challengeId, rows.map((r) => r.id))))
+    : [];
+  const statusByChallenge = new Map(memberships.map((m) => [m.challengeId, m.status]));
+
+  const challenges = rows.map((c) => {
+    const status = statusByChallenge.get(c.id) ?? null;
+    return {
+      ...serializeChallenge(c),
+      participationStatus: status,
+      currentUserRegistered: status != null && status !== "left",
+    };
+  });
+  return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
 });
 
 // ── GET /unlimited-challenges/:id (detail + membership + canJoin) ─────────────
@@ -192,6 +214,7 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
   return res.json({
     challenge: serializeChallenge(challenge),
     membership: membership ? { status: membership.status } : null,
+    currentUserRegistered: !!membership && membership.status !== "left",
     canJoin,
     players,
     participants: players,

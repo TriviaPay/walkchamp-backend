@@ -161,10 +161,10 @@ const featureFlags = {
     parseBoolean(rawEnv.CASH_FEATURES_ENABLED)
     && parseBoolean(rawEnv.FEATURE_CASH_FEATURES),
   coinEntryChallengesEnabled: parseBoolean(rawEnv.FEATURE_COIN_ENTRY_CHALLENGES),
-  // Unlimited Challenge (unlimited_goal). Primary rollback switch: setting this false blocks all
-  // create/join (routes 404); worker start/finalize/settle paths are intentionally NOT gated so
-  // any in-flight challenge still completes safely.
-  unlimitedGoalEnabled: parseBoolean(rawEnv.FEATURE_UNLIMITED_GOAL),
+  // Unlimited Challenge (unlimited_goal). On by default; primary rollback switch: setting
+  // FEATURE_UNLIMITED_GOAL=false blocks all create/join (routes 404); worker start/finalize/settle
+  // paths are intentionally NOT gated so any in-flight challenge still completes safely.
+  unlimitedGoalEnabled: parseBoolean(rawEnv.FEATURE_UNLIMITED_GOAL, true),
   allowTestRoutes: parseBoolean(rawEnv.ALLOW_TEST_ROUTES),
   allowDemoSeeds: parseBoolean(rawEnv.ALLOW_DEMO_SEEDS),
   mockProvidersEnabled: parseBoolean(rawEnv.MOCK_PROVIDERS_ENABLED),

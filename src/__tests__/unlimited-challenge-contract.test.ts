@@ -18,7 +18,7 @@ const schema = readFileSync("db/src/schema/unlimitedChallenge.ts", "utf8");
 
 describe("rollback flag", () => {
   it("is env-driven (FEATURE_UNLIMITED_GOAL) and gates the router", () => {
-    expect(config).toContain("unlimitedGoalEnabled: parseBoolean(rawEnv.FEATURE_UNLIMITED_GOAL)");
+    expect(config).toContain("unlimitedGoalEnabled: parseBoolean(rawEnv.FEATURE_UNLIMITED_GOAL, true)");
     expect(router).toContain("if (!config.features.unlimitedGoalEnabled)");
     expect(router).toContain('code: "FEATURE_DISABLED"');
   });
@@ -167,5 +167,37 @@ describe("USD Unlimited strict midnight scheduling", () => {
   });
   it("scheduling rules stay scoped to the unlimited path — the race engine is untouched", () => {
     expect(races).not.toContain("validateUnlimitedSchedule");
+  });
+});
+
+describe("viewer membership on read paths (Next Race must not infer 'mine' from host id)", () => {
+  it("list overlays the viewer's own membership per challenge (batched, left excluded)", () => {
+    expect(router).toContain("currentUserRegistered: status != null && status !== \"left\"");
+    expect(router).toContain("participationStatus: status");
+    // batched lookup, not N+1
+    expect(router).toContain("inArray(unlimitedChallengeParticipantsTable.challengeId, rows.map((r) => r.id))");
+  });
+  it("detail exposes an explicit currentUserRegistered boolean alongside membership.status", () => {
+    expect(router).toContain('currentUserRegistered: !!membership && membership.status !== "left"');
+  });
+  it("leave response self-describes released membership + refundAmountCents alias", () => {
+    expect(router).toContain("currentUserRegistered: false");
+    expect(router).toContain("refundAmountCents: result.data.refundAmountCents");
+    expect(races).toContain("currentUserRegistered: false");
+    expect(races).toContain("refundAmountCents: refundAmount");
+  });
+});
+
+describe("unified GET /races/my-upcoming ('mine' = active participation)", () => {
+  it("merges scheduled fixed races (registered) + unlimited challenges (active participant)", () => {
+    expect(races).toContain('router.get("/races/my-upcoming"');
+    expect(races).toContain('eq(scheduledRoomRegistrationsTable.status, "registered")');
+    expect(races).toContain('ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left")');
+    expect(races).toContain('eq(unlimitedChallengesTable.status, "waiting")');
+  });
+  it("tags each item by kind and never treats host id alone as membership", () => {
+    expect(races).toContain('kind: "fixed" as const');
+    expect(races).toContain('kind: "unlimited" as const');
+    expect(races).toContain("currentUserRegistered: true");
   });
 });

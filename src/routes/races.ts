@@ -22,6 +22,8 @@ import {
   coinBalancesTable,
   cashChallengeConsentsTable,
   raceTrackThemesTable,
+  unlimitedChallengesTable,
+  unlimitedChallengeParticipantsTable,
 } from "../../db/src/schema/index.js";
 import { eq, and, desc, asc, sql, ne, inArray, notInArray, or, lt } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
@@ -2753,6 +2755,104 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
   });
 });
 
+// ── GET /api/races/my-upcoming ────────────────────────────────────────────────
+// Unified "mine" feed for Next Race: scheduled fixed races the viewer is registered
+// for + unlimited challenges the viewer is an active participant in. Membership is by
+// participation only (never host id alone), so leaving removes the item.
+router.get("/races/my-upcoming", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const now = new Date();
+
+  const [fixedRows, unlimitedRows] = await Promise.all([
+    db
+      .select({
+        id: raceRoomsTable.id,
+        title: raceRoomsTable.title,
+        entryType: raceRoomsTable.entryType,
+        entryAmountCents: raceRoomsTable.entryAmountCents,
+        targetSteps: raceRoomsTable.targetSteps,
+        status: raceRoomsTable.status,
+        creatorId: raceRoomsTable.creatorId,
+        scheduledStartAt: raceRoomsTable.scheduledStartAt,
+        challengeEndAt: raceRoomsTable.challengeEndAt,
+      })
+      .from(scheduledRoomRegistrationsTable)
+      .innerJoin(raceRoomsTable, eq(raceRoomsTable.id, scheduledRoomRegistrationsTable.raceRoomId))
+      .where(
+        and(
+          eq(scheduledRoomRegistrationsTable.userId, userId),
+          eq(scheduledRoomRegistrationsTable.status, "registered"),
+          eq(raceRoomsTable.status, "scheduled"),
+          sql`${raceRoomsTable.scheduledStartAt} > ${now}`,
+        ),
+      ),
+    db
+      .select({
+        id: unlimitedChallengesTable.id,
+        title: unlimitedChallengesTable.title,
+        entryFeeCents: unlimitedChallengesTable.entryFeeCents,
+        dailyGoalSteps: unlimitedChallengesTable.dailyGoalSteps,
+        status: unlimitedChallengesTable.status,
+        hostUserId: unlimitedChallengesTable.hostUserId,
+        startAtUtc: unlimitedChallengesTable.startAtUtc,
+        challengeEndAtUtc: unlimitedChallengesTable.challengeEndAtUtc,
+        participationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
+      })
+      .from(unlimitedChallengeParticipantsTable)
+      .innerJoin(unlimitedChallengesTable, eq(unlimitedChallengesTable.id, unlimitedChallengeParticipantsTable.challengeId))
+      .where(
+        and(
+          eq(unlimitedChallengeParticipantsTable.userId, userId),
+          ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+          eq(unlimitedChallengesTable.status, "waiting"),
+        ),
+      ),
+  ]);
+
+  const items = [
+    ...fixedRows.map((r) => ({
+      sortMs: r.scheduledStartAt?.getTime() ?? 0,
+      item: {
+        kind: "fixed" as const,
+        id: r.id,
+        title: r.title,
+        challengeType: r.entryType,
+        entryType: r.entryType,
+        entryFeeCents: r.entryAmountCents,
+        targetSteps: r.targetSteps,
+        scheduledStartAt: r.scheduledStartAt?.toISOString() ?? null,
+        challengeEndAt: r.challengeEndAt?.toISOString() ?? null,
+        status: r.status,
+        isHost: r.creatorId === userId,
+        currentUserRegistered: true,
+        participationStatus: "active",
+      },
+    })),
+    ...unlimitedRows.map((r) => ({
+      sortMs: r.startAtUtc?.getTime() ?? 0,
+      item: {
+        kind: "unlimited" as const,
+        id: r.id,
+        title: r.title,
+        challengeType: "unlimited_goal",
+        entryType: "unlimited_goal",
+        entryFeeCents: r.entryFeeCents,
+        targetSteps: r.dailyGoalSteps,
+        scheduledStartAt: r.startAtUtc?.toISOString() ?? null,
+        challengeEndAt: r.challengeEndAtUtc?.toISOString() ?? null,
+        status: r.status,
+        isHost: r.hostUserId === userId,
+        currentUserRegistered: true,
+        participationStatus: r.participationStatus,
+      },
+    })),
+  ]
+    .sort((a, b) => a.sortMs - b.sortMs)
+    .map((x) => x.item);
+
+  return res.json({ items, count: items.length });
+});
+
 // ── POST /api/races/host ──────────────────────────────────────────────────────
 // Creates a new race room and joins the creator as host participant.
 const VALID_TRACK_LAYOUTS = TRACK_THEME_CODES;
@@ -3595,11 +3695,13 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
         message: "You left the race.",
         participationStatus: "left",
         participant_status: "left",
+        currentUserRegistered: false,
         prizeEligible: false,
         refundEligible: true,
         refundIssued: refundAmount > 0,
         refundStatus: refund.status ?? null,
         refundAmount,
+        refundAmountCents: refundAmount,
         activeChallengeReleased: true,
         challengeStatus: room.status, // unchanged — leaving never cancels the challenge
         hostLeft: isHost,
@@ -3696,10 +3798,12 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
       participationStatus: "left",
       participant_status: "forfeited",
       participantStatus: "forfeited",
+      currentUserRegistered: false,
       prizeEligible: false,
       refundEligible: false,
       refundIssued: false,
       refundAmount: 0,
+      refundAmountCents: 0,
       activeChallengeReleased: true,
       raceStatus: "active",
       challengeStatus: room.status, // unchanged — leaving never cancels the challenge
