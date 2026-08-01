@@ -1,8 +1,9 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lte, ne, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { profilesTable } from "../../db/src/schema/profiles.js";
+import { stepDailyTotalsTable } from "../../db/src/schema/steps.js";
 import {
   unlimitedChallengesTable,
   unlimitedChallengeParticipantsTable,
@@ -93,31 +94,85 @@ async function loadChallengePlayers(challengeId: string, currentUserId: string, 
       asc(unlimitedChallengeParticipantsTable.id),
     );
 
-  return rows.map((p, i) => ({
-    id: p.participantId,
-    participantId: p.participantId,
-    userId: p.userId,
-    username: p.username,
-    fullName: p.fullName,
-    displayName: p.fullName || p.username,
-    country: p.country ?? null,
-    countryFlag: p.countryFlag ?? null,
-    avatarColor: p.avatarColor ?? null,
-    avatarUrl: p.avatarUrl ?? null,
-    avatarVersion: p.updatedAt?.getTime() ?? 0,
-    qualificationStatus: p.qualificationStatus,
-    status: p.qualificationStatus,
-    joinedAt: p.joinedAt,
-    rank: i + 1,
-    isHost: p.userId === hostUserId,
-    isCurrentUser: p.userId === currentUserId,
-    friendStatus: "none",
-    friendRequestId: null,
-    activeTitle: null,
-    currentSteps: 0,
-    completedDays: 0,
-    totalChallengeSteps: 0,
-  }));
+  const now = new Date();
+
+  // Per-participant finalized aggregates: completed (passed) days + verified step sum across all days.
+  const dayAgg = await db
+    .select({
+      participantId: unlimitedChallengeDaysTable.participantId,
+      completedDays: sql<number>`count(*) filter (where ${unlimitedChallengeDaysTable.status} = 'passed')::int`,
+      finalizedSteps: sql<number>`coalesce(sum(${unlimitedChallengeDaysTable.verifiedSteps}), 0)::int`,
+    })
+    .from(unlimitedChallengeDaysTable)
+    .where(eq(unlimitedChallengeDaysTable.challengeId, challengeId))
+    .groupBy(unlimitedChallengeDaysTable.participantId);
+  const aggByParticipant = new Map(dayAgg.map((d) => [d.participantId, d]));
+
+  // The day whose window currently contains `now` gives each participant's live local date. Its
+  // verifiedSteps stays 0 until finalized, so today's steps come from step_daily_totals (the same
+  // source finalizeUnlimitedDays reads), keeping the live number consistent with settlement.
+  const currentDays = await db
+    .select({
+      participantId: unlimitedChallengeDaysTable.participantId,
+      userId: unlimitedChallengeDaysTable.userId,
+      localDate: unlimitedChallengeDaysTable.localDate,
+    })
+    .from(unlimitedChallengeDaysTable)
+    .where(
+      and(
+        eq(unlimitedChallengeDaysTable.challengeId, challengeId),
+        lte(unlimitedChallengeDaysTable.windowStartUtc, now),
+        gt(unlimitedChallengeDaysTable.windowEndUtc, now),
+      ),
+    );
+  const currentDayByParticipant = new Map(currentDays.map((d) => [d.participantId, d]));
+
+  const liveByUserDate = new Map<string, number>();
+  if (currentDays.length) {
+    const stepRows = await db
+      .select({ userId: stepDailyTotalsTable.userId, date: stepDailyTotalsTable.date, steps: stepDailyTotalsTable.steps })
+      .from(stepDailyTotalsTable)
+      .where(
+        and(
+          inArray(stepDailyTotalsTable.userId, currentDays.map((d) => d.userId)),
+          inArray(stepDailyTotalsTable.date, currentDays.map((d) => d.localDate)),
+        ),
+      );
+    for (const s of stepRows) liveByUserDate.set(`${s.userId}|${s.date}`, s.steps);
+  }
+
+  return rows.map((p, i) => {
+    const agg = aggByParticipant.get(p.participantId);
+    const cur = currentDayByParticipant.get(p.participantId);
+    const todaySteps = cur ? liveByUserDate.get(`${cur.userId}|${cur.localDate}`) ?? 0 : 0;
+    const finalizedSteps = agg?.finalizedSteps ?? 0;
+    return {
+      id: p.participantId,
+      participantId: p.participantId,
+      userId: p.userId,
+      username: p.username,
+      fullName: p.fullName,
+      displayName: p.fullName || p.username,
+      country: p.country ?? null,
+      countryFlag: p.countryFlag ?? null,
+      avatarColor: p.avatarColor ?? null,
+      avatarUrl: p.avatarUrl ?? null,
+      avatarVersion: p.updatedAt?.getTime() ?? 0,
+      qualificationStatus: p.qualificationStatus,
+      status: p.qualificationStatus,
+      joinedAt: p.joinedAt,
+      rank: i + 1,
+      isHost: p.userId === hostUserId,
+      isCurrentUser: p.userId === currentUserId,
+      friendStatus: "none",
+      friendRequestId: null,
+      activeTitle: null,
+      // Live today's steps (from step_daily_totals); verified finalized days plus today's live for the total.
+      currentSteps: todaySteps,
+      completedDays: agg?.completedDays ?? 0,
+      totalChallengeSteps: finalizedSteps + todaySteps,
+    };
+  });
 }
 
 // ── POST /unlimited-challenges/host ───────────────────────────────────────────

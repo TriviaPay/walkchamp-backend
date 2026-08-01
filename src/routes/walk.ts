@@ -3,6 +3,7 @@ import { db } from "../../db/src/index.js";
 import {
   stepDailyTotalsTable, stepSessionsTable, profilesTable, userPresenceTable, userPreferencesTable,
   walkingGroupMembersTable, walkingGroupDailyStepsTable, walkingGroupsTable,
+  unlimitedChallengeDaysTable, unlimitedChallengesTable,
 } from "../../db/src/schema/index.js";
 import { eq, and, sql, desc, gte, lte, asc, count, inArray } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
@@ -21,6 +22,7 @@ import {
   isRejectedDailySource,
   classifyDailySource,
 } from "../lib/stepSources.js";
+import { triggerEvent } from "../lib/pusher.js";
 
 const router = Router();
 
@@ -483,6 +485,41 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
 
   // Evaluate achievement titles — fire-and-forget so step sync never fails on this
   evaluateAndNotify(userId).catch(() => {});
+
+  // Broadcast live progress to any active Unlimited challenge this user is racing today, so the
+  // challenge screen updates in realtime. Channel matches the other unlimited events
+  // (`unlimited-challenge-${challengeId}`); event is `progress_updated`. Fire-and-forget.
+  (async () => {
+    try {
+      const activeDays = await db
+        .select({
+          challengeId: unlimitedChallengeDaysTable.challengeId,
+          participantId: unlimitedChallengeDaysTable.participantId,
+          dayNumber: unlimitedChallengeDaysTable.dayNumber,
+          goalSteps: unlimitedChallengeDaysTable.goalSteps,
+        })
+        .from(unlimitedChallengeDaysTable)
+        .innerJoin(unlimitedChallengesTable, eq(unlimitedChallengesTable.id, unlimitedChallengeDaysTable.challengeId))
+        .where(and(
+          eq(unlimitedChallengeDaysTable.userId, userId),
+          eq(unlimitedChallengeDaysTable.localDate, today),
+          eq(unlimitedChallengesTable.status, "active"),
+          inArray(unlimitedChallengeDaysTable.status, ["pending", "in_progress", "pending_verification"]),
+        ));
+      if (!activeDays.length) return;
+      const todaySteps = updatedForCoins?.steps ?? 0;
+      for (const d of activeDays) {
+        void triggerEvent(`unlimited-challenge-${d.challengeId}`, "progress_updated", {
+          userId,
+          participantId: d.participantId,
+          todaySteps,
+          dayNumber: d.dayNumber,
+          goalSteps: d.goalSteps,
+          goalReached: todaySteps >= d.goalSteps,
+        });
+      }
+    } catch (_) {}
+  })();
 
   // Daily goal completion notification — fire-and-forget, never blocks step sync.
   // Triggered only when the user crosses the goal for the first time today.

@@ -13,6 +13,7 @@ const router = readFileSync("src/routes/unlimitedChallenge.ts", "utf8");
 const worker = readFileSync("src/worker.ts", "utf8");
 const scheduler = readFileSync("src/lib/scheduler.ts", "utf8");
 const races = readFileSync("src/routes/races.ts", "utf8");
+const walk = readFileSync("src/routes/walk.ts", "utf8");
 const membership = readFileSync("src/lib/challengeMembership.ts", "utf8");
 const schema = readFileSync("db/src/schema/unlimitedChallenge.ts", "utf8");
 
@@ -185,6 +186,26 @@ describe("viewer membership on read paths (Next Race must not infer 'mine' from 
     expect(router).toContain("refundAmountCents: result.data.refundAmountCents");
     expect(races).toContain("currentUserRegistered: false");
     expect(races).toContain("refundAmountCents: refundAmount");
+  });
+});
+
+describe("live step progress on unlimited challenges (no more hardcoded 0)", () => {
+  it("detail players list computes live currentSteps from step_daily_totals, not a constant", () => {
+    // the old hardcoded zeros are gone
+    expect(router).not.toContain("currentSteps: 0,");
+    expect(router).toContain("currentSteps: todaySteps");
+    expect(router).toContain("totalChallengeSteps: finalizedSteps + todaySteps");
+    // live steps read from the same source finalizeUnlimitedDays uses
+    expect(router).toContain("from(stepDailyTotalsTable)");
+    // current day = the window that currently contains now
+    expect(router).toContain("lte(unlimitedChallengeDaysTable.windowStartUtc, now)");
+    expect(router).toContain("gt(unlimitedChallengeDaysTable.windowEndUtc, now)");
+  });
+  it("step ingestion broadcasts progress_updated on the unlimited-challenge channel", () => {
+    expect(walk).toContain('triggerEvent(`unlimited-challenge-${d.challengeId}`, "progress_updated"');
+    expect(walk).toContain('eq(unlimitedChallengesTable.status, "active")');
+    // reuses today's committed total; fire-and-forget so step sync never fails on it
+    expect(walk).toContain("const todaySteps = updatedForCoins?.steps ?? 0;");
   });
 });
 
