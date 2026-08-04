@@ -10,6 +10,7 @@ import { buildDayWindows } from "./challengeDayWindow.js";
 import { settleUnlimitedChallenge } from "./unlimitedChallengeSettlement.js";
 import { enqueueJob } from "./queue.js";
 import { triggerEvent } from "./pusher.js";
+import { emitUnlimitedRealtime } from "./unlimitedRealtime.js";
 import { sendNotification } from "../routes/notifications.js";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
@@ -17,20 +18,24 @@ import { logger } from "./logger.js";
 /**
  * Start an Unlimited Challenge at its scheduled time: compare-and-set waiting→starting, materialize
  * each participant's per-day windows in their LOCKED timezone, go starting→active, and schedule
- * settlement. Idempotent — a challenge not in `waiting` is a no-op; day rows use a unique
- * (challenge, participant, dayNumber) constraint so re-runs never duplicate.
+ * settlement. Idempotent — a challenge not in `waiting`/`starting` (recovery) is a no-op; day rows
+ * use a unique (challenge, participant, dayNumber) constraint so re-runs never duplicate.
  */
 export async function startUnlimitedChallenge(challengeId: string): Promise<void> {
   const [pre] = await db.select().from(unlimitedChallengesTable).where(eq(unlimitedChallengesTable.id, challengeId)).limit(1);
-  if (!pre || pre.status !== "waiting") return;
-  if (Date.now() < pre.startAtUtc.getTime()) return; // too early
+  if (!pre) return;
+  // Allow resume of stuck `starting` rows (crash between claim and active).
+  if (pre.status !== "waiting" && pre.status !== "starting") return;
+  if (pre.status === "waiting" && Date.now() < pre.startAtUtc.getTime()) return;
 
-  const [claimed] = await db
-    .update(unlimitedChallengesTable)
-    .set({ status: "starting", updatedAt: new Date() })
-    .where(and(eq(unlimitedChallengesTable.id, challengeId), eq(unlimitedChallengesTable.status, "waiting")))
-    .returning({ id: unlimitedChallengesTable.id });
-  if (!claimed) return; // another worker won
+  if (pre.status === "waiting") {
+    const [claimed] = await db
+      .update(unlimitedChallengesTable)
+      .set({ status: "starting", updatedAt: new Date() })
+      .where(and(eq(unlimitedChallengesTable.id, challengeId), eq(unlimitedChallengesTable.status, "waiting")))
+      .returning({ id: unlimitedChallengesTable.id });
+    if (!claimed) return; // another worker won
+  }
 
   const participants = await db
     .select({ id: unlimitedChallengeParticipantsTable.id, userId: unlimitedChallengeParticipantsTable.userId, tz: unlimitedChallengeParticipantsTable.participantTimezone })
@@ -57,7 +62,7 @@ export async function startUnlimitedChallenge(challengeId: string): Promise<void
 
   await db
     .update(unlimitedChallengesTable)
-    .set({ status: "active", startedAtUtc: new Date(), updatedAt: new Date() })
+    .set({ status: "active", startedAtUtc: pre.startedAtUtc ?? new Date(), updatedAt: new Date() })
     .where(and(eq(unlimitedChallengesTable.id, challengeId), eq(unlimitedChallengesTable.status, "starting")));
 
   await enqueueJob("scheduled-jobs", "unlimited.settle", { challengeId }, {
@@ -66,7 +71,16 @@ export async function startUnlimitedChallenge(challengeId: string): Promise<void
   }).catch((err) => logger.warn({ err, challengeId }, "[Unlimited] settle-job enqueue failed (reconciler covers)"));
 
   logger.info({ challengeId, participants: participants.length }, "[Unlimited] challenge started (active)");
-  void triggerEvent(`unlimited-challenge-${challengeId}`, "challenge_started", { challengeId });
+  emitUnlimitedRealtime(
+    challengeId,
+    "challenge_started",
+    { challengeId },
+    { event: "race:started", payload: { raceId: challengeId, challengeType: "unlimited_goal" } },
+  );
+  void triggerEvent(`public-live-race-${challengeId}`, "race:starting", {
+    raceId: challengeId,
+    challengeType: "unlimited_goal",
+  });
   for (const p of participants) {
     void sendNotification(p.userId, "race_started", "Your challenge has started", "Your Unlimited Challenge has started — hit your daily goal every day!", {
       challengeId,
@@ -142,7 +156,15 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
           eq(unlimitedChallengeParticipantsTable.id, d.participantId),
           inArray(unlimitedChallengeParticipantsTable.qualificationStatus, ["active", "goal_completed_today", "pending_verification"]),
         ));
-      void triggerEvent(`unlimited-challenge-${d.challengeId}`, "participant_disqualified", { challengeId: d.challengeId, userId: d.userId });
+      void emitUnlimitedRealtime(
+        d.challengeId,
+        "participant_disqualified",
+        { challengeId: d.challengeId, userId: d.userId },
+        {
+          event: "race:participant-forfeited",
+          payload: { raceId: d.challengeId, userId: d.userId, reason: "missed_daily_goal" },
+        },
+      );
     }
   }
 }
@@ -167,6 +189,13 @@ export async function reconcileUnlimitedChallenges(now: Date = new Date()): Prom
       .from(unlimitedChallengesTable)
       .where(and(eq(unlimitedChallengesTable.status, "waiting"), lte(unlimitedChallengesTable.startAtUtc, now)));
     for (const c of dueStart) await startUnlimitedChallenge(c.id);
+
+    // Resume challenges stuck in `starting` (crash between claim and active).
+    const stuckStarting = await db
+      .select({ id: unlimitedChallengesTable.id })
+      .from(unlimitedChallengesTable)
+      .where(eq(unlimitedChallengesTable.status, "starting"));
+    for (const c of stuckStarting) await startUnlimitedChallenge(c.id);
 
     await finalizeUnlimitedDays(now);
 

@@ -16,6 +16,7 @@ import {
   createUnlimitedChallenge,
   joinUnlimitedChallenge,
   leaveUnlimitedChallenge,
+  UNLIMITED_OPEN_STATUSES,
 } from "../lib/unlimitedChallengeService.js";
 
 const router: Router = Router();
@@ -70,6 +71,38 @@ function serializeChallenge(c: typeof unlimitedChallengesTable.$inferSelect) {
   };
 }
 
+async function overlayMembership(
+  rows: Array<typeof unlimitedChallengesTable.$inferSelect>,
+  userId: string,
+) {
+  const memberships = rows.length
+    ? await db
+        .select({
+          challengeId: unlimitedChallengeParticipantsTable.challengeId,
+          status: unlimitedChallengeParticipantsTable.qualificationStatus,
+        })
+        .from(unlimitedChallengeParticipantsTable)
+        .where(
+          and(
+            eq(unlimitedChallengeParticipantsTable.userId, userId),
+            inArray(
+              unlimitedChallengeParticipantsTable.challengeId,
+              rows.map((r) => r.id),
+            ),
+          ),
+        )
+    : [];
+  const statusByChallenge = new Map(memberships.map((m) => [m.challengeId, m.status]));
+  return rows.map((c) => {
+    const status = statusByChallenge.get(c.id) ?? null;
+    return {
+      ...serializeChallenge(c),
+      participationStatus: status,
+      currentUserRegistered: status != null && status !== "left",
+    };
+  });
+}
+
 async function loadChallengePlayers(challengeId: string, currentUserId: string, hostUserId: string) {
   const rows = await db
     .select({
@@ -86,7 +119,7 @@ async function loadChallengePlayers(challengeId: string, currentUserId: string, 
       updatedAt: profilesTable.updatedAt,
     })
     .from(unlimitedChallengeParticipantsTable)
-    .innerJoin(profilesTable, eq(profilesTable.id, unlimitedChallengeParticipantsTable.userId))
+    .leftJoin(profilesTable, eq(profilesTable.id, unlimitedChallengeParticipantsTable.userId))
     .where(and(eq(unlimitedChallengeParticipantsTable.challengeId, challengeId), ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left")))
     .orderBy(
       sql`(${unlimitedChallengeParticipantsTable.userId} = ${hostUserId}) desc`,
@@ -146,13 +179,15 @@ async function loadChallengePlayers(challengeId: string, currentUserId: string, 
     const cur = currentDayByParticipant.get(p.participantId);
     const todaySteps = cur ? liveByUserDate.get(`${cur.userId}|${cur.localDate}`) ?? 0 : 0;
     const finalizedSteps = agg?.finalizedSteps ?? 0;
+    const displayName =
+      p.fullName || p.username || (p.userId === currentUserId ? "You" : `Player ${i + 1}`);
     return {
       id: p.participantId,
       participantId: p.participantId,
       userId: p.userId,
-      username: p.username,
+      username: p.username ?? displayName,
       fullName: p.fullName,
-      displayName: p.fullName || p.username,
+      displayName,
       country: p.country ?? null,
       countryFlag: p.countryFlag ?? null,
       avatarColor: p.avatarColor ?? null,
@@ -217,37 +252,84 @@ router.post("/unlimited-challenges/:id/leave", requireAuth, async (req, res) => 
   });
 });
 
-// ── GET /unlimited-challenges (paginated public listing) ──────────────────────
-router.get("/unlimited-challenges", requireAuth, async (req, res) => {
-  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
+// ── GET /unlimited-challenges/live (public running challenges for Live tab) ───
+// Must be registered BEFORE /:id so "live" is not treated as an id.
+router.get("/unlimited-challenges/live", requireAuth, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const rows = await db
     .select()
     .from(unlimitedChallengesTable)
-    .where(and(eq(unlimitedChallengesTable.visibility, "public"), eq(unlimitedChallengesTable.status, "waiting")))
+    .where(
+      and(
+        eq(unlimitedChallengesTable.visibility, "public"),
+        inArray(unlimitedChallengesTable.status, ["starting", "active", "settling"]),
+      ),
+    )
+    .orderBy(desc(unlimitedChallengesTable.startAtUtc))
+    .limit(limit)
+    .offset(offset);
+
+  const challenges = await overlayMembership(rows, userId);
+  return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
+});
+
+// ── GET /unlimited-challenges/my-active (membership-scoped open challenges) ───
+router.get("/unlimited-challenges/my-active", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const rows = await db
+    .select({
+      challenge: unlimitedChallengesTable,
+      participationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
+    })
+    .from(unlimitedChallengeParticipantsTable)
+    .innerJoin(
+      unlimitedChallengesTable,
+      eq(unlimitedChallengesTable.id, unlimitedChallengeParticipantsTable.challengeId),
+    )
+    .where(
+      and(
+        eq(unlimitedChallengeParticipantsTable.userId, userId),
+        ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+        inArray(unlimitedChallengesTable.status, [...UNLIMITED_OPEN_STATUSES]),
+      ),
+    )
+    .orderBy(desc(unlimitedChallengesTable.startAtUtc));
+
+  const challenges = rows.map((r) => ({
+    ...serializeChallenge(r.challenge),
+    participationStatus: r.participationStatus,
+    currentUserRegistered: true,
+  }));
+  return res.json({ challenges, count: challenges.length });
+});
+
+// ── GET /unlimited-challenges (paginated public listing) ──────────────────────
+// Default: public + waiting (Available / joinable).
+// ?status=active|live|in_progress → public starting/active/settling (Live browse).
+// ?status=waiting → explicit waiting (same as default).
+router.get("/unlimited-challenges", requireAuth, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const statusRaw = typeof req.query.status === "string" ? req.query.status.trim().toLowerCase() : "";
+  const liveStatuses = statusRaw === "active" || statusRaw === "live" || statusRaw === "in_progress";
+  const statusFilter = liveStatuses
+    ? inArray(unlimitedChallengesTable.status, ["starting", "active", "settling"])
+    : eq(unlimitedChallengesTable.status, "waiting");
+
+  const rows = await db
+    .select()
+    .from(unlimitedChallengesTable)
+    .where(and(eq(unlimitedChallengesTable.visibility, "public"), statusFilter))
     .orderBy(desc(unlimitedChallengesTable.startAtUtc))
     .limit(limit)
     .offset(offset);
 
   // Overlay the viewer's own membership so clients can tell "is this mine?" by
   // participation rather than falling back to hostUserId. One batched lookup for all listed rows.
-  const memberships = rows.length
-    ? await db
-        .select({ challengeId: unlimitedChallengeParticipantsTable.challengeId, status: unlimitedChallengeParticipantsTable.qualificationStatus })
-        .from(unlimitedChallengeParticipantsTable)
-        .where(and(eq(unlimitedChallengeParticipantsTable.userId, userId), inArray(unlimitedChallengeParticipantsTable.challengeId, rows.map((r) => r.id))))
-    : [];
-  const statusByChallenge = new Map(memberships.map((m) => [m.challengeId, m.status]));
-
-  const challenges = rows.map((c) => {
-    const status = statusByChallenge.get(c.id) ?? null;
-    return {
-      ...serializeChallenge(c),
-      participationStatus: status,
-      currentUserRegistered: status != null && status !== "left",
-    };
-  });
+  const challenges = await overlayMembership(rows, userId);
   return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
 });
 
@@ -295,7 +377,7 @@ router.get("/unlimited-challenges/:id/leaderboard", requireAuth, async (req, res
     })
     .from(unlimitedChallengeParticipantsTable)
     .leftJoin(unlimitedChallengeDaysTable, eq(unlimitedChallengeDaysTable.participantId, unlimitedChallengeParticipantsTable.id))
-    .innerJoin(profilesTable, eq(profilesTable.id, unlimitedChallengeParticipantsTable.userId))
+    .leftJoin(profilesTable, eq(profilesTable.id, unlimitedChallengeParticipantsTable.userId))
     .where(and(eq(unlimitedChallengeParticipantsTable.challengeId, challengeId), ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left")))
     .groupBy(unlimitedChallengeParticipantsTable.id, unlimitedChallengeParticipantsTable.userId, profilesTable.username, unlimitedChallengeParticipantsTable.qualificationStatus)
     .orderBy(
@@ -312,10 +394,11 @@ router.get("/unlimited-challenges/:id/leaderboard", requireAuth, async (req, res
       rank: offset + i + 1,
       participantId: r.participantId,
       userId: r.userId,
-      displayName: r.username,
+      displayName: r.username ?? `Player ${offset + i + 1}`,
       qualificationStatus: r.qualificationStatus,
       completedDays: r.completedDays,
       totalChallengeSteps: r.totalSteps,
+      currentSteps: r.totalSteps,
     })),
     pagination: { limit, offset, count: rows.length },
   });

@@ -175,8 +175,10 @@ describe("viewer membership on read paths (Next Race must not infer 'mine' from 
   it("list overlays the viewer's own membership per challenge (batched, left excluded)", () => {
     expect(router).toContain("currentUserRegistered: status != null && status !== \"left\"");
     expect(router).toContain("participationStatus: status");
-    // batched lookup, not N+1
-    expect(router).toContain("inArray(unlimitedChallengeParticipantsTable.challengeId, rows.map((r) => r.id))");
+    // batched lookup via overlayMembership helper, not N+1
+    expect(router).toContain("async function overlayMembership");
+    expect(router).toContain("unlimitedChallengeParticipantsTable.challengeId");
+    expect(router).toContain("rows.map((r) => r.id)");
   });
   it("detail exposes an explicit currentUserRegistered boolean alongside membership.status", () => {
     expect(router).toContain('currentUserRegistered: !!membership && membership.status !== "left"');
@@ -202,10 +204,13 @@ describe("live step progress on unlimited challenges (no more hardcoded 0)", () 
     expect(router).toContain("gt(unlimitedChallengeDaysTable.windowEndUtc, now)");
   });
   it("step ingestion broadcasts progress_updated on the unlimited-challenge channel", () => {
-    expect(walk).toContain('triggerEvent(`unlimited-challenge-${d.challengeId}`, "progress_updated"');
+    expect(walk).toContain('emitUnlimitedRealtime(');
+    expect(walk).toContain('"progress_updated"');
     expect(walk).toContain('eq(unlimitedChallengesTable.status, "active")');
     // reuses today's committed total; fire-and-forget so step sync never fails on it
     expect(walk).toContain("const todaySteps = updatedForCoins?.steps ?? 0;");
+    // Classic Live Detail compatibility mirror
+    expect(walk).toContain('event: "race:progress_updated"');
   });
 });
 
@@ -214,7 +219,7 @@ describe("unified GET /races/my-upcoming ('mine' = active participation)", () =>
     expect(races).toContain('router.get("/races/my-upcoming"');
     expect(races).toContain('eq(scheduledRoomRegistrationsTable.status, "registered")');
     expect(races).toContain('ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left")');
-    expect(races).toContain('eq(unlimitedChallengesTable.status, "waiting")');
+    expect(races).toContain('inArray(unlimitedChallengesTable.status, ["waiting", "starting", "active", "settling"])');
   });
   it("tags each item by kind and never treats host id alone as membership", () => {
     expect(races).toContain('kind: "fixed" as const');

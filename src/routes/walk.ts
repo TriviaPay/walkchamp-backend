@@ -487,8 +487,8 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   evaluateAndNotify(userId).catch(() => {});
 
   // Broadcast live progress to any active Unlimited challenge this user is racing today, so the
-  // challenge screen updates in realtime. Channel matches the other unlimited events
-  // (`unlimited-challenge-${challengeId}`); event is `progress_updated`. Fire-and-forget.
+  // challenge screen updates in realtime. Canonical channel: unlimited-challenge-*; also mirror
+  // onto public-live-race-* as race:progress_updated (steps) for Live Detail compatibility.
   (async () => {
     try {
       const activeDays = await db
@@ -508,15 +508,33 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
         ));
       if (!activeDays.length) return;
       const todaySteps = updatedForCoins?.steps ?? 0;
+      const { emitUnlimitedRealtime } = await import("../lib/unlimitedRealtime.js");
       for (const d of activeDays) {
-        void triggerEvent(`unlimited-challenge-${d.challengeId}`, "progress_updated", {
-          userId,
-          participantId: d.participantId,
-          todaySteps,
-          dayNumber: d.dayNumber,
-          goalSteps: d.goalSteps,
-          goalReached: todaySteps >= d.goalSteps,
-        });
+        emitUnlimitedRealtime(
+          d.challengeId,
+          "progress_updated",
+          {
+            userId,
+            participantId: d.participantId,
+            todaySteps,
+            dayNumber: d.dayNumber,
+            goalSteps: d.goalSteps,
+            goalReached: todaySteps >= d.goalSteps,
+          },
+          {
+            event: "race:progress_updated",
+            payload: {
+              raceId: d.challengeId,
+              userId,
+              participantId: d.participantId,
+              steps: todaySteps,
+              todaySteps,
+              dayNumber: d.dayNumber,
+              goalSteps: d.goalSteps,
+              goalReached: todaySteps >= d.goalSteps,
+            },
+          },
+        );
       }
     } catch (_) {}
   })();

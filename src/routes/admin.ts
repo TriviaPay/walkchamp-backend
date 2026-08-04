@@ -781,4 +781,93 @@ router.post("/admin/withdrawals/:id/reject", requireCashFeaturesEnabled, async (
   return res.json({ ok: true });
 });
 
+// ── POST /api/admin/unlimited-challenges/cancel-all ───────────────────────────
+// Platform cancel every open Unlimited Challenge and refund entry contributions.
+router.post("/admin/unlimited-challenges/cancel-all", async (req, res) => {
+  const adminUserId = (req as unknown as AuthenticatedRequest).descopeUserId;
+  const reason =
+    typeof req.body?.reason === "string" && req.body.reason.trim()
+      ? req.body.reason.trim()
+      : "platform_cancelled_all";
+
+  const { cancelAllOpenUnlimitedChallenges } = await import("../lib/unlimitedChallengeService.js");
+  const result = await cancelAllOpenUnlimitedChallenges({
+    reason,
+    actorUserId: adminUserId,
+  });
+
+  void writeAuditLog({
+    actorUserId: adminUserId ?? null,
+    actorType: "admin",
+    action: "admin.unlimited_challenge.cancel_all",
+    entityType: "unlimited_challenge",
+    entityId: null,
+    reason,
+    metadata: {
+      cancelled: result.cancelled,
+      skippedTerminal: result.skippedTerminal,
+    },
+  });
+
+  logger.info(
+    { cancelled: result.cancelled, skippedTerminal: result.skippedTerminal, reason },
+    "Admin: cancelled all open unlimited challenges",
+  );
+
+  return res.json({
+    ok: true,
+    cancelled: result.cancelled,
+    skippedTerminal: result.skippedTerminal,
+    results: result.results.map((r) => ({
+      challengeId: r.challengeId,
+      ok: r.ok,
+      alreadyTerminal: r.alreadyTerminal ?? false,
+      refundedCount: r.refundedUserIds.length,
+      failedRefundCount: r.failedRefundUserIds.length,
+    })),
+  });
+});
+
+// ── POST /api/admin/unlimited-challenges/:id/cancel ───────────────────────────
+router.post("/admin/unlimited-challenges/:id/cancel", async (req, res) => {
+  const adminUserId = (req as unknown as AuthenticatedRequest).descopeUserId;
+  const challengeId = String(req.params.id);
+  const reason =
+    typeof req.body?.reason === "string" && req.body.reason.trim()
+      ? req.body.reason.trim()
+      : "platform_cancelled";
+
+  const { cancelUnlimitedChallengeByPlatform } = await import("../lib/unlimitedChallengeService.js");
+  const result = await cancelUnlimitedChallengeByPlatform(challengeId, {
+    reason,
+    actorUserId: adminUserId,
+  });
+
+  if (!result.ok && result.refundedUserIds.length === 0 && !result.alreadyTerminal) {
+    return res.status(404).json({ error: "Challenge not found." });
+  }
+
+  void writeAuditLog({
+    actorUserId: adminUserId ?? null,
+    actorType: "admin",
+    action: "admin.unlimited_challenge.cancel",
+    entityType: "unlimited_challenge",
+    entityId: challengeId,
+    reason,
+    metadata: {
+      alreadyTerminal: result.alreadyTerminal ?? false,
+      refundedCount: result.refundedUserIds.length,
+      failedRefundCount: result.failedRefundUserIds.length,
+    },
+  });
+
+  return res.json({
+    ok: true,
+    challengeId,
+    alreadyTerminal: result.alreadyTerminal ?? false,
+    refundedCount: result.refundedUserIds.length,
+    failedRefundCount: result.failedRefundUserIds.length,
+  });
+});
+
 export default router;

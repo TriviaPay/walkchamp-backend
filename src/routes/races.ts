@@ -2705,45 +2705,71 @@ router.post("/rooms/:roomId/cancel-registration", requireAuth, async (req, res) 
 });
 
 // ── GET /api/races/my-active ──────────────────────────────────────────────────
-// Returns the current user's waiting or active race (if any).
+// Returns the current user's waiting or active race(s), including Unlimited.
 router.get("/races/my-active", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
 
-  const rows = await db
-    .select({
-      id: raceRoomsTable.id,
-      title: raceRoomsTable.title,
-      entryType: raceRoomsTable.entryType,
-      entryAmountCents: raceRoomsTable.entryAmountCents,
-      targetSteps: raceRoomsTable.targetSteps,
-      maxPlayers: raceRoomsTable.maxPlayers,
-      currentPlayers: raceRoomsTable.currentPlayers,
-      status: raceRoomsTable.status,
-      trackLayout: raceRoomsTable.trackLayout,
-      creatorId: raceRoomsTable.creatorId,
-      startedAt: raceRoomsTable.startedAt,
-      createdAt: raceRoomsTable.createdAt,
-    })
-    .from(raceRoomsTable)
-    .innerJoin(
-      raceParticipantsTable,
-      and(
-        eq(raceParticipantsTable.raceRoomId, raceRoomsTable.id),
-        eq(raceParticipantsTable.userId, userId),
-        and(ne(raceParticipantsTable.status, "left"), ne(raceParticipantsTable.status, "forfeited")),
-      ),
-    )
-    .where(inArray(raceRoomsTable.status, ["open", "in_progress"]))
-    .orderBy(desc(raceRoomsTable.createdAt))
-    .limit(1);
+  const [rows, unlimitedRows] = await Promise.all([
+    db
+      .select({
+        id: raceRoomsTable.id,
+        title: raceRoomsTable.title,
+        entryType: raceRoomsTable.entryType,
+        entryAmountCents: raceRoomsTable.entryAmountCents,
+        targetSteps: raceRoomsTable.targetSteps,
+        maxPlayers: raceRoomsTable.maxPlayers,
+        currentPlayers: raceRoomsTable.currentPlayers,
+        status: raceRoomsTable.status,
+        trackLayout: raceRoomsTable.trackLayout,
+        creatorId: raceRoomsTable.creatorId,
+        startedAt: raceRoomsTable.startedAt,
+        createdAt: raceRoomsTable.createdAt,
+      })
+      .from(raceRoomsTable)
+      .innerJoin(
+        raceParticipantsTable,
+        and(
+          eq(raceParticipantsTable.raceRoomId, raceRoomsTable.id),
+          eq(raceParticipantsTable.userId, userId),
+          and(ne(raceParticipantsTable.status, "left"), ne(raceParticipantsTable.status, "forfeited")),
+        ),
+      )
+      .where(inArray(raceRoomsTable.status, ["open", "in_progress"]))
+      .orderBy(desc(raceRoomsTable.createdAt))
+      .limit(5),
+    db
+      .select({
+        id: unlimitedChallengesTable.id,
+        title: unlimitedChallengesTable.title,
+        entryFeeCents: unlimitedChallengesTable.entryFeeCents,
+        dailyGoalSteps: unlimitedChallengesTable.dailyGoalSteps,
+        status: unlimitedChallengesTable.status,
+        hostUserId: unlimitedChallengesTable.hostUserId,
+        paidParticipantCount: unlimitedChallengesTable.paidParticipantCount,
+        startAtUtc: unlimitedChallengesTable.startAtUtc,
+        challengeEndAtUtc: unlimitedChallengesTable.challengeEndAtUtc,
+        createdAt: unlimitedChallengesTable.createdAt,
+      })
+      .from(unlimitedChallengeParticipantsTable)
+      .innerJoin(
+        unlimitedChallengesTable,
+        eq(unlimitedChallengesTable.id, unlimitedChallengeParticipantsTable.challengeId),
+      )
+      .where(
+        and(
+          eq(unlimitedChallengeParticipantsTable.userId, userId),
+          ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+          inArray(unlimitedChallengesTable.status, ["waiting", "starting", "active", "settling"]),
+        ),
+      )
+      .orderBy(desc(unlimitedChallengesTable.startAtUtc))
+      .limit(5),
+  ]);
 
-  if (rows.length === 0) return res.json({ race: null });
-
-  const row = rows[0];
-  const mediaMap = await getTrackThemeMediaMap([row.trackLayout]);
-  const trackTheme = trackThemeForCode(row.trackLayout, mediaMap);
-  return res.json({
-    race: {
+  const mediaMap = await getTrackThemeMediaMap(rows.map((r) => r.trackLayout));
+  const classicRaces = rows.map((row) => {
+    const trackTheme = trackThemeForCode(row.trackLayout, mediaMap);
+    return {
       ...row,
       isHost: row.creatorId === userId,
       entryType: entryTypeLabel(row.entryType),
@@ -2751,7 +2777,42 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
       trackTheme,
       imageSet: trackTheme.imageSet,
       trackThemeImageSet: trackTheme.imageSet,
-    },
+      challengeType: undefined as string | undefined,
+      capacityMode: undefined as string | undefined,
+      currentUserParticipating: true,
+    };
+  });
+
+  const unlimitedRaces = unlimitedRows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    entryType: "unlimited_goal",
+    entryAmountCents: r.entryFeeCents,
+    entryAmountDollars: r.entryFeeCents / 100,
+    targetSteps: r.dailyGoalSteps,
+    maxPlayers: null as number | null,
+    currentPlayers: r.paidParticipantCount,
+    status:
+      r.status === "active" || r.status === "starting" || r.status === "settling"
+        ? "in_progress"
+        : "open",
+    trackLayout: "bg",
+    creatorId: r.hostUserId,
+    startedAt: r.startAtUtc,
+    createdAt: r.createdAt,
+    isHost: r.hostUserId === userId,
+    challengeType: "unlimited_goal",
+    capacityMode: "unlimited",
+    challengeEndAt: r.challengeEndAtUtc,
+    currentUserParticipating: true,
+  }));
+
+  const races = [...unlimitedRaces, ...classicRaces];
+  if (races.length === 0) return res.json({ race: null, races: [] });
+
+  return res.json({
+    race: races[0],
+    races,
   });
 });
 
@@ -2804,7 +2865,7 @@ router.get("/races/my-upcoming", requireAuth, async (req, res) => {
         and(
           eq(unlimitedChallengeParticipantsTable.userId, userId),
           ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
-          eq(unlimitedChallengesTable.status, "waiting"),
+          inArray(unlimitedChallengesTable.status, ["waiting", "starting", "active", "settling"]),
         ),
       ),
   ]);

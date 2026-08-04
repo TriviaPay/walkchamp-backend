@@ -8,7 +8,7 @@ import {
 } from "../../db/src/schema/unlimitedChallenge.js";
 import { creditCashChallengePrizes, creditEntryRefunds } from "./cashChallengePayments.js";
 import { computeEqualSplit } from "./unlimitedChallengeMoney.js";
-import { triggerEvent } from "./pusher.js";
+import { emitUnlimitedRealtime } from "./unlimitedRealtime.js";
 import { sendNotification } from "../routes/notifications.js";
 import { writeAuditLog } from "./auditLog.js";
 import { logger } from "./logger.js";
@@ -105,7 +105,15 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
         metadata: { prizePoolCents: pre.prizePoolCents, policy, refundedUsers: refundUserIds.size },
       });
       logger.warn({ challengeId, policy, refundedUsers: refundUserIds.size, prizePoolCents: pre.prizePoolCents }, "[Unlimited] zero winners — entry contributions refunded");
-      void triggerEvent(`unlimited-challenge-${challengeId}`, "challenge_completed", { challengeId, winners: 0, settlementStatus: "refunded" });
+      emitUnlimitedRealtime(
+        challengeId,
+        "challenge_completed",
+        { challengeId, winners: 0, settlementStatus: "refunded" },
+        {
+          event: "race:completed",
+          payload: { raceId: challengeId, challengeType: "unlimited_goal", winners: 0 },
+        },
+      );
       return;
     }
 
@@ -127,7 +135,15 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
       metadata: { prizePoolCents: pre.prizePoolCents, policy },
     });
     logger.warn({ challengeId, policy, prizePoolCents: pre.prizePoolCents }, "[Unlimited] zero winners — held for manual handling (no auto-credit)");
-    void triggerEvent(`unlimited-challenge-${challengeId}`, "challenge_completed", { challengeId, winners: 0, settlementStatus: policy });
+    emitUnlimitedRealtime(
+      challengeId,
+      "challenge_completed",
+      { challengeId, winners: 0, settlementStatus: policy },
+      {
+        event: "race:completed",
+        payload: { raceId: challengeId, challengeType: "unlimited_goal", winners: 0 },
+      },
+    );
     return;
   }
 
@@ -160,7 +176,15 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
   });
 
   logger.info({ challengeId, winners: qualified.length, prizePoolCents: pre.prizePoolCents }, "[Unlimited] settled — equal split credited");
-  void triggerEvent(`unlimited-challenge-${challengeId}`, "challenge_completed", { challengeId, winners: qualified.length });
+  emitUnlimitedRealtime(
+    challengeId,
+    "challenge_completed",
+    { challengeId, winners: qualified.length },
+    {
+      event: "race:completed",
+      payload: { raceId: challengeId, challengeType: "unlimited_goal", winners: qualified.length },
+    },
+  );
   for (const a of allocations) {
     const uid = userIdByParticipant.get(a.participantId)!;
     void sendNotification(uid, "race_won", "You won!", `You qualified and won $${(a.payoutCents / 100).toFixed(2)}.`, {

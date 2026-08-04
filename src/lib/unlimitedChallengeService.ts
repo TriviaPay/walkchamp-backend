@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { profilesTable } from "../../db/src/schema/profiles.js";
 import { userPreferencesTable } from "../../db/src/schema/userPreferences.js";
@@ -8,6 +8,7 @@ import {
   type UnlimitedChallenge,
 } from "../../db/src/schema/unlimitedChallenge.js";
 import { debitWalletForCashChallenge, createRefundForRaceParticipantTx } from "./refundService.js";
+import { creditEntryRefunds } from "./cashChallengePayments.js";
 import { computeIsAdult } from "./dateOfBirth.js";
 import { isCashChallengeUnsupportedForCountry } from "./cashChallengeFees.js";
 import { generateInviteCode } from "./inviteCodes.js";
@@ -22,9 +23,13 @@ import {
 import { acquireOneChallengeLock, getBlockingMembership } from "./challengeMembership.js";
 import { enqueueJob } from "./queue.js";
 import { triggerEvent } from "./pusher.js";
+import { emitUnlimitedRealtime } from "./unlimitedRealtime.js";
 import { sendNotification } from "../routes/notifications.js";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
+
+/** Non-terminal challenge statuses that still block membership / appear as "open". */
+export const UNLIMITED_OPEN_STATUSES = ["waiting", "starting", "active", "settling"] as const;
 
 export type ServiceResult<T> = { ok: true; data: T } | { ok: false; httpStatus: number; body: Record<string, unknown> };
 
@@ -254,7 +259,26 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
 
   if (!result.ok) return { ok: false, httpStatus: result.httpStatus, body: result.body };
   if (result.fresh) {
-    void triggerEvent(`unlimited-challenge-${challengeId}`, "participant_joined", { challengeId, userId });
+    emitUnlimitedRealtime(
+      challengeId,
+      "participant_joined",
+      { challengeId, userId },
+      {
+        event: "race:player-joined",
+        payload: { raceId: challengeId, userId, room_id: challengeId },
+      },
+    );
+    // Waiting Room also binds room:participant_joined on the live-race + rooms channels.
+    void triggerEvent(`public-live-race-${challengeId}`, "room:participant_joined", {
+      room_id: challengeId,
+      raceId: challengeId,
+      userId,
+    });
+    void triggerEvent("public-rooms-available", "room:participant_joined", {
+      room_id: challengeId,
+      raceId: challengeId,
+      userId,
+    });
   }
   return { ok: true, data: { challengeId } };
 }
@@ -322,7 +346,15 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
   });
 
   if (!result.ok) return { ok: false, httpStatus: result.httpStatus, body: result.body };
-  void triggerEvent(`unlimited-challenge-${challengeId}`, "participant_left", { challengeId, userId });
+  emitUnlimitedRealtime(
+    challengeId,
+    "participant_left",
+    { challengeId, userId },
+    {
+      event: "race:player-left",
+      payload: { raceId: challengeId, userId },
+    },
+  );
   const msg = result.refundIssued
     ? "You left the challenge. Your entry fee has been refunded."
     : "You left the challenge. Entry fees are non-refundable after it starts.";
@@ -331,4 +363,188 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
     dedupeKey: `unlimited_left:${challengeId}:${userId}`,
   }).catch(() => {});
   return { ok: true, data: { challengeId, participantStatus: "left", refundIssued: result.refundIssued, refundAmountCents: result.refundAmountCents } };
+}
+
+/**
+ * Platform cancel for a single Unlimited Challenge: mark cancelled_by_platform, refund entry
+ * contributions for every non-left participant (platform fee kept), release memberships.
+ * Idempotent when already cancelled/completed.
+ *
+ * Refunds use the same wallet credit path as zero-winner settlement (fast, idempotent per user)
+ * so large challenges don't hold a mega refund-item transaction open.
+ */
+export async function cancelUnlimitedChallengeByPlatform(
+  challengeId: string,
+  opts?: { reason?: string; actorUserId?: string | null },
+): Promise<{
+  ok: boolean;
+  challengeId: string;
+  alreadyTerminal?: boolean;
+  refundedUserIds: string[];
+  failedRefundUserIds: string[];
+}> {
+  const reason = opts?.reason?.trim() || "platform_cancelled";
+
+  const [pre] = await db
+    .select()
+    .from(unlimitedChallengesTable)
+    .where(eq(unlimitedChallengesTable.id, challengeId))
+    .limit(1);
+  if (!pre) {
+    return { ok: false, challengeId, refundedUserIds: [], failedRefundUserIds: [] };
+  }
+  if (pre.status === "cancelled_by_platform" || pre.status === "completed") {
+    return {
+      ok: true,
+      challengeId,
+      alreadyTerminal: true,
+      refundedUserIds: [],
+      failedRefundUserIds: [],
+    };
+  }
+
+  const participants = await db
+    .select({
+      userId: unlimitedChallengeParticipantsTable.userId,
+      status: unlimitedChallengeParticipantsTable.qualificationStatus,
+      entryContributionCents: unlimitedChallengeParticipantsTable.entryContributionCents,
+    })
+    .from(unlimitedChallengeParticipantsTable)
+    .where(eq(unlimitedChallengeParticipantsTable.challengeId, challengeId));
+
+  const refundTargets = participants.filter((p) => p.status !== "left");
+  const refundedUserIds: string[] = [];
+  const failedRefundUserIds: string[] = [];
+  const now = new Date();
+
+  // 1) Claim terminal status + release memberships (short transaction).
+  const [claimed] = await db
+    .update(unlimitedChallengesTable)
+    .set({
+      status: "cancelled_by_platform",
+      settlementStatus: "refunded",
+      prizePoolCents: 0,
+      paidParticipantCount: 0,
+      settledAt: now,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(unlimitedChallengesTable.id, challengeId),
+        inArray(unlimitedChallengesTable.status, [...UNLIMITED_OPEN_STATUSES]),
+      ),
+    )
+    .returning({ id: unlimitedChallengesTable.id });
+
+  if (!claimed) {
+    return {
+      ok: true,
+      challengeId,
+      alreadyTerminal: true,
+      refundedUserIds: [],
+      failedRefundUserIds: [],
+    };
+  }
+
+  if (refundTargets.length > 0) {
+    await db
+      .update(unlimitedChallengeParticipantsTable)
+      .set({
+        qualificationStatus: "left",
+        leftAt: now,
+        disqualificationReason: reason,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
+          ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+        ),
+      );
+
+    // 2) Wallet refunds in a dedicated transaction (idempotent keys).
+    try {
+      await db.transaction(async (tx) => {
+        await creditEntryRefunds(tx, {
+          sourceId: challengeId,
+          refunds: refundTargets.map((p) => ({
+            userId: p.userId,
+            amountCents: p.entryContributionCents,
+          })),
+        });
+      });
+      refundedUserIds.push(...refundTargets.map((p) => p.userId));
+    } catch (err) {
+      failedRefundUserIds.push(...refundTargets.map((p) => p.userId));
+      logger.error({ err, challengeId }, "[Unlimited] platform cancel bulk refund failed");
+    }
+  }
+
+  emitUnlimitedRealtime(
+    challengeId,
+    "challenge_cancelled",
+    { challengeId, reason },
+    {
+      event: "race:cancelled",
+      payload: { raceId: challengeId, reason, challengeType: "unlimited_goal" },
+    },
+  );
+
+  for (const userId of refundTargets.map((p) => p.userId)) {
+    void sendNotification(
+      userId,
+      "race_cancelled",
+      "Challenge cancelled",
+      "This Unlimited Challenge was cancelled by the platform. Your entry fee has been refunded.",
+      {
+        challengeId,
+        dedupeKey: `unlimited_platform_cancel_notify:${challengeId}:${userId}`,
+      },
+    ).catch(() => {});
+  }
+
+  logger.info(
+    {
+      challengeId,
+      reason,
+      actorUserId: opts?.actorUserId ?? null,
+      refunded: refundedUserIds.length,
+      failed: failedRefundUserIds.length,
+    },
+    "[Unlimited] platform cancelled challenge",
+  );
+
+  return { ok: true, challengeId, refundedUserIds, failedRefundUserIds };
+}
+
+/** Cancel every open Unlimited Challenge (waiting/starting/active/settling) with refunds. */
+export async function cancelAllOpenUnlimitedChallenges(opts?: {
+  reason?: string;
+  actorUserId?: string | null;
+}): Promise<{
+  cancelled: number;
+  skippedTerminal: number;
+  results: Array<Awaited<ReturnType<typeof cancelUnlimitedChallengeByPlatform>>>;
+}> {
+  const open = await db
+    .select({ id: unlimitedChallengesTable.id })
+    .from(unlimitedChallengesTable)
+    .where(inArray(unlimitedChallengesTable.status, [...UNLIMITED_OPEN_STATUSES]));
+
+  const results: Array<Awaited<ReturnType<typeof cancelUnlimitedChallengeByPlatform>>> = [];
+  let cancelled = 0;
+  let skippedTerminal = 0;
+
+  for (const row of open) {
+    const result = await cancelUnlimitedChallengeByPlatform(row.id, opts);
+    results.push(result);
+    if (result.alreadyTerminal) skippedTerminal += 1;
+    else if (result.ok) cancelled += 1;
+  }
+
+  logger.info(
+    { cancelled, skippedTerminal, scanned: open.length },
+    "[Unlimited] cancel-all open challenges finished",
+  );
+  return { cancelled, skippedTerminal, results };
 }
