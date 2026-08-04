@@ -245,39 +245,49 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
       platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS,
       paymentReference: `unlimited_entry:${challengeId}:${userId}`,
     });
+    const nextCount = challenge.paidParticipantCount + 1;
     await tx
       .update(unlimitedChallengesTable)
       .set({
         prizePoolCents: sql`${unlimitedChallengesTable.prizePoolCents} + ${challenge.entryFeeCents}`,
-        paidParticipantCount: sql`${unlimitedChallengesTable.paidParticipantCount} + 1`,
+        paidParticipantCount: nextCount,
         updatedAt: new Date(),
       })
       .where(eq(unlimitedChallengesTable.id, challengeId));
 
-    return { ok: true as const, fresh: true };
+    return { ok: true as const, fresh: true, participantCount: nextCount };
   });
 
   if (!result.ok) return { ok: false, httpStatus: result.httpStatus, body: result.body };
   if (result.fresh) {
+    const count = result.participantCount;
+    const joinPayload = {
+      challengeId,
+      userId,
+      room_id: challengeId,
+      raceId: challengeId,
+      current_players: count,
+      registered_count: count,
+      participantCount: count,
+    };
     emitUnlimitedRealtime(
       challengeId,
       "participant_joined",
-      { challengeId, userId },
+      joinPayload,
       {
         event: "race:player-joined",
-        payload: { raceId: challengeId, userId, room_id: challengeId },
+        payload: joinPayload,
       },
     );
-    // Waiting Room also binds room:participant_joined on the live-race + rooms channels.
-    void triggerEvent(`public-live-race-${challengeId}`, "room:participant_joined", {
+    // Waiting Room + Available bind room:participant_joined on live-race + rooms channels.
+    void triggerEvent(`public-live-race-${challengeId}`, "room:participant_joined", joinPayload);
+    void triggerEvent("public-rooms-available", "room:participant_joined", joinPayload);
+    // Upcoming cards listen for room:registered — keep Unlimited join counts in sync.
+    void triggerEvent("public-rooms-available", "room:registered", {
       room_id: challengeId,
       raceId: challengeId,
-      userId,
-    });
-    void triggerEvent("public-rooms-available", "room:participant_joined", {
-      room_id: challengeId,
-      raceId: challengeId,
-      userId,
+      registered_count: count,
+      current_players: count,
     });
   }
   return { ok: true, data: { challengeId } };
@@ -321,7 +331,12 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
 
     if (!preStart) {
       // Post-start: contribution stays in the pool (no refund); pool/count unchanged.
-      return { ok: true as const, refundIssued: false, refundAmountCents: 0 };
+      return {
+        ok: true as const,
+        refundIssued: false,
+        refundAmountCents: 0,
+        participantCount: challenge.paidParticipantCount,
+      };
     }
 
     // Pre-start refund: refund the entry fee per policy (refundableAmountCents), remove the user's
@@ -334,27 +349,60 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
       idempotencyKey: `unlimited_leave:${challengeId}:${userId}`,
       sourceType: "unlimited_challenge",
     });
+    const nextCount = Math.max(challenge.paidParticipantCount - 1, 0);
     await tx
       .update(unlimitedChallengesTable)
       .set({
         prizePoolCents: sql`GREATEST(${unlimitedChallengesTable.prizePoolCents} - ${participant.entryContributionCents}, 0)`,
-        paidParticipantCount: sql`GREATEST(${unlimitedChallengesTable.paidParticipantCount} - 1, 0)`,
+        paidParticipantCount: nextCount,
         updatedAt: now,
       })
       .where(eq(unlimitedChallengesTable.id, challengeId));
-    return { ok: true as const, refundIssued: true, refundAmountCents: participant.entryContributionCents };
+    return {
+      ok: true as const,
+      refundIssued: true,
+      refundAmountCents: participant.entryContributionCents,
+      participantCount: nextCount,
+    };
   });
 
   if (!result.ok) return { ok: false, httpStatus: result.httpStatus, body: result.body };
+  const leaveCount =
+    "participantCount" in result && typeof result.participantCount === "number"
+      ? result.participantCount
+      : undefined;
+  const leavePayload = {
+    challengeId,
+    userId,
+    room_id: challengeId,
+    raceId: challengeId,
+    ...(leaveCount != null
+      ? {
+          current_players: leaveCount,
+          registered_count: leaveCount,
+          participantCount: leaveCount,
+        }
+      : {}),
+  };
   emitUnlimitedRealtime(
     challengeId,
     "participant_left",
-    { challengeId, userId },
+    leavePayload,
     {
       event: "race:player-left",
-      payload: { raceId: challengeId, userId },
+      payload: leavePayload,
     },
   );
+  void triggerEvent(`public-live-race-${challengeId}`, "room:participant_left", leavePayload);
+  void triggerEvent("public-rooms-available", "room:participant_left", leavePayload);
+  if (leaveCount != null) {
+    void triggerEvent("public-rooms-available", "room:registration_cancelled", {
+      room_id: challengeId,
+      raceId: challengeId,
+      registered_count: leaveCount,
+      current_players: leaveCount,
+    });
+  }
   const msg = result.refundIssued
     ? "You left the challenge. Your entry fee has been refunded."
     : "You left the challenge. Entry fees are non-refundable after it starts.";

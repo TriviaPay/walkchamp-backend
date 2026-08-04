@@ -275,6 +275,28 @@ router.get("/unlimited-challenges/live", requireAuth, async (req, res) => {
   return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
 });
 
+// ── GET /unlimited-challenges/recently-finished (Live tab Recently Finished) ───
+router.get("/unlimited-challenges/recently-finished", requireAuth, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 50);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const rows = await db
+    .select()
+    .from(unlimitedChallengesTable)
+    .where(
+      and(
+        eq(unlimitedChallengesTable.visibility, "public"),
+        inArray(unlimitedChallengesTable.status, ["completed", "cancelled_by_platform"]),
+      ),
+    )
+    .orderBy(desc(unlimitedChallengesTable.challengeEndAtUtc))
+    .limit(limit)
+    .offset(offset);
+
+  const challenges = await overlayMembership(rows, userId);
+  return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
+});
+
 // ── GET /unlimited-challenges/my-active (membership-scoped open challenges) ───
 router.get("/unlimited-challenges/my-active", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
@@ -315,9 +337,17 @@ router.get("/unlimited-challenges", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const statusRaw = typeof req.query.status === "string" ? req.query.status.trim().toLowerCase() : "";
   const liveStatuses = statusRaw === "active" || statusRaw === "live" || statusRaw === "in_progress";
+  const finishedStatuses =
+    statusRaw === "completed" ||
+    statusRaw === "finished" ||
+    statusRaw === "ended" ||
+    statusRaw === "cancelled" ||
+    statusRaw === "canceled";
   const statusFilter = liveStatuses
     ? inArray(unlimitedChallengesTable.status, ["starting", "active", "settling"])
-    : eq(unlimitedChallengesTable.status, "waiting");
+    : finishedStatuses
+      ? inArray(unlimitedChallengesTable.status, ["completed", "cancelled_by_platform"])
+      : eq(unlimitedChallengesTable.status, "waiting");
 
   const rows = await db
     .select()
