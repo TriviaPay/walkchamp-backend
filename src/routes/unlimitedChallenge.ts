@@ -47,11 +47,13 @@ function serializeChallenge(c: typeof unlimitedChallengesTable.$inferSelect) {
   return {
     id: c.id,
     challengeType: "unlimited_goal",
+    entryType: "unlimited_goal",
     hostUserId: c.hostUserId,
     title: c.title,
     visibility: c.visibility,
     capacityMode: "unlimited",
     maxParticipants: null,
+    maxPlayers: null,
     status: c.status,
     entryFeeCents: c.entryFeeCents,
     platformFeeCents: c.platformFeeCents,
