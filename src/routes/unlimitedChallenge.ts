@@ -1,9 +1,8 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
-import { and, asc, desc, eq, gt, inArray, lte, ne, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, lte, ne, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { profilesTable } from "../../db/src/schema/profiles.js";
-import { stepDailyTotalsTable } from "../../db/src/schema/steps.js";
 import {
   unlimitedChallengesTable,
   unlimitedChallengeParticipantsTable,
@@ -18,6 +17,18 @@ import {
   leaveUnlimitedChallenge,
   UNLIMITED_OPEN_STATUSES,
 } from "../lib/unlimitedChallengeService.js";
+import {
+  loadActiveDayProgressByChallenge,
+  loadChallengePlayers,
+} from "../lib/unlimitedLiveProgress.js";
+import {
+  applyUnlimitedProvisionalLive,
+  displayedFromLanes,
+  progressSourceFromLanes,
+} from "../lib/unlimitedProvisionalLive.js";
+import { emitUnlimitedRealtime } from "../lib/unlimitedRealtime.js";
+import { isProvisionalLiveSource, normalizeSource } from "../lib/stepSources.js";
+import { stepDailyTotalsTable } from "../../db/src/schema/steps.js";
 
 const router: Router = Router();
 
@@ -101,113 +112,6 @@ async function overlayMembership(
       ...serializeChallenge(c),
       participationStatus: status,
       currentUserRegistered: status != null && status !== "left",
-    };
-  });
-}
-
-async function loadChallengePlayers(challengeId: string, currentUserId: string, hostUserId: string) {
-  const rows = await db
-    .select({
-      participantId: unlimitedChallengeParticipantsTable.id,
-      userId: unlimitedChallengeParticipantsTable.userId,
-      qualificationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
-      joinedAt: unlimitedChallengeParticipantsTable.joinedAt,
-      username: profilesTable.username,
-      fullName: profilesTable.fullName,
-      country: profilesTable.country,
-      countryFlag: profilesTable.countryFlag,
-      avatarColor: profilesTable.avatarColor,
-      avatarUrl: profilesTable.avatarUrl,
-      updatedAt: profilesTable.updatedAt,
-    })
-    .from(unlimitedChallengeParticipantsTable)
-    .leftJoin(profilesTable, eq(profilesTable.id, unlimitedChallengeParticipantsTable.userId))
-    .where(and(eq(unlimitedChallengeParticipantsTable.challengeId, challengeId), ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left")))
-    .orderBy(
-      sql`(${unlimitedChallengeParticipantsTable.userId} = ${hostUserId}) desc`,
-      asc(unlimitedChallengeParticipantsTable.joinedAt),
-      asc(unlimitedChallengeParticipantsTable.id),
-    );
-
-  const now = new Date();
-
-  // Per-participant finalized aggregates: completed (passed) days + verified step sum across all days.
-  const dayAgg = await db
-    .select({
-      participantId: unlimitedChallengeDaysTable.participantId,
-      completedDays: sql<number>`count(*) filter (where ${unlimitedChallengeDaysTable.status} = 'passed')::int`,
-      finalizedSteps: sql<number>`coalesce(sum(${unlimitedChallengeDaysTable.verifiedSteps}), 0)::int`,
-    })
-    .from(unlimitedChallengeDaysTable)
-    .where(eq(unlimitedChallengeDaysTable.challengeId, challengeId))
-    .groupBy(unlimitedChallengeDaysTable.participantId);
-  const aggByParticipant = new Map(dayAgg.map((d) => [d.participantId, d]));
-
-  // The day whose window currently contains `now` gives each participant's live local date. Its
-  // verifiedSteps stays 0 until finalized, so today's steps come from step_daily_totals (the same
-  // source finalizeUnlimitedDays reads), keeping the live number consistent with settlement.
-  const currentDays = await db
-    .select({
-      participantId: unlimitedChallengeDaysTable.participantId,
-      userId: unlimitedChallengeDaysTable.userId,
-      localDate: unlimitedChallengeDaysTable.localDate,
-    })
-    .from(unlimitedChallengeDaysTable)
-    .where(
-      and(
-        eq(unlimitedChallengeDaysTable.challengeId, challengeId),
-        lte(unlimitedChallengeDaysTable.windowStartUtc, now),
-        gt(unlimitedChallengeDaysTable.windowEndUtc, now),
-      ),
-    );
-  const currentDayByParticipant = new Map(currentDays.map((d) => [d.participantId, d]));
-
-  const liveByUserDate = new Map<string, number>();
-  if (currentDays.length) {
-    const stepRows = await db
-      .select({ userId: stepDailyTotalsTable.userId, date: stepDailyTotalsTable.date, steps: stepDailyTotalsTable.steps })
-      .from(stepDailyTotalsTable)
-      .where(
-        and(
-          inArray(stepDailyTotalsTable.userId, currentDays.map((d) => d.userId)),
-          inArray(stepDailyTotalsTable.date, currentDays.map((d) => d.localDate)),
-        ),
-      );
-    for (const s of stepRows) liveByUserDate.set(`${s.userId}|${s.date}`, s.steps);
-  }
-
-  return rows.map((p, i) => {
-    const agg = aggByParticipant.get(p.participantId);
-    const cur = currentDayByParticipant.get(p.participantId);
-    const todaySteps = cur ? liveByUserDate.get(`${cur.userId}|${cur.localDate}`) ?? 0 : 0;
-    const finalizedSteps = agg?.finalizedSteps ?? 0;
-    const displayName =
-      p.fullName || p.username || (p.userId === currentUserId ? "You" : `Player ${i + 1}`);
-    return {
-      id: p.participantId,
-      participantId: p.participantId,
-      userId: p.userId,
-      username: p.username ?? displayName,
-      fullName: p.fullName,
-      displayName,
-      country: p.country ?? null,
-      countryFlag: p.countryFlag ?? null,
-      avatarColor: p.avatarColor ?? null,
-      avatarUrl: p.avatarUrl ?? null,
-      avatarVersion: p.updatedAt?.getTime() ?? 0,
-      qualificationStatus: p.qualificationStatus,
-      status: p.qualificationStatus,
-      joinedAt: p.joinedAt,
-      rank: i + 1,
-      isHost: p.userId === hostUserId,
-      isCurrentUser: p.userId === currentUserId,
-      friendStatus: "none",
-      friendRequestId: null,
-      activeTitle: null,
-      // Live today's steps (from step_daily_totals); verified finalized days plus today's live for the total.
-      currentSteps: todaySteps,
-      completedDays: agg?.completedDays ?? 0,
-      totalChallengeSteps: finalizedSteps + todaySteps,
     };
   });
 }
@@ -380,20 +284,204 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
 
   const canJoin = !membership && challenge.status === "waiting" && Date.now() < challenge.startAtUtc.getTime();
   const players = await loadChallengePlayers(challengeId, userId, challenge.hostUserId);
+  const challengeDayKey =
+    players.find((p) => p.userId === userId)?.challengeDayKey ??
+    players.find((p) => p.challengeDayKey)?.challengeDayKey ??
+    null;
   return res.json({
-    challenge: serializeChallenge(challenge),
+    challenge: {
+      ...serializeChallenge(challenge),
+      challengeDayKey,
+    },
     membership: membership ? { status: membership.status } : null,
     currentUserRegistered: !!membership && membership.status !== "left",
     canJoin,
+    challengeDayKey,
     players,
     participants: players,
+  });
+});
+
+// ── POST /unlimited-challenges/:id/live-progress (provisional sensor only) ─────
+// Redis live state only. Never writes step_daily_totals / qualification / prizes.
+const provisionalLiveSchema = z.object({
+  challengeDayKey: z.string().min(1).max(32),
+  timezone: z.string().min(1).max(64).optional(),
+  provisionalCumulativeSteps: z.number().int().min(0).max(200000),
+  source: z.string().max(50),
+  measuredAtUtc: z.string().min(1).max(64).optional(),
+  sessionId: z.string().min(1).max(128),
+  sequence: z.number().int().min(0).max(1_000_000_000),
+});
+
+router.post("/unlimited-challenges/:id/live-progress", requireAuth, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const challengeId = String(req.params.id);
+  const parsed = provisionalLiveSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid provisional progress", details: parsed.error.issues });
+  }
+
+  const source = normalizeSource(parsed.data.source);
+  if (!isProvisionalLiveSource(source)) {
+    return res.status(400).json({
+      error: "Only provisional sensor sources are accepted on this endpoint.",
+      code: "INVALID_PROVISIONAL_SOURCE",
+      accepted: false,
+    });
+  }
+
+  const [challenge] = await db
+    .select()
+    .from(unlimitedChallengesTable)
+    .where(eq(unlimitedChallengesTable.id, challengeId))
+    .limit(1);
+  if (!challenge) return res.status(404).json({ error: "Challenge not found." });
+  if (challenge.status !== "active") {
+    return res.status(409).json({
+      error: "Challenge is not active.",
+      code: "CHALLENGE_NOT_ACTIVE",
+      accepted: false,
+    });
+  }
+
+  const [membership] = await db
+    .select({
+      participantId: unlimitedChallengeParticipantsTable.id,
+      status: unlimitedChallengeParticipantsTable.qualificationStatus,
+    })
+    .from(unlimitedChallengeParticipantsTable)
+    .where(
+      and(
+        eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
+        eq(unlimitedChallengeParticipantsTable.userId, userId),
+      ),
+    )
+    .limit(1);
+  if (!membership || membership.status === "left" || membership.status === "disqualified") {
+    return res.status(403).json({ error: "Not an active participant.", accepted: false });
+  }
+
+  const now = new Date();
+  const [dayRow] = await db
+    .select({
+      localDate: unlimitedChallengeDaysTable.localDate,
+      dayNumber: unlimitedChallengeDaysTable.dayNumber,
+      goalSteps: unlimitedChallengeDaysTable.goalSteps,
+      timezone: unlimitedChallengeDaysTable.timezone,
+      status: unlimitedChallengeDaysTable.status,
+    })
+    .from(unlimitedChallengeDaysTable)
+    .where(
+      and(
+        eq(unlimitedChallengeDaysTable.challengeId, challengeId),
+        eq(unlimitedChallengeDaysTable.participantId, membership.participantId),
+        lte(unlimitedChallengeDaysTable.windowStartUtc, now),
+        gt(unlimitedChallengeDaysTable.windowEndUtc, now),
+      ),
+    )
+    .limit(1);
+
+  if (!dayRow) {
+    return res.status(409).json({
+      error: "No active challenge day window.",
+      code: "NO_ACTIVE_DAY",
+      accepted: false,
+    });
+  }
+  if (parsed.data.challengeDayKey !== dayRow.localDate) {
+    return res.status(409).json({
+      error: "Challenge day mismatch.",
+      code: "WRONG_CHALLENGE_DAY",
+      accepted: false,
+      expectedChallengeDayKey: dayRow.localDate,
+    });
+  }
+
+  const applied = await applyUnlimitedProvisionalLive({
+    challengeId,
+    userId,
+    challengeDayKey: dayRow.localDate,
+    provisionalCumulativeSteps: parsed.data.provisionalCumulativeSteps,
+    source: source!,
+    measuredAtUtc: parsed.data.measuredAtUtc ?? now.toISOString(),
+    sessionId: parsed.data.sessionId,
+    sequence: parsed.data.sequence,
+  });
+
+  if (!applied.accepted) {
+    return res.status(409).json({
+      accepted: false,
+      reason: applied.reason,
+      provisionalTodaySteps: applied.state?.provisionalSteps ?? 0,
+    });
+  }
+
+  // Verified lane from step_daily_totals — never updated by this endpoint.
+  const [verifiedRow] = await db
+    .select({ steps: stepDailyTotalsTable.steps })
+    .from(stepDailyTotalsTable)
+    .where(
+      and(
+        eq(stepDailyTotalsTable.userId, userId),
+        eq(stepDailyTotalsTable.date, dayRow.localDate),
+      ),
+    )
+    .limit(1);
+  const verifiedTodaySteps = verifiedRow?.steps ?? 0;
+  const provisionalTodaySteps = applied.state.provisionalSteps;
+  const displayedLiveSteps = displayedFromLanes(verifiedTodaySteps, provisionalTodaySteps);
+  const progressSource = progressSourceFromLanes(verifiedTodaySteps, provisionalTodaySteps);
+  const timezone = parsed.data.timezone || dayRow.timezone || challenge.challengeTimezone;
+  const updatedAt = now.toISOString();
+
+  const payload = {
+    challengeId,
+    userId,
+    participantId: membership.participantId,
+    challengeDayKey: dayRow.localDate,
+    localDate: dayRow.localDate,
+    timezone,
+    dayNumber: dayRow.dayNumber,
+    goalSteps: dayRow.goalSteps,
+    dailyGoalSteps: dayRow.goalSteps,
+    verifiedTodaySteps,
+    provisionalTodaySteps,
+    displayedLiveSteps,
+    currentSteps: displayedLiveSteps,
+    todaySteps: displayedLiveSteps,
+    steps: displayedLiveSteps,
+    progressSource,
+    verificationStatus:
+      provisionalTodaySteps > verifiedTodaySteps
+        ? "verification_delayed"
+        : verifiedTodaySteps > 0
+          ? "verified"
+          : "syncing",
+    // Never claim goalReached from provisional alone.
+    goalReached: verifiedTodaySteps >= dayRow.goalSteps,
+    updatedAt,
+  };
+
+  if (!applied.unchanged) {
+    emitUnlimitedRealtime(challengeId, "progress_updated", payload, {
+      event: "race:progress_updated",
+      payload: { raceId: challengeId, ...payload },
+    });
+  }
+
+  return res.json({
+    accepted: true,
+    unchanged: applied.unchanged,
+    ...payload,
   });
 });
 
 // ── GET /unlimited-challenges/:id/leaderboard (paginated, informational) ──────
 router.get("/unlimited-challenges/:id/leaderboard", requireAuth, async (req, res) => {
   const challengeId = String(req.params.id);
-  const limit = Math.min(Math.max(Number(req.query.limit) || 25, 1), 100);
+  // Live Board may paginate the full roster (100+/page). Cap keeps abuse bounded.
+  const limit = Math.min(Math.max(Number(req.query.limit) || 25, 1), 500);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
 
   // Bounded, paginated. Ranking is informational only (never affects payout): eligible first,
@@ -403,6 +491,7 @@ router.get("/unlimited-challenges/:id/leaderboard", requireAuth, async (req, res
       participantId: unlimitedChallengeParticipantsTable.id,
       userId: unlimitedChallengeParticipantsTable.userId,
       username: profilesTable.username,
+      fullName: profilesTable.fullName,
       qualificationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
       completedDays: sql<number>`count(*) filter (where ${unlimitedChallengeDaysTable.status} = 'passed')::int`,
       totalSteps: sql<number>`coalesce(sum(${unlimitedChallengeDaysTable.verifiedSteps}), 0)::int`,
@@ -411,7 +500,13 @@ router.get("/unlimited-challenges/:id/leaderboard", requireAuth, async (req, res
     .leftJoin(unlimitedChallengeDaysTable, eq(unlimitedChallengeDaysTable.participantId, unlimitedChallengeParticipantsTable.id))
     .leftJoin(profilesTable, eq(profilesTable.id, unlimitedChallengeParticipantsTable.userId))
     .where(and(eq(unlimitedChallengeParticipantsTable.challengeId, challengeId), ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left")))
-    .groupBy(unlimitedChallengeParticipantsTable.id, unlimitedChallengeParticipantsTable.userId, profilesTable.username, unlimitedChallengeParticipantsTable.qualificationStatus)
+    .groupBy(
+      unlimitedChallengeParticipantsTable.id,
+      unlimitedChallengeParticipantsTable.userId,
+      profilesTable.username,
+      profilesTable.fullName,
+      unlimitedChallengeParticipantsTable.qualificationStatus,
+    )
     .orderBy(
       sql`(${unlimitedChallengeParticipantsTable.qualificationStatus} = 'disqualified')`,
       sql`count(*) filter (where ${unlimitedChallengeDaysTable.status} = 'passed') desc`,
@@ -421,17 +516,41 @@ router.get("/unlimited-challenges/:id/leaderboard", requireAuth, async (req, res
     .limit(limit)
     .offset(offset);
 
+  // currentSteps = active challenge-day display (verified + provisional overlay).
+  // totalChallengeSteps stays finalized + verified today only.
+  const activeByParticipant = await loadActiveDayProgressByChallenge(challengeId);
   return res.json({
-    leaderboard: rows.map((r, i) => ({
-      rank: offset + i + 1,
-      participantId: r.participantId,
-      userId: r.userId,
-      displayName: r.username ?? `Player ${offset + i + 1}`,
-      qualificationStatus: r.qualificationStatus,
-      completedDays: r.completedDays,
-      totalChallengeSteps: r.totalSteps,
-      currentSteps: r.totalSteps,
-    })),
+    leaderboard: rows.map((r, i) => {
+      const live = activeByParticipant.get(r.participantId);
+      const verifiedToday = live?.verifiedTodaySteps ?? 0;
+      const provisionalToday = live?.provisionalTodaySteps ?? 0;
+      const currentSteps = live?.currentSteps ?? verifiedToday;
+      const displayName =
+        (r.fullName && r.fullName.trim()) ||
+        r.username ||
+        `Player ${offset + i + 1}`;
+      return {
+        rank: offset + i + 1,
+        participantId: r.participantId,
+        userId: r.userId,
+        username: r.username ?? displayName,
+        fullName: r.fullName ?? null,
+        displayName,
+        qualificationStatus: r.qualificationStatus,
+        completedDays: r.completedDays,
+        totalChallengeSteps: r.totalSteps + verifiedToday,
+        currentSteps,
+        verifiedTodaySteps: verifiedToday,
+        provisionalTodaySteps: provisionalToday,
+        displayedLiveSteps: currentSteps,
+        progressSource: live?.progressSource ?? "unavailable",
+        challengeDayKey: live?.challengeDayKey ?? null,
+        localDate: live?.localDate ?? null,
+        timezone: live?.timezone ?? null,
+        dayNumber: live?.dayNumber ?? null,
+        dailyGoalSteps: live?.goalSteps ?? null,
+      };
+    }),
     pagination: { limit, offset, count: rows.length },
   });
 });

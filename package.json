@@ -29,7 +29,8 @@
     "check:sponsored-races": "tsx ./scripts/src/checkSponsoredRaces.ts",
     "create:evening-events": "tsx ./scripts/src/createEveningEvents.ts",
     "seed:test-titles": "tsx ./scripts/src/seedTestTitles.ts",
-    "apply-db-indexes": "tsx ./scripts/src/apply-db-indexes.ts"
+    "apply-db-indexes": "tsx ./scripts/src/apply-db-indexes.ts",
+    "apply-step-device-totals-table": "tsx ./scripts/src/apply-step-device-totals-table.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1053.0",

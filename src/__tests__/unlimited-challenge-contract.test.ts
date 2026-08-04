@@ -147,10 +147,11 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
     expect(router).toContain(".limit(limit)");
   });
   it("detail response includes all non-left players for waiting room rendering", () => {
-    expect(router).toContain("async function loadChallengePlayers");
+    expect(router).toContain("loadChallengePlayers");
     expect(router).toContain("players,");
     expect(router).toContain("participants: players");
-    expect(router).toContain("isCurrentUser: p.userId === currentUserId");
+    const liveProgress = readFileSync("src/lib/unlimitedLiveProgress.ts", "utf8");
+    expect(liveProgress).toContain("isCurrentUser: p.userId === currentUserId");
   });
 });
 
@@ -193,24 +194,28 @@ describe("viewer membership on read paths (Next Race must not infer 'mine' from 
 
 describe("live step progress on unlimited challenges (no more hardcoded 0)", () => {
   it("detail players list computes live currentSteps from step_daily_totals, not a constant", () => {
-    // the old hardcoded zeros are gone
-    expect(router).not.toContain("currentSteps: 0,");
-    expect(router).toContain("currentSteps: todaySteps");
-    expect(router).toContain("totalChallengeSteps: finalizedSteps + todaySteps");
-    // live steps read from the same source finalizeUnlimitedDays uses
-    expect(router).toContain("from(stepDailyTotalsTable)");
-    // current day = the window that currently contains now
-    expect(router).toContain("lte(unlimitedChallengeDaysTable.windowStartUtc, now)");
-    expect(router).toContain("gt(unlimitedChallengeDaysTable.windowEndUtc, now)");
+    const liveProgress = readFileSync("src/lib/unlimitedLiveProgress.ts", "utf8");
+    // shared helper owns the query — router must call it
+    expect(router).toContain("loadChallengePlayers");
+    expect(liveProgress).toContain("currentSteps: todaySteps");
+    expect(liveProgress).toContain("totalChallengeSteps: finalizedSteps + todaySteps");
+    expect(liveProgress).toContain("from(stepDailyTotalsTable)");
+    expect(liveProgress).toContain("lte(unlimitedChallengeDaysTable.windowStartUtc, now)");
+    expect(liveProgress).toContain("gt(unlimitedChallengeDaysTable.windowEndUtc, now)");
+  });
+  it("leaderboard currentSteps is active-day progress, not multi-day total", () => {
+    expect(router).toContain("loadActiveDayProgressByChallenge");
+    expect(router).not.toContain("currentSteps: r.totalSteps");
+    expect(router).toContain("currentSteps,");
+    expect(router).toContain("challengeDayKey: live?.challengeDayKey");
   });
   it("step ingestion broadcasts progress_updated on the unlimited-challenge channel", () => {
-    expect(walk).toContain('emitUnlimitedRealtime(');
+    expect(walk).toContain("emitUnlimitedRealtime");
     expect(walk).toContain('"progress_updated"');
-    expect(walk).toContain('eq(unlimitedChallengesTable.status, "active")');
-    // reuses today's committed total; fire-and-forget so step sync never fails on it
-    expect(walk).toContain("const todaySteps = updatedForCoins?.steps ?? 0;");
+    expect(walk).toContain("findActiveUnlimitedDaysForUser");
     // Classic Live Detail compatibility mirror
     expect(walk).toContain('event: "race:progress_updated"');
+    expect(walk).toContain("challengeDayKey");
   });
 });
 

@@ -25,6 +25,37 @@ export const stepDailyTotalsTable = pgTable(
   ],
 );
 
+// ── Per-device daily step contribution (same account, multiple physical devices) ──
+// Health Connect/HealthKit totals are device-wide, not account-wide. Each device's
+// absolute daily reading is tracked separately (GREATEST per device, same anti-double-
+// count guarantee as before) and step_daily_totals.steps is the SUM across devices —
+// so a user who genuinely walks with two phones on the same day gets credit for both,
+// while a single device restarting/resyncing never double-counts itself.
+export const stepDailyDeviceTotalsTable = pgTable(
+  "step_daily_device_totals",
+  {
+    id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+    userId: text("user_id").notNull(),
+    date: date("date").notNull(),
+    deviceId: text("device_id").notNull(),
+    steps: integer("steps").notNull().default(0),
+    distanceMeters: integer("distance_meters").notNull().default(0),
+    caloriesBurned: integer("calories_burned").notNull().default(0),
+    activeMinutes: integer("active_minutes").notNull().default(0),
+    sourceClass: text("source_class").notNull().default("unverified"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("step_daily_device_totals_user_date_device_idx").on(
+      t.userId,
+      t.date,
+      t.deviceId,
+    ),
+    index("step_daily_device_totals_user_date_idx").on(t.userId, t.date),
+  ],
+);
+
 // ── Individual walk sessions (start → stop) ───────────────────────────────────
 export const stepSessionsTable = pgTable(
   "step_sessions",

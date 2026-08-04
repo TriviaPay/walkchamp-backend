@@ -1,9 +1,8 @@
 import { Router } from "express";
 import { db } from "../../db/src/index.js";
 import {
-  stepDailyTotalsTable, stepSessionsTable, profilesTable, userPresenceTable, userPreferencesTable,
+  stepDailyTotalsTable, stepDailyDeviceTotalsTable, stepSessionsTable, profilesTable, userPresenceTable, userPreferencesTable,
   walkingGroupMembersTable, walkingGroupDailyStepsTable, walkingGroupsTable,
-  unlimitedChallengeDaysTable, unlimitedChallengesTable,
 } from "../../db/src/schema/index.js";
 import { eq, and, sql, desc, gte, lte, asc, count, inArray } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
@@ -20,6 +19,7 @@ import {
   normalizeSource,
   isVerifiedDailySource,
   isRejectedDailySource,
+  isProvisionalLiveSource,
   classifyDailySource,
 } from "../lib/stepSources.js";
 import { triggerEvent } from "../lib/pusher.js";
@@ -188,9 +188,9 @@ router.get("/walk/today", requireAuth, async (req, res) => {
 // Source handling (§5 verified-daily separation): the raw `source` string is normalized via the
 // central step-source contract. Verified health sources (health_connect/healthkit, plus their
 // legacy aliases ios_healthkit/android_health_connect) mark the session/day as verified.
-// Provisional sensor sources (android_step_counter/ios_pedometer) are ACCEPTED but flagged
-// unverified so a provisional estimate never becomes verified daily state. Clearly-fake sources
-// are safely ignored (200 no-op), never a hard error that would break the client's sync loop.
+// Provisional sensor sources (android_step_counter/ios_pedometer) are IGNORED here — they must
+// use POST /api/unlimited-challenges/:id/live-progress (Unlimited) or classic race progress.
+// Clearly-fake sources are safely ignored (200 no-op), never a hard error that would break sync.
 const submitStepsSchema = z.object({
   steps: z.number().int().min(1).max(200000),
   // Absolute daily total from Health app — used for GREATEST upsert so restarts never double-count.
@@ -220,6 +220,10 @@ function combineDaySourceClass(
 
 router.post("/walk/steps", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
+  // Informational only (never trusted for auth) — lets us attribute today's steps
+  // per physical device so a second device's real walking is additive, not dropped
+  // by a same-account GREATEST comparison against a bigger first device.
+  const deviceId = (req as AuthenticatedRequest).deviceInfo?.deviceId || null;
   const parsed = submitStepsSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: "Invalid step data", details: parsed.error.issues });
@@ -231,13 +235,18 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   // so a mock/random provider can never poison verified daily state, and the client's
   // periodic sync loop is not broken by a 4xx.
   const source = normalizeSource(rawSource);
-  if (isRejectedDailySource(source)) {
+  if (isRejectedDailySource(source) || isProvisionalLiveSource(source)) {
     const [existing] = await db
       .select({ steps: stepDailyTotalsTable.steps })
       .from(stepDailyTotalsTable)
       .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, localDateStr(parsed.data.localDate))))
       .limit(1);
-    return res.json({ submitted: 0, ignored: true, today: { steps: existing?.steps ?? 0 } });
+    return res.json({
+      submitted: 0,
+      ignored: true,
+      reason: isProvisionalLiveSource(source) ? "provisional_not_verified" : "rejected_source",
+      today: { steps: existing?.steps ?? 0 },
+    });
   }
   const sessionVerified = isVerifiedDailySource(source);
   const incomingDayClass = classifyDailySource(source);
@@ -290,11 +299,48 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   // activeMinutes is always absolute (total today) — use GREATEST to only ever move up.
   const activeMinutes = parsed.data.activeMinutes ?? Math.ceil(totalSteps / 120);
 
-  const absoluteMetricsUnchanged = !!prevStepRow
-    && totalSteps <= previousSteps
-    && totalDistMeters <= prevStepRow.distanceMeters
-    && totalCals <= prevStepRow.caloriesBurned
-    && activeMinutes <= prevStepRow.activeMinutes;
+  // Multi-device same-account merge: only kicks in for verified absolute totals
+  // with a known device id. Each device's own reading is tracked separately
+  // (GREATEST per device — a single device restarting/resyncing never double-
+  // counts itself), then the account's daily total is the SUM across devices,
+  // floored by whatever the row already had (never regresses pre-migration data).
+  const useDeviceMerge = usingAbsolute && !!deviceId && sessionVerified;
+
+  // shortUnchanged must compare against THIS device's prior contribution when
+  // multi-device merge is active — otherwise a smaller second-device reading
+  // (e.g. 64) is incorrectly treated as unchanged vs the account sum (e.g. 85).
+  let absoluteMetricsUnchanged = false;
+  if (usingAbsolute && parsed.data.shortUnchanged === true) {
+    if (useDeviceMerge) {
+      const [prevDeviceRow] = await db
+        .select({
+          steps: stepDailyDeviceTotalsTable.steps,
+          distanceMeters: stepDailyDeviceTotalsTable.distanceMeters,
+          caloriesBurned: stepDailyDeviceTotalsTable.caloriesBurned,
+          activeMinutes: stepDailyDeviceTotalsTable.activeMinutes,
+        })
+        .from(stepDailyDeviceTotalsTable)
+        .where(
+          and(
+            eq(stepDailyDeviceTotalsTable.userId, userId),
+            eq(stepDailyDeviceTotalsTable.date, today),
+            eq(stepDailyDeviceTotalsTable.deviceId, deviceId!),
+          ),
+        )
+        .limit(1);
+      absoluteMetricsUnchanged = !!prevDeviceRow
+        && totalSteps <= prevDeviceRow.steps
+        && totalDistMeters <= prevDeviceRow.distanceMeters
+        && totalCals <= prevDeviceRow.caloriesBurned
+        && activeMinutes <= prevDeviceRow.activeMinutes;
+    } else {
+      absoluteMetricsUnchanged = !!prevStepRow
+        && totalSteps <= previousSteps
+        && totalDistMeters <= prevStepRow.distanceMeters
+        && totalCals <= prevStepRow.caloriesBurned
+        && activeMinutes <= prevStepRow.activeMinutes;
+    }
+  }
 
   if (parsed.data.shortUnchanged === true && usingAbsolute && absoluteMetricsUnchanged) {
     return res.json({
@@ -309,6 +355,36 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   const deltaCals = parsed.data.caloriesBurned ?? Math.round(steps * 0.04);
 
   await db.transaction(async (tx) => {
+    if (useDeviceMerge) {
+      await tx
+        .insert(stepDailyDeviceTotalsTable)
+        .values({
+          userId,
+          date: today,
+          deviceId: deviceId!,
+          steps: totalSteps,
+          distanceMeters: totalDistMeters,
+          caloriesBurned: totalCals,
+          activeMinutes,
+          sourceClass: incomingDayClass,
+        })
+        .onConflictDoUpdate({
+          target: [
+            stepDailyDeviceTotalsTable.userId,
+            stepDailyDeviceTotalsTable.date,
+            stepDailyDeviceTotalsTable.deviceId,
+          ],
+          set: {
+            steps: sql`GREATEST(${stepDailyDeviceTotalsTable.steps}, ${totalSteps})`,
+            distanceMeters: sql`GREATEST(${stepDailyDeviceTotalsTable.distanceMeters}, ${totalDistMeters})`,
+            caloriesBurned: sql`GREATEST(${stepDailyDeviceTotalsTable.caloriesBurned}, ${totalCals})`,
+            activeMinutes: sql`GREATEST(${stepDailyDeviceTotalsTable.activeMinutes}, ${activeMinutes})`,
+            sourceClass: incomingDayClass,
+            updatedAt: new Date(),
+          },
+        });
+    }
+
     // Upsert daily total — always use GREATEST so the row is monotonically increasing.
     // When the client sends an absolute total we set the row to max(existing, total).
     // When only a delta is sent (legacy/fallback) we add it to the existing value.
@@ -326,7 +402,29 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
       })
       .onConflictDoUpdate({
         target: [stepDailyTotalsTable.userId, stepDailyTotalsTable.date],
-        set: usingAbsolute
+        set: useDeviceMerge
+          ? {
+              // Multi-device: the account total is the SUM of each device's own
+              // (GREATEST-protected) reading — computed inside this transaction so
+              // concurrent syncs from two devices can't clobber each other. Floored
+              // by the existing row so pre-migration single-device totals never drop.
+              steps: sql`GREATEST(${stepDailyTotalsTable.steps}, (
+                SELECT COALESCE(SUM(steps), 0) FROM step_daily_device_totals
+                WHERE user_id = ${userId} AND date = ${today}
+              ))`,
+              distanceMeters: sql`GREATEST(${stepDailyTotalsTable.distanceMeters}, (
+                SELECT COALESCE(SUM(distance_meters), 0) FROM step_daily_device_totals
+                WHERE user_id = ${userId} AND date = ${today}
+              ))`,
+              caloriesBurned: sql`GREATEST(${stepDailyTotalsTable.caloriesBurned}, (
+                SELECT COALESCE(SUM(calories_burned), 0) FROM step_daily_device_totals
+                WHERE user_id = ${userId} AND date = ${today}
+              ))`,
+              activeMinutes: sql`GREATEST(${stepDailyTotalsTable.activeMinutes}, ${activeMinutes})`,
+              sourceClass: nextDaySourceClass,
+              updatedAt: new Date(),
+            }
+          : usingAbsolute
           ? {
               // Absolute mode: GREATEST so daily steps are monotonically increasing.
               // If Android/iOS sends a stale lower total (e.g. subscription restart, race
@@ -486,55 +584,135 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   // Evaluate achievement titles — fire-and-forget so step sync never fails on this
   evaluateAndNotify(userId).catch(() => {});
 
-  // Broadcast live progress to any active Unlimited challenge this user is racing today, so the
-  // challenge screen updates in realtime. Canonical channel: unlimited-challenge-*; also mirror
-  // onto public-live-race-* as race:progress_updated (steps) for Live Detail compatibility.
+  // Broadcast live progress to any active Unlimited challenge day whose locked
+  // window contains now (authoritative). Do not require client localDate === day.localDate.
   (async () => {
     try {
-      const activeDays = await db
-        .select({
-          challengeId: unlimitedChallengeDaysTable.challengeId,
-          participantId: unlimitedChallengeDaysTable.participantId,
-          dayNumber: unlimitedChallengeDaysTable.dayNumber,
-          goalSteps: unlimitedChallengeDaysTable.goalSteps,
-        })
-        .from(unlimitedChallengeDaysTable)
-        .innerJoin(unlimitedChallengesTable, eq(unlimitedChallengesTable.id, unlimitedChallengeDaysTable.challengeId))
-        .where(and(
-          eq(unlimitedChallengeDaysTable.userId, userId),
-          eq(unlimitedChallengeDaysTable.localDate, today),
-          eq(unlimitedChallengesTable.status, "active"),
-          inArray(unlimitedChallengeDaysTable.status, ["pending", "in_progress", "pending_verification"]),
-        ));
+      const { findActiveUnlimitedDaysForUser } = await import("../lib/unlimitedLiveProgress.js");
+      const emitNow = new Date();
+      const activeDays = await findActiveUnlimitedDaysForUser(userId, emitNow);
       if (!activeDays.length) return;
-      const todaySteps = updatedForCoins?.steps ?? 0;
+
+      const dayDates = [...new Set(activeDays.map((d) => d.localDate))];
+      const dayStepRows =
+        dayDates.length === 1 && dayDates[0] === today
+          ? []
+          : await db
+              .select({
+                date: stepDailyTotalsTable.date,
+                steps: stepDailyTotalsTable.steps,
+              })
+              .from(stepDailyTotalsTable)
+              .where(
+                and(
+                  eq(stepDailyTotalsTable.userId, userId),
+                  inArray(stepDailyTotalsTable.date, dayDates),
+                ),
+              );
+      const stepsByDate = new Map(dayStepRows.map((r) => [r.date, r.steps]));
+      if (dayDates.includes(today)) {
+        stepsByDate.set(today, updatedForCoins?.steps ?? stepsByDate.get(today) ?? 0);
+      }
+
       const { emitUnlimitedRealtime } = await import("../lib/unlimitedRealtime.js");
+      const updatedAt = emitNow.toISOString();
       for (const d of activeDays) {
-        emitUnlimitedRealtime(
-          d.challengeId,
-          "progress_updated",
-          {
+        const currentSteps = stepsByDate.get(d.localDate) ?? (d.localDate === today ? (updatedForCoins?.steps ?? 0) : 0);
+        const challengeTimezone = d.challengeTimezone || d.timezone;
+        let provisionalTodaySteps = 0;
+        try {
+          const { getUnlimitedProvisionalLive, displayedFromLanes, progressSourceFromLanes } =
+            await import("../lib/unlimitedProvisionalLive.js");
+          const prov = await getUnlimitedProvisionalLive(d.challengeId, userId, d.localDate);
+          provisionalTodaySteps = prov?.provisionalSteps ?? 0;
+          const displayedLiveSteps = displayedFromLanes(currentSteps, provisionalTodaySteps);
+          const progressSource = progressSourceFromLanes(currentSteps, provisionalTodaySteps);
+          const payload = {
+            challengeId: d.challengeId,
             userId,
             participantId: d.participantId,
-            todaySteps,
+            currentSteps: displayedLiveSteps,
+            todaySteps: displayedLiveSteps,
+            steps: displayedLiveSteps,
+            displayedLiveSteps,
+            verifiedTodaySteps: currentSteps,
+            provisionalTodaySteps,
+            progressSource,
+            verificationStatus:
+              provisionalTodaySteps > currentSteps
+                ? "verification_delayed"
+                : currentSteps > 0
+                  ? "verified"
+                  : "syncing",
             dayNumber: d.dayNumber,
             goalSteps: d.goalSteps,
-            goalReached: todaySteps >= d.goalSteps,
-          },
-          {
+            dailyGoalSteps: d.goalSteps,
+            // Qualification / goalReached from verified only.
+            goalReached: currentSteps >= d.goalSteps,
+            challengeDayKey: d.localDate,
+            localDate: d.localDate,
+            timezone: d.timezone,
+            challengeTimezone,
+            updatedAt,
+            receivedLocalDate: today,
+          };
+          if (process.env.NODE_ENV !== "production") {
+            req.log.debug(
+              {
+                userId,
+                challengeId: d.challengeId,
+                challengeTimezone,
+                receivedLocalDate: today,
+                resolvedChallengeDayKey: d.localDate,
+                verifiedTodaySteps: currentSteps,
+                provisionalTodaySteps,
+                displayedLiveSteps,
+                emitAttempted: true,
+              },
+              "[Unlimited] walk progress emit",
+            );
+          }
+          emitUnlimitedRealtime(d.challengeId, "progress_updated", payload, {
             event: "race:progress_updated",
             payload: {
               raceId: d.challengeId,
-              userId,
-              participantId: d.participantId,
-              steps: todaySteps,
-              todaySteps,
-              dayNumber: d.dayNumber,
-              goalSteps: d.goalSteps,
-              goalReached: todaySteps >= d.goalSteps,
+              ...payload,
             },
+          });
+          continue;
+        } catch {
+          /* fall through to verified-only payload */
+        }
+        const payload = {
+          challengeId: d.challengeId,
+          userId,
+          participantId: d.participantId,
+          currentSteps,
+          todaySteps: currentSteps,
+          steps: currentSteps,
+          displayedLiveSteps: currentSteps,
+          verifiedTodaySteps: currentSteps,
+          provisionalTodaySteps: 0,
+          progressSource: currentSteps > 0 ? "verified" : "unavailable",
+          verificationStatus: currentSteps > 0 ? "verified" : "syncing",
+          dayNumber: d.dayNumber,
+          goalSteps: d.goalSteps,
+          dailyGoalSteps: d.goalSteps,
+          goalReached: currentSteps >= d.goalSteps,
+          challengeDayKey: d.localDate,
+          localDate: d.localDate,
+          timezone: d.timezone,
+          challengeTimezone,
+          updatedAt,
+          receivedLocalDate: today,
+        };
+        emitUnlimitedRealtime(d.challengeId, "progress_updated", payload, {
+          event: "race:progress_updated",
+          payload: {
+            raceId: d.challengeId,
+            ...payload,
           },
-        );
+        });
       }
     } catch (_) {}
   })();

@@ -441,10 +441,9 @@ export async function getParticipantCount(raceId: string): Promise<number> {
 }
 
 /**
- * Cross-process broadcast coalescing lease. Returns true at most once per ttlMs per race across
- * all API replicas, so per-tick leaderboard broadcasts collapse to ~1 per window (the next
- * broadcast always carries the latest ZSET state). Finish events bypass this — they are rare
- * and must always be delivered.
+ * Cross-process lease for expensive full-leaderboard payloads only.
+ * Compact per-user progress deltas must still emit when this returns false.
+ * Finish events / justFinished should bypass and include standings.
  */
 export async function tryAcquireBroadcastLease(raceId: string, ttlMs = 750): Promise<boolean> {
   await ensureRedisLiveConnected();

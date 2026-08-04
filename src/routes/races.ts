@@ -5177,12 +5177,14 @@ router.get("/races/:id", requireAuth, async (req, res) => {
         updatedAt: profilesTable.updatedAt,
       })
       .from(raceParticipantsTable)
-      .innerJoin(profilesTable, eq(raceParticipantsTable.userId, profilesTable.id))
+      .leftJoin(profilesTable, eq(raceParticipantsTable.userId, profilesTable.id))
       .where(and(eq(raceParticipantsTable.raceRoomId, raceId), ne(raceParticipantsTable.status, "left")))
       .orderBy(desc(raceParticipantsTable.currentSteps));
 
     const allParticipantRows = participants.map((p) => ({
       ...p,
+      // Missing profile must not drop membership — keep stable participant id + userId.
+      username: p.username?.trim() || "Walker",
       displayRank: p.rank ?? null,
       prizeCents: 0,
       prizeCoins: 0,
@@ -5662,20 +5664,21 @@ async function tryHandleRedisProgress(
 
   const standings = await getStandingsWithNames(raceId, 20);
   const userRank = standings.find((s) => s.userId === userId)?.rank ?? 0;
-  // Coalesce leaderboard broadcasts across processes: at most ~1 per 750ms per race. On lease
-  // error, default to broadcasting so a redis blip doesn't silently drop all updates.
-  const shouldBroadcast = result.justFinished
+  const updatedAt = new Date().toISOString();
+  // Compact per-user delta always emits so peers never miss accepted progress.
+  // Expensive leaderboard[] payloads remain coalesced via the broadcast lease.
+  const includeLeaderboard = result.justFinished
     || (await tryAcquireBroadcastLease(raceId).catch(() => true));
-  if (shouldBroadcast) {
-    void triggerEvent(`public-live-race-${raceId}`, "race:progress_updated", {
-      participantId: result.participantId,
-      userId,
-      steps: result.newSteps,
-      progress: result.newSteps / Math.max(cfg.targetSteps, 1),
-      rank: userRank,
-      leaderboard: standings.slice(0, 20),
-    });
-  }
+  void triggerEvent(`public-live-race-${raceId}`, "race:progress_updated", {
+    raceId,
+    participantId: result.participantId,
+    userId,
+    steps: result.newSteps,
+    progress: result.newSteps / Math.max(cfg.targetSteps, 1),
+    rank: userRank,
+    updatedAt,
+    ...(includeLeaderboard ? { leaderboard: standings.slice(0, 20) } : {}),
+  });
 
   await sendRedisProgressResponse(
     res,
@@ -6182,11 +6185,13 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
         // Broadcast progress + goal completion in parallel
         await Promise.all([
           triggerEvent(`public-live-race-${raceId}`, "race:progress_updated", {
+            raceId,
             participantId: participantData.id,
             userId,
             steps: newSteps,
             progress: newSteps / Math.max(targetSteps, 1),
             rank: userRank,
+            updatedAt: new Date().toISOString(),
             leaderboard: standings.slice(0, 20),
           }),
           triggerEvent(`public-live-race-${raceId}`, "participant_finished_goal", {
@@ -6239,11 +6244,13 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
       const userRank = standings.find((s) => s.userId === userId)?.rank ?? 0;
 
       await triggerEvent(`public-live-race-${raceId}`, "race:progress_updated", {
+        raceId,
         participantId: participantData.id,
         userId,
         steps: newSteps,
         progress: newSteps / Math.max(targetSteps, 1),
         rank: userRank,
+        updatedAt: new Date().toISOString(),
         leaderboard: standings.slice(0, 20),
       });
     }
