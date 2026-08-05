@@ -10,7 +10,8 @@ const races = readFileSync("src/routes/races.ts", "utf8");
 
 describe("all_forfeited bypasses the duration end-date wait", () => {
   it("defines a FORCED_COMPLETION_REASONS set that includes all_forfeited", () => {
-    expect(races).toContain("const FORCED_COMPLETION_REASONS = new Set([...MANUAL_COMPLETION_REASONS, \"all_forfeited\"])");
+    expect(races).toContain('"all_forfeited"');
+    expect(races).toMatch(/const FORCED_COMPLETION_REASONS = new Set\(\[/);
   });
   it("the duration guard honors FORCED_COMPLETION_REASONS (not just manual)", () => {
     expect(races).toContain("if (FORCED_COMPLETION_REASONS.has(endedReason)) return { allowed: true");

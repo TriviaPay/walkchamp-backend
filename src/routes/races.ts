@@ -120,6 +120,12 @@ import { getUnlimitedBlockingMembership } from "../lib/challengeMembership.js";
 
 const router = Router();
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+/**
+ * Fixed-player classic races (free / coins / cash, challengeDurationDays = 0):
+ * stay live for 24h from start unless enough winners finish earlier.
+ * Not used for Unlimited, multi-day duration challenges, or sponsored (3h).
+ */
+const FIXED_RACE_MAX_DURATION_MS = MS_PER_DAY;
 
 class PaidJoinRollback extends Error {
   constructor(
@@ -167,6 +173,8 @@ export async function recoverStaleRaces(): Promise<void> {
         id: raceRoomsTable.id,
         type: raceRoomsTable.type,
         currentPlayers: raceRoomsTable.currentPlayers,
+        startingParticipantCount: raceRoomsTable.startingParticipantCount,
+        winnerSlotCount: raceRoomsTable.winnerSlotCount,
         challengeDurationDays: raceRoomsTable.challengeDurationDays,
         challengeEndAt: raceRoomsTable.challengeEndAt,
         startedAt: raceRoomsTable.startedAt,
@@ -215,8 +223,17 @@ export async function recoverStaleRaces(): Promise<void> {
         if (completion.allowed) {
           logger.info({ raceId: race.id, challengeEndAt: completion.challengeEndAt?.toISOString() ?? null }, "[recoverStaleRaces] duration expired — completing");
           autoCompleteRace(race.id, "duration_expired").catch(() => {});
+          continue;
         }
-        continue;
+        // Fall through: winner slots can still finalize multi-day rooms early.
+      }
+      // Classic fixed races also use 24h from start when nobody filled winner slots.
+      if (!isDurationChallengeRoom(race) && race.type !== "sponsored" && race.startedAt) {
+        const elapsed = Date.now() - race.startedAt.getTime();
+        if (elapsed >= FIXED_RACE_MAX_DURATION_MS) {
+          autoCompleteRace(race.id, "race_duration_expired").catch(() => {});
+          continue;
+        }
       }
       // Complete any race where:
       // (a) all active participants finished — OR
@@ -238,7 +255,14 @@ export async function recoverStaleRaces(): Promise<void> {
       const totalCount = userDone.size;
       const finishedCount = [...userDone.values()].filter(Boolean).length;
       const allDone = totalCount > 0 && finishedCount === totalCount;
-      const winnersNeeded = numWinners(race.currentPlayers ?? totalCount);
+      const winnersNeeded =
+        typeof race.winnerSlotCount === "number" && race.winnerSlotCount > 0
+          ? race.winnerSlotCount
+          : getWinnerSlotCount(
+              race.startingParticipantCount
+                ?? race.currentPlayers
+                ?? totalCount,
+            ) || numWinners(race.currentPlayers ?? totalCount);
       const enoughWinnersDecided = !allDone && totalCount > 0 && winnersNeeded > 0 && finishedCount >= winnersNeeded;
       if (allDone) {
         autoCompleteRace(race.id, "all_finished_or_forfeited").catch(() => {});
@@ -254,8 +278,9 @@ export async function recoverStaleRaces(): Promise<void> {
 
 // ── Periodic safety net: complete races where all participants are done ────────
 // Called every 15s from app.ts. Completes races where everyone has finished or
-// forfeited. Also force-completes non-duration races stuck for >30 minutes
-// (safety net). Duration challenges run until challengeEndAt.
+// forfeited. Fixed-player free/coins/cash races (non-duration) end after 24h from
+// start if winners are not decided earlier. Duration challenges run until
+// challengeEndAt. Sponsored stays at 3 hours. Unlimited is a separate system.
 export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<void> {
   try {
     // Fast-path gate: when the durable registry confidently reports zero active races,
@@ -267,13 +292,14 @@ export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<v
       if (active === 0) return;
     }
 
-    const SAFETY_TIMEOUT_MS = 30 * 60_000; // 30-minute hard cap for stuck races
     const stale = await db
       .select({
         id: raceRoomsTable.id,
         startedAt: raceRoomsTable.startedAt,
         type: raceRoomsTable.type,
         currentPlayers: raceRoomsTable.currentPlayers,
+        startingParticipantCount: raceRoomsTable.startingParticipantCount,
+        winnerSlotCount: raceRoomsTable.winnerSlotCount,
         challengeDurationDays: raceRoomsTable.challengeDurationDays,
         challengeEndAt: raceRoomsTable.challengeEndAt,
         scheduledStartAt: raceRoomsTable.scheduledStartAt,
@@ -283,25 +309,31 @@ export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<v
 
     // Reconcile the registry to DB truth: drops finalized races (so the gate can close)
     // and (re)adds any in-progress race missing from it (so a missed start-hook self-heals).
-    const activeEntries: ActiveRaceEntry[] = stale.map((r) => ({
-      id: r.id,
-      timeoutAtMs: (r.startedAt?.getTime() ?? Date.now()) + SAFETY_TIMEOUT_MS,
-    }));
+    const activeEntries: ActiveRaceEntry[] = stale.map((r) => {
+      const isSponsored = r.type === "sponsored";
+      const isDuration = isDurationChallengeRoom(r);
+      const timeoutAtMs = isSponsored
+        ? (r.startedAt?.getTime() ?? Date.now()) + 3 * 60 * 60_000
+        : isDuration
+          ? (r.challengeEndAt?.getTime()
+              ?? (r.startedAt?.getTime() ?? Date.now()) + FIXED_RACE_MAX_DURATION_MS)
+          : (r.startedAt?.getTime() ?? Date.now()) + FIXED_RACE_MAX_DURATION_MS;
+      return { id: r.id, timeoutAtMs };
+    });
     await reconcileActive(activeEntries);
 
     for (const race of stale) {
       const isSponsored = race.type === "sponsored";
-      const isDurationChallenge = !isSponsored && race.challengeDurationDays > 0;
-      // Sponsored events run for exactly 3 hours; duration challenges end at
-      // challengeEndAt; only non-duration regular races have a 30-min safety cap.
+      const isDurationChallenge = isDurationChallengeRoom(race);
+      // Sponsored = 3h; multi-day duration = challengeEndAt; classic fixed free/coins/cash = 24h.
       if (race.startedAt) {
         const elapsed = Date.now() - race.startedAt.getTime();
         const timeoutMs = isSponsored
           ? 3 * 60 * 60_000
           : isDurationChallenge
             ? null
-            : SAFETY_TIMEOUT_MS;
-        const reason = isSponsored ? "sponsored_duration_expired" : "safety_timeout";
+            : FIXED_RACE_MAX_DURATION_MS;
+        const reason = isSponsored ? "sponsored_duration_expired" : "race_duration_expired";
         if (timeoutMs !== null && elapsed >= timeoutMs) {
           autoCompleteRace(race.id, reason).catch((err) => {
             logger.error({ raceId: race.id, elapsedMs: elapsed, err }, `cleanupOverdueRaces: ${reason} autoCompleteRace failed`);
@@ -334,10 +366,11 @@ export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<v
           autoCompleteRace(race.id, "duration_expired").catch((err) => {
             logger.error({ raceId: race.id, err }, "cleanupOverdueRaces: duration_expired autoCompleteRace failed");
           });
+          continue;
         }
-        continue;
+        // Fall through: winner slots can still finalize multi-day rooms early.
       }
-      // Complete regular races where:
+      // Complete races where:
       // (a) all active participants finished — OR
       // (b) enough winner slots are filled (finishedCount >= numWinners) — safety net
       //     for when the per-sync early-winner trigger fired but autoCompleteRace failed.
@@ -357,7 +390,15 @@ export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<v
       const totalCount = userDone.size;
       const finishedCount = [...userDone.values()].filter(Boolean).length;
       const allDone = totalCount > 0 && finishedCount === totalCount;
-      const winnersNeeded = numWinners(race.currentPlayers ?? totalCount);
+      // Prefer frozen start-time winner slots (2→1, 3→2, 4–10→3).
+      const winnersNeeded =
+        typeof race.winnerSlotCount === "number" && race.winnerSlotCount > 0
+          ? race.winnerSlotCount
+          : getWinnerSlotCount(
+              race.startingParticipantCount
+                ?? race.currentPlayers
+                ?? totalCount,
+            ) || numWinners(race.currentPlayers ?? totalCount);
       const enoughWinnersDecided = !allDone && totalCount > 0 && winnersNeeded > 0 && finishedCount >= winnersNeeded;
       if (allDone) {
         autoCompleteRace(race.id, "all_finished_or_forfeited").catch((err) => {
@@ -436,14 +477,24 @@ function buildChallengeTimeFields(room: Pick<typeof raceRoomsTable.$inferSelect,
 
 const MANUAL_COMPLETION_REASONS = new Set(["admin_force_complete", "manual_force_complete"]);
 // Reasons that bypass the duration-challenge end-date wait. In addition to explicit admin/manual
-// force-completes, "all_forfeited" is included: it is only ever passed once the caller has verified
-// NOBODY is still racing (every participant forfeited or finished), so there is nothing to wait for
-// and a duration challenge must not stay stuck LIVE until its natural end date. Winners/payouts are
-// still gated by actual completion, so a true all-quit settles with zero winners.
-const FORCED_COMPLETION_REASONS = new Set([...MANUAL_COMPLETION_REASONS, "all_forfeited"]);
+// force-completes: all_forfeited (nobody left racing) and winner-slot fills (2→1, 3→2, 4–10→3)
+// so fixed-player matches can settle as soon as enough finishers exist — including multi-day rooms.
+const FORCED_COMPLETION_REASONS = new Set([
+  ...MANUAL_COMPLETION_REASONS,
+  "all_forfeited",
+  "all_finished_or_forfeited",
+  "winners_finalized",
+  "winners_decided_periodic",
+  "winners_decided_recovery",
+]);
 
+/**
+ * Multi-day "fixed days" challenges (weekly/monthly: 7/30). Classic fixed-player
+ * free/coins/cash races use challengeDurationDays 0 (or legacy daily=1) and end by
+ * winner slots or 24h from start — not a calendar duration wait.
+ */
 function isDurationChallengeRoom(room: Pick<typeof raceRoomsTable.$inferSelect, "type" | "challengeDurationDays">): boolean {
-  return room.type !== "sponsored" && room.challengeDurationDays > 0;
+  return room.type !== "sponsored" && room.challengeDurationDays > 1;
 }
 
 function canAutoCompleteDurationChallenge(
@@ -805,7 +856,7 @@ async function writeVerificationAudit(row: {
   }
 }
 
-async function autoCompleteRace(raceId: string, endedReason = "time_expired"): Promise<void> {
+export async function autoCompleteRace(raceId: string, endedReason = "time_expired"): Promise<void> {
   const [room] = await db
     .select()
     .from(raceRoomsTable)
@@ -3535,7 +3586,14 @@ export async function activateRoomAndStart(
   }
 
   const startedAt = new Date();
-  const challengeEndAt = deriveChallengeEndAt({ ...room, startedAt });
+  // Sponsored: 3h. Multi-day rooms: calendar challengeEndAt. Classic fixed free/coins/cash
+  // (durationDays 0 or legacy daily=1): startedAt + 24h unless winners finish sooner.
+  const challengeEndAt =
+    room.type === "sponsored"
+      ? new Date(startedAt.getTime() + 3 * 60 * 60_000)
+      : isDurationChallengeRoom(room)
+        ? deriveChallengeEndAt({ ...room, startedAt })
+        : new Date(startedAt.getTime() + FIXED_RACE_MAX_DURATION_MS);
 
   // ── Freeze winner slots at race start (never recalculated afterwards) ─────────
   // Count distinct valid participants NOW (after any pre-start coins_battle disqualification).
@@ -3577,7 +3635,11 @@ export async function activateRoomAndStart(
   );
 
   // Register the live race so the safety-net cleanup considers it (opens the idle gate).
-  void markRaceActive(raceId, (challengeEndAt?.getTime() ?? startedAt.getTime()) + 30 * 60_000);
+  // Fixed free/coins/cash: 24h from start. Duration challenges: challengeEndAt.
+  void markRaceActive(
+    raceId,
+    challengeEndAt?.getTime() ?? startedAt.getTime() + FIXED_RACE_MAX_DURATION_MS,
+  );
   // Seed redis-live if this race started in redis mode (no-op otherwise).
   void initializeRaceLiveState(raceId);
 
@@ -5024,8 +5086,8 @@ router.get("/races/:id", requireAuth, async (req, res) => {
   //  a) required winners finish their goal (handled in POST /progress), or
   //  b) all participants forfeit (handled in POST /forfeit), or
   //  c) a scheduled end time is reached (handled by the scheduler), or
-  //  d) the 30-min safety net fires (cleanupOverdueRaces in app.ts).
-  // Do NOT end a race just because N seconds have elapsed.
+  //  d) fixed free/coins/cash hit the 24h max (cleanupOverdueRaces).
+  // Do NOT end a race just because a short local timer elapsed.
 
   const isWaitingRoom = room.status === "open" || room.status === "full";
 
@@ -5467,11 +5529,17 @@ async function persistRedisFinish(
         .select({ finishedCount: sql<number>`count(distinct ${raceParticipantsTable.userId})::int` })
         .from(raceParticipantsTable)
         .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.finishedGoal, true)));
-      return { finishedCount, playerCount: room.currentPlayers ?? 0 };
+      const winnersNeeded =
+        typeof room.winnerSlotCount === "number" && room.winnerSlotCount > 0
+          ? room.winnerSlotCount
+          : getWinnerSlotCount(
+              room.startingParticipantCount ?? room.currentPlayers ?? 0,
+            ) || numWinners(room.currentPlayers ?? 0);
+      return { finishedCount, winnersNeeded };
     });
     if (!result) return;
     await markFinishOfficial(raceId, userId); // clear from pending set, mark official in Redis
-    if (result.finishedCount >= numWinners(result.playerCount)) {
+    if (result.winnersNeeded > 0 && result.finishedCount >= result.winnersNeeded) {
       autoCompleteRace(raceId, "winners_finalized").catch(() => {});
     }
   } catch (err) {
@@ -6156,10 +6224,18 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
             eq(raceParticipantsTable.finishedGoal, true),
           ));
 
+        const winnersNeeded =
+          typeof lockedRoom.winnerSlotCount === "number" && lockedRoom.winnerSlotCount > 0
+            ? lockedRoom.winnerSlotCount
+            : getWinnerSlotCount(
+                lockedRoom.startingParticipantCount ?? lockedRoom.currentPlayers ?? 2,
+              ) || numWinners(lockedRoom.currentPlayers ?? 2);
+
         return {
           finishRank: nextParticipant.finishRank ?? computedFinishRank,
           finishedCount: finishedCountRow?.cnt ?? 0,
           playerCount: lockedRoom.currentPlayers ?? 2,
+          winnersNeeded,
         };
       });
 
@@ -6205,10 +6281,10 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
           }),
         ]);
 
-        // ── Early finalization: end race immediately when required winners are set ──
-        // numWinners is based on currentPlayers captured at race start.
+        // ── Early finalization: end race when required winner slots are filled ──
+        // Slots frozen at start: 2→1, 3→2, 4–10→3 (free / coins / cash).
         const playerCount = updated.playerCount;
-        const winnersNeeded = numWinners(playerCount);
+        const winnersNeeded = updated.winnersNeeded;
         const finishedCount = updated.finishedCount;
 
         req.log.info(
@@ -6221,16 +6297,17 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
           ? canAutoCompleteDurationChallenge(room, "winners_finalized")
           : { allowed: true, challengeEndAt: null };
 
-        if (finishedCount >= winnersNeeded && !durationCompletion.allowed) {
-          req.log.info(
-            { raceId, finishedCount, winnersNeeded, challengeEndAt: durationCompletion.challengeEndAt?.toISOString() ?? null },
-            "[RaceFinalize] duration challenge winner slots filled — waiting for challenge end",
-          );
-        } else if (finishedCount >= winnersNeeded) {
+        if (finishedCount >= winnersNeeded) {
+          // Winner slots always finalize immediately (including multi-day rooms).
           req.log.info({ raceId, finishedCount, winnersNeeded }, "[RaceFinalize] all winner slots filled — triggering immediate finalization");
           autoCompleteRace(raceId, "winners_finalized").catch((err) => {
             req.log.error({ raceId, err }, "[RaceFinalize] early autoCompleteRace failed");
           });
+        } else if (!durationCompletion.allowed) {
+          req.log.info(
+            { raceId, finishedCount, winnersNeeded, challengeEndAt: durationCompletion.challengeEndAt?.toISOString() ?? null },
+            "[RaceFinalize] duration challenge — waiting for more finishers or challenge end",
+          );
         }
       }
     } else {

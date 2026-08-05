@@ -215,9 +215,11 @@ async function finalizeDurationRoom(roomId: string): Promise<void> {
 
     if (!room || room.status !== "in_progress") return;
 
-    // Duration races must go through the race finalizer so standings, results,
-    // payouts, and realtime finish events are all produced consistently.
-    logger.info({ roomId, challengeEndAt: room.challengeEndAt?.toISOString() ?? null }, "[ScheduleRoomJob] duration due; race finalizer will complete");
+    // Duration / soft-end races must go through the race finalizer so standings,
+    // results, payouts, and realtime finish events are all produced consistently.
+    logger.info({ roomId, challengeEndAt: room.challengeEndAt?.toISOString() ?? null }, "[ScheduleRoomJob] duration due; completing via race finalizer");
+    const { autoCompleteRace } = await import("../routes/races.js");
+    await autoCompleteRace(roomId, "duration_expired");
   } catch (err) {
     logger.error({ err, roomId }, "[ScheduleRoomJob] error finalizing duration room");
   }
