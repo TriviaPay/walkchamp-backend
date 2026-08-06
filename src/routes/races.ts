@@ -2089,7 +2089,11 @@ router.get("/races/current-active", requireAuth, async (req, res) => {
 //   user_joined_waiting | user_hosting_active | user_joined_active |
 //   active_other | finished
 export async function getChallengeCardsForUser(userId: string) {
-  const entryTypes = ["free", "paid_1", "paid_3", "paid_5", "coins_battle"] as const;
+  // paid_usd is the entry type every new cash challenge is created with (see the host
+  // schema below). Omitting it here meant cash rooms existed but never produced a card,
+  // so the Cash Prize card could never reach a Join state. The legacy paid_1/3/5 tiers
+  // are kept for the enum's sake but have never had a single room.
+  const entryTypes = ["free", "paid_1", "paid_3", "paid_5", "paid_usd", "coins_battle"] as const;
 
   // ── Housekeeping: auto-cancel abandoned solo waiting rooms ──────────────────
   // Only cancel rooms where nobody has joined (host alone) after 5 minutes.
@@ -2116,7 +2120,7 @@ export async function getChallengeCardsForUser(userId: string) {
     .from(raceRoomsTable)
     .where(
       and(
-        inArray(raceRoomsTable.entryType, ["free", "paid_1", "paid_3", "paid_5", "coins_battle"]),
+        inArray(raceRoomsTable.entryType, ["free", "paid_1", "paid_3", "paid_5", "paid_usd", "coins_battle"]),
         inArray(raceRoomsTable.status, ["open", "in_progress"]),
         ne(raceRoomsTable.type, "sponsored"),
         eq(raceRoomsTable.isPrivate, false),
@@ -2129,6 +2133,9 @@ export async function getChallengeCardsForUser(userId: string) {
     paid_1: { open: 0, in_progress: 0 },
     paid_3: { open: 0, in_progress: 0 },
     paid_5: { open: 0, in_progress: 0 },
+    // Must stay in sync with the inArray above — a row whose entryType has no key here
+    // would throw on countsMap[row.entryType].open below.
+    paid_usd: { open: 0, in_progress: 0 },
     coins_battle: { open: 0, in_progress: 0 },
   };
   for (const row of rawCounts) {
@@ -2150,6 +2157,7 @@ export async function getChallengeCardsForUser(userId: string) {
           currentPlayers: raceRoomsTable.currentPlayers,
           maxPlayers: raceRoomsTable.maxPlayers,
           targetSteps: raceRoomsTable.targetSteps,
+          entryAmountCents: raceRoomsTable.entryAmountCents,
         })
         .from(raceRoomsTable)
         .innerJoin(
@@ -2186,6 +2194,7 @@ export async function getChallengeCardsForUser(userId: string) {
             isHost, isParticipant: true,
             joinedCount: room.currentPlayers, maxPlayers: room.maxPlayers,
             targetSteps: targetStepsForRoom(room),
+            entryAmountCents: room.entryAmountCents,
             canHost: false, canJoin: false, isActive: true, isFinished: false,
             label: isHost ? "Hosting · Active" : "My Race · Active",
             liveCount: lc, waitingCount: wc, canHostNew: false,
@@ -2200,6 +2209,7 @@ export async function getChallengeCardsForUser(userId: string) {
           isHost, isParticipant: true,
           joinedCount: room.currentPlayers, maxPlayers: room.maxPlayers,
           targetSteps: targetStepsForRoom(room),
+          entryAmountCents: room.entryAmountCents,
           canHost: false, canJoin: false, isActive: false, isFinished: false,
           label: isHost
             ? `Hosting · ${room.currentPlayers}/${room.maxPlayers}`
@@ -2214,6 +2224,7 @@ export async function getChallengeCardsForUser(userId: string) {
           id: raceRoomsTable.id,
           currentPlayers: raceRoomsTable.currentPlayers,
           maxPlayers: raceRoomsTable.maxPlayers,
+          entryAmountCents: raceRoomsTable.entryAmountCents,
         })
         .from(raceRoomsTable)
         .where(
@@ -2239,6 +2250,7 @@ export async function getChallengeCardsForUser(userId: string) {
           raceId: best.id,
           isHost: false, isParticipant: false,
           joinedCount: best.currentPlayers, maxPlayers: best.maxPlayers,
+          entryAmountCents: best.entryAmountCents,
           canHost: false, canJoin: true, isActive: false, isFinished: false,
           label: `Join · ${best.currentPlayers}/${best.maxPlayers}`,
           liveCount, waitingCount, canHostNew: true,
@@ -2247,7 +2259,7 @@ export async function getChallengeCardsForUser(userId: string) {
 
       // ── Step 3: Is there an active race the user is not in? ──
       const activeOther = await db
-        .select({ id: raceRoomsTable.id, currentPlayers: raceRoomsTable.currentPlayers })
+        .select({ id: raceRoomsTable.id, currentPlayers: raceRoomsTable.currentPlayers, entryAmountCents: raceRoomsTable.entryAmountCents })
         .from(raceRoomsTable)
         .where(
           and(
@@ -2265,6 +2277,7 @@ export async function getChallengeCardsForUser(userId: string) {
           raceId: activeOther[0].id,
           isHost: false, isParticipant: false,
           joinedCount: activeOther[0].currentPlayers, maxPlayers: 10,
+          entryAmountCents: activeOther[0].entryAmountCents,
           canHost: false, canJoin: false, isActive: true, isFinished: false,
           label: "Active",
           liveCount, waitingCount, canHostNew: true,
@@ -2278,6 +2291,7 @@ export async function getChallengeCardsForUser(userId: string) {
         raceId: null,
         isHost: false, isParticipant: false,
         joinedCount: 0, maxPlayers: 10,
+        entryAmountCents: null,
         canHost: true, canJoin: false, isActive: false, isFinished: false,
         label: "Host",
         liveCount, waitingCount, canHostNew: true,
@@ -2456,12 +2470,16 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
   const limitNum = Math.min(parseInt(limit, 10) || 30, 50);
   const offsetNum = Math.max(parseInt(offset, 10) || 0, 0);
 
-  const filterToEntryTypes: Record<string, ("free" | "paid_1" | "paid_3" | "paid_5" | "coins_battle")[]> = {
-    all: ["free", "paid_1", "paid_3", "paid_5", "coins_battle"],
+  const filterToEntryTypes: Record<string, ("free" | "paid_1" | "paid_3" | "paid_5" | "paid_usd" | "coins_battle")[]> = {
+    all: ["free", "paid_1", "paid_3", "paid_5", "paid_usd", "coins_battle"],
     free: ["free"],
     one_dollar: ["paid_1"],
     three_dollar: ["paid_3"],
     five_dollar: ["paid_5"],
+    // Cash rooms carry a custom amount, so they are filtered as one bucket rather than
+    // by a fixed tier. "cash" is the forward-looking name; "usd" accepted as an alias.
+    cash: ["paid_usd"],
+    usd: ["paid_usd"],
     coins: ["coins_battle"],
   };
   const entryTypes = filterToEntryTypes[filter] ?? filterToEntryTypes.all;
@@ -2532,13 +2550,15 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
       .groupBy(raceRoomsTable.isPrivate),
   ]);
 
-  const counts = { total: 0, free: 0, one_dollar: 0, three_dollar: 0, five_dollar: 0 };
+  const counts = { total: 0, free: 0, one_dollar: 0, three_dollar: 0, five_dollar: 0, cash: 0, coins: 0 };
   for (const c of countRows) {
     counts.total += c.count;
     if (c.entryType === "free") counts.free = c.count;
     else if (c.entryType === "paid_1") counts.one_dollar = c.count;
     else if (c.entryType === "paid_3") counts.three_dollar = c.count;
     else if (c.entryType === "paid_5") counts.five_dollar = c.count;
+    else if (c.entryType === "paid_usd") counts.cash = c.count;
+    else if (c.entryType === "coins_battle") counts.coins = c.count;
   }
 
   const publicRoomCount = visibilityCountRows.find((r) => !r.isPrivate)?.count ?? 0;
@@ -3964,6 +3984,8 @@ router.get("/races", requireAuth, async (req, res) => {
           ? eq(raceRoomsTable.entryType, "paid_3")
           : filter === "$5"
             ? eq(raceRoomsTable.entryType, "paid_5")
+          : filter === "cash" || filter === "usd" || filter === "paid_usd"
+            ? eq(raceRoomsTable.entryType, "paid_usd")
             : filter === "coins" || filter === "coins_battle"
             ? eq(raceRoomsTable.entryType, "coins_battle")
             : filter === "country"
