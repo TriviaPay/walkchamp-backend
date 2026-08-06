@@ -228,7 +228,9 @@ export async function recoverStaleRaces(): Promise<void> {
         // Fall through: winner slots can still finalize multi-day rooms early.
       }
       // Classic fixed races also use 24h from start when nobody filled winner slots.
-      if (!isDurationChallengeRoom(race) && race.type !== "sponsored" && race.startedAt) {
+      // Sponsored rooms already `continue`d out of the loop above, so they cannot reach here —
+      // the previous `race.type !== "sponsored"` guard was always true.
+      if (!isDurationChallengeRoom(race) && race.startedAt) {
         const elapsed = Date.now() - race.startedAt.getTime();
         if (elapsed >= FIXED_RACE_MAX_DURATION_MS) {
           autoCompleteRace(race.id, "race_duration_expired").catch(() => {});

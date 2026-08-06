@@ -46,7 +46,9 @@ describe("money safety (integer cents, fixed $0.50, no double charge)", () => {
   it("pre-start leave decrements the pool + count (post-start leave leaves them intact)", () => {
     // Pre-start USD leave refunds the entry and removes the contribution from the pool.
     expect(service).toContain("GREATEST(${unlimitedChallengesTable.prizePoolCents} - ${participant.entryContributionCents}, 0)");
-    expect(service).toContain("GREATEST(${unlimitedChallengesTable.paidParticipantCount} - 1, 0)");
+    // Count decrement is a lock-protected read-modify-write (see paid-leave-cancel.test.ts).
+    expect(service).toContain("const nextCount = Math.max(challenge.paidParticipantCount - 1, 0)");
+    expect(service).toContain('.limit(1).for("update")');
     // Post-start still keeps the contribution in the pool (guarded by the preStart branch).
     expect(service).toContain("Post-start: contribution stays in the pool");
   });
@@ -197,8 +199,10 @@ describe("live step progress on unlimited challenges (no more hardcoded 0)", () 
     const liveProgress = readFileSync("src/lib/unlimitedLiveProgress.ts", "utf8");
     // shared helper owns the query — router must call it
     expect(router).toContain("loadChallengePlayers");
-    expect(liveProgress).toContain("currentSteps: todaySteps");
-    expect(liveProgress).toContain("totalChallengeSteps: finalizedSteps + todaySteps");
+    // Display uses the provisional/verified lane split; the settlement total deliberately
+    // uses verified-only so provisional live steps can never inflate a multi-day payout.
+    expect(liveProgress).toContain("currentSteps: displayToday");
+    expect(liveProgress).toContain("totalChallengeSteps: finalizedSteps + verifiedToday");
     expect(liveProgress).toContain("from(stepDailyTotalsTable)");
     expect(liveProgress).toContain("lte(unlimitedChallengeDaysTable.windowStartUtc, now)");
     expect(liveProgress).toContain("gt(unlimitedChallengeDaysTable.windowEndUtc, now)");

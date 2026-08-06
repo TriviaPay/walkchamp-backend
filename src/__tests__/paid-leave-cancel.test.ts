@@ -68,7 +68,12 @@ describe("unlimited leave — pre-start refund, idempotent, pool/count accountin
   });
   it("pre-start leave decrements pool + count; post-start keeps them", () => {
     expect(uService).toContain("GREATEST(${unlimitedChallengesTable.prizePoolCents} - ${participant.entryContributionCents}, 0)");
-    expect(uService).toContain("GREATEST(${unlimitedChallengesTable.paidParticipantCount} - 1, 0)");
+    // The count decrement is computed in JS (Math.max clamps at 0) rather than SQL GREATEST,
+    // because nextCount is also returned as participantCount. That is safe only because the
+    // challenge row is read FOR UPDATE inside the same transaction — assert both halves.
+    expect(uService).toContain("const nextCount = Math.max(challenge.paidParticipantCount - 1, 0)");
+    expect(uService).toContain("paidParticipantCount: nextCount");
+    expect(uService).toContain('.limit(1).for("update")');
     expect(uService).toContain("Post-start: contribution stays in the pool");
   });
   it("host leaving preserves hostUserId (no reassignment / no ghost)", () => {

@@ -183,7 +183,8 @@ export async function findActiveUnlimitedDaysForUser(
     goalSteps: number;
     localDate: string;
     timezone: string;
-    challengeTimezone: string;
+    /** Nullable in the schema (challenge_timezone has no NOT NULL); callers fall back to `timezone`. */
+    challengeTimezone: string | null;
   }>
 > {
   return db
