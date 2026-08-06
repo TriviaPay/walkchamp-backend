@@ -91,6 +91,12 @@ const envSchema = z
     RAZORPAY_KEY_SECRET: z.string().optional(),
     RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
     CASH_CHALLENGE_PLATFORM_SERVICE_FEE_CENTS: z.string().optional(),
+    // INR/Razorpay cash-challenge rollout gate. Default off — production keeps the India
+    // block until the Razorpay cash path is exercised end to end. Read at call time in
+    // cashChallengeFees.inrCashChallengesEnabled(); declared here so it is a documented,
+    // validated part of the environment contract.
+    ENABLE_INR_CASH_CHALLENGES: z.enum(["true", "false"]).optional(),
+    CASH_CHALLENGE_RAZORPAY_PROCESSING_BASIS_POINTS: z.string().optional(),
     OBJECT_STORAGE_ENDPOINT: z.string().optional(),
     OBJECT_STORAGE_REGION: z.string().optional(),
     OBJECT_STORAGE_BUCKET: z.string().optional(),
