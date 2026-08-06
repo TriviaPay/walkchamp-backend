@@ -283,8 +283,45 @@ export async function recoverStaleRaces(): Promise<void> {
 // forfeited. Fixed-player free/coins/cash races (non-duration) end after 24h from
 // start if winners are not decided earlier. Duration challenges run until
 // challengeEndAt. Sponsored stays at 3 hours. Unlimited is a separate system.
+/**
+ * Re-drives settlement for races that already left the live state but still owe a payout
+ * (status=completed, settlementStatus=awaiting_verification).
+ *
+ * These are invisible to every other sweep, which all filter on status=in_progress, and they
+ * are not "active races" either — so this must run ahead of the activeRaceCount() fast path
+ * below or a deferred cash race would never be paid on an otherwise idle server.
+ *
+ * Only awaiting_verification is retried automatically: the grace window expiring is what
+ * resolves it (strict → hold for review, non-strict → settle on the capped live total).
+ * review_required is an explicit ops hold and is resolved through /verification-resolve,
+ * which re-enters autoCompleteRace itself.
+ */
+export async function resettlePendingRaces(): Promise<void> {
+  const pending = await db
+    .select({ id: raceRoomsTable.id })
+    .from(raceRoomsTable)
+    .where(and(
+      eq(raceRoomsTable.status, "completed"),
+      eq(raceRoomsTable.settlementStatus, "awaiting_verification"),
+    ))
+    .limit(50)
+    .catch((err) => {
+      logger.error({ err }, "resettlePendingRaces: query failed");
+      return [] as { id: string }[];
+    });
+
+  for (const race of pending) {
+    await autoCompleteRace(race.id, "settlement_retry").catch((err) => {
+      logger.error({ err, raceId: race.id }, "resettlePendingRaces: autoCompleteRace failed");
+    });
+  }
+}
+
 export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<void> {
   try {
+    // Deferred payouts first — see resettlePendingRaces for why this precedes the idle gate.
+    await resettlePendingRaces();
+
     // Fast-path gate: when the durable registry confidently reports zero active races,
     // skip the Postgres scan entirely so Neon compute can suspend while idle. `null`
     // means the registry is unavailable → fail open and scan. `force` bypasses the gate
@@ -858,6 +895,66 @@ async function writeVerificationAudit(row: {
   }
 }
 
+/**
+ * Settlement states that mean "the race is over, but the money is not resolved yet".
+ * A room in one of these is terminal for *liveness* (status = completed, it has left the
+ * live UI) while settlement is still owed, so autoCompleteRace must be able to re-enter and
+ * finish paying once verification resolves.
+ */
+const PENDING_SETTLEMENT_STATUSES = new Set(["awaiting_verification", "review_required"]);
+
+export function isSettlementPending(settlementStatus: string | null | undefined): boolean {
+  return PENDING_SETTLEMENT_STATUSES.has(settlementStatus ?? "");
+}
+
+/**
+ * Marks a room terminal for liveness while leaving settlement owed.
+ *
+ * Winner slots being filled (or the 24h cap) ends the *race*; verification only gates the
+ * *payout*. Previously both lived past the same early return, so a strict cash race sat at
+ * status=in_progress — showing as LIVE with 105/100 — for the whole grace window and, under
+ * strict_hold, until ops intervened. The room now leaves the live state immediately and the
+ * payout is re-driven from settlementStatus.
+ */
+async function markRoomTerminalPendingSettlement(
+  raceId: string,
+  settlementStatus: "awaiting_verification" | "review_required",
+  endedReason: string,
+): Promise<void> {
+  const now = new Date();
+  const updated = await db
+    .update(raceRoomsTable)
+    .set({
+      status: "completed",
+      // completedAt is the moment the race stopped being live, not the moment it was paid.
+      // payoutFinalizedAt (set in the payout transaction) records settlement separately.
+      completedAt: now,
+      updatedAt: now,
+      settlementStatus,
+    })
+    .where(and(
+      eq(raceRoomsTable.id, raceId),
+      eq(raceRoomsTable.status, "in_progress"),
+    ))
+    .returning({ id: raceRoomsTable.id })
+    .catch((err) => {
+      logger.error({ err, raceId }, "autoCompleteRace: failed to mark room terminal pending settlement");
+      return [] as { id: string }[];
+    });
+
+  if (updated.length > 0) {
+    logger.info(
+      { raceId, settlementStatus, endedReason },
+      "autoCompleteRace: race ended (left live state); settlement still owed",
+    );
+    void triggerEvent(`public-live-race-${raceId}`, "race:completed", {
+      raceId,
+      settlementStatus,
+      settlementPending: true,
+    });
+  }
+}
+
 export async function autoCompleteRace(raceId: string, endedReason = "time_expired"): Promise<void> {
   const [room] = await db
     .select()
@@ -865,7 +962,12 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
     .where(eq(raceRoomsTable.id, raceId))
     .limit(1);
 
-  if (!room || room.status !== "in_progress") return;
+  // Re-entrant for a race that already left the live state but still owes settlement —
+  // otherwise marking the room completed at a deferral point below would permanently strand
+  // the payout, since every retry path funnels through this guard.
+  if (!room) return;
+  const reEnteringForSettlement = room.status === "completed" && isSettlementPending(room.settlementStatus);
+  if (room.status !== "in_progress" && !reEnteringForSettlement) return;
 
   const durationCompletion = canAutoCompleteDurationChallenge(room, endedReason);
   if (!durationCompletion.allowed) {
@@ -1055,11 +1157,12 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
       await Promise.allSettled(reconWrites);
 
       // Grace-window deferral: verification may still arrive → wait and retry.
+      // The PAYOUT waits, but the race does not: the winner slots are already filled, so the
+      // room leaves the live state now and settles when verification lands (or ops resolves).
       if (anyPendingInGrace) {
-        void db.update(raceRoomsTable).set({ settlementStatus: "awaiting_verification" })
-          .where(eq(raceRoomsTable.id, raceId)).catch(() => {});
-        logger.info({ raceId, strictRace }, "autoCompleteRace: deferring — awaiting verification within grace window");
-        return; // scheduler retries; verification may still arrive
+        await markRoomTerminalPendingSettlement(raceId, "awaiting_verification", endedReason);
+        logger.info({ raceId, strictRace }, "autoCompleteRace: deferring payout — awaiting verification within grace window");
+        return; // scheduler / POST /verify re-enters; verification may still arrive
       }
       if (strictRace && anyHeldForReview) {
         void db.update(raceRoomsTable).set({ settlementStatus: "review_required" })
@@ -1416,10 +1519,11 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
       || [...heldUserIds].some((uid) => heldCeiling(uid) >= lowestPaidSteps)      // step-ranking promotion within tolerance
       || paidWinners.length === 0;                                                // no resolved winner yet → a held user could be it
     if (contested) {
-      void db.update(raceRoomsTable).set({ settlementStatus: "review_required" })
-        .where(eq(raceRoomsTable.id, raceId)).catch(() => {});
+      // Same split as the grace deferral: the payout is held for ops, but the race itself is
+      // over, so it must not keep showing as LIVE while an ops decision is pending.
+      await markRoomTerminalPendingSettlement(raceId, "review_required", endedReason);
       logger.warn({ raceId, heldUserIds: [...heldUserIds] },
-        "autoCompleteRace: HELD — an unresolved participant could affect a paid slot; awaiting ops decision");
+        "autoCompleteRace: payout HELD — an unresolved participant could affect a paid slot; awaiting ops decision");
       void triggerEvent(`public-live-race-${raceId}`, "race:review_required", { raceId, held: true });
       return; // ops resolves via /verification-resolve; the next pass settles
     }
@@ -1454,9 +1558,15 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
         .update(raceRoomsTable)
         .set({
           status: "completed",
-          completedAt: payoutFinalizedAt,
+          // Keep the original race-end time when the room was already marked terminal at a
+          // deferral point — completedAt is when the race stopped being live, whereas
+          // payoutFinalizedAt below records when the money settled. Overwriting it here would
+          // backdate every deferred cash race's end to its payout time.
+          completedAt: sql`coalesce(${raceRoomsTable.completedAt}, ${payoutFinalizedAt})`,
           updatedAt: payoutFinalizedAt,
-          ...(useHybrid && { settlementStatus: "paid" }),
+          // Always clear the pending marker on the settling pass, not just under the hybrid
+          // flag — a re-entering race is settled by definition once this CAS matches.
+          ...((useHybrid || reEnteringForSettlement) && { settlementStatus: "paid" }),
           ...(!isSponsored && { prizePoolCents: totalPoolCents }),
           winnersPoolCents,
           platformFeeCents: platformFeeCentsVal,
@@ -1472,7 +1582,18 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
         })
         .where(and(
           eq(raceRoomsTable.id, raceId),
-          eq(raceRoomsTable.status, "in_progress"),
+          // Claim either a still-live race, or one already marked terminal that still owes
+          // settlement. Without the second arm, any race deferred for verification could never
+          // be paid: the deferral marks it completed, and this compare-and-swap would never
+          // match again. Settled rooms (paid / partially_verified) match neither arm, so the
+          // payout stays single-shot.
+          or(
+            eq(raceRoomsTable.status, "in_progress"),
+            and(
+              eq(raceRoomsTable.status, "completed"),
+              inArray(raceRoomsTable.settlementStatus, [...PENDING_SETTLEMENT_STATUSES]),
+            ),
+          ),
           completionAllowedSql,
         ))
         .returning({ id: raceRoomsTable.id });
@@ -6636,7 +6757,7 @@ router.post("/races/:id/verify", requireAuth, async (req, res) => {
   const [[room], [participant]] = await Promise.all([
     db.select({ status: raceRoomsTable.status, startedAt: raceRoomsTable.startedAt, completedAt: raceRoomsTable.completedAt,
       challengeEndAt: raceRoomsTable.challengeEndAt, challengeDurationDays: raceRoomsTable.challengeDurationDays,
-      scheduledStartAt: raceRoomsTable.scheduledStartAt })
+      scheduledStartAt: raceRoomsTable.scheduledStartAt, settlementStatus: raceRoomsTable.settlementStatus })
       .from(raceRoomsTable).where(eq(raceRoomsTable.id, raceId)).limit(1),
     db.select({ status: raceParticipantsTable.status, verifiedCumulativeSteps: raceParticipantsTable.verifiedCumulativeSteps,
       verifiedMeasuredAt: raceParticipantsTable.verifiedMeasuredAt })
@@ -6653,7 +6774,13 @@ router.post("/races/:id/verify", requireAuth, async (req, res) => {
   // Race window: accept while in progress, or within the verification window after completion.
   const endAtMs = (room.completedAt ? new Date(room.completedAt) : deriveChallengeEndAt(room))?.getTime() ?? null;
   const withinPostWindow = endAtMs != null && Date.now() - endAtMs <= config.hybridReconciliation.verificationWindowMs;
-  if (room.status !== "in_progress" && !withinPostWindow) {
+  // A race whose payout is still deferred is, by definition, waiting for exactly this
+  // submission — so accept it for as long as settlement is owed. Without this the room's
+  // status flips to completed the moment winner slots fill, and the short post-completion
+  // window (verificationWindowMs, ~10 min) would reject verifications that the much longer
+  // grace window (graceMs, hours) is still waiting for.
+  const awaitingSettlement = isSettlementPending(room.settlementStatus);
+  if (room.status !== "in_progress" && !withinPostWindow && !awaitingSettlement) {
     return res.status(409).json({ error: "Verification window is not open for this race" });
   }
 
@@ -6678,7 +6805,18 @@ router.post("/races/:id/verify", requireAuth, async (req, res) => {
   void triggerEvent(`public-live-race-${raceId}`, "participant:verification_status_changed", {
     userId, verificationStatus: "received",
   });
-  return res.json({ accepted: true, verifiedCumulativeSteps: acceptedVerified });
+
+  // Re-kick settlement: this submission may be the last one the payout was waiting on.
+  // Without it a deferred race sits until the next cleanup tick even though the blocking
+  // verification has just arrived. Fire-and-forget — settlement must never delay or fail the
+  // client's verification response, and autoCompleteRace is idempotent.
+  if (awaitingSettlement) {
+    void autoCompleteRace(raceId, "verification_received").catch((err) => {
+      req.log.error({ err, raceId, userId }, "verify: settlement re-kick failed (cleanup tick will retry)");
+    });
+  }
+
+  return res.json({ accepted: true, verifiedCumulativeSteps: acceptedVerified, settlementPending: awaitingSettlement });
 });
 
 // ── GET /api/races/:id/result-status ──────────────────────────────────────────
