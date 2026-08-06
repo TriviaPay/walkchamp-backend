@@ -36,6 +36,7 @@ import {
   getRazorpay,
   getStripe,
   settleRazorpayPayment,
+  settleStripeCheckoutSession,
 } from "../lib/depositSettlement.js";
 import {
   verifyRazorpayCheckoutSignature,
@@ -207,8 +208,14 @@ router.post("/wallet/deposit/stripe/create-payment-intent", requireAuth, async (
   let stripe: StripeClient;
   try {
     stripe = getStripe();
-  } catch {
-    return res.status(503).json({ error: "Payment provider not configured." });
+  } catch (err) {
+    // Name the missing setting: this 503 is an operator problem, and a generic
+    // "not configured" gives whoever is on call nothing to act on.
+    req.log.error({ err, userId }, "[PaymentBackend] stripe: client unavailable — STRIPE_SECRET_KEY not configured");
+    return res.status(503).json({
+      error: "Stripe is not configured on this server. Set STRIPE_SECRET_KEY (and STRIPE_WEBHOOK_SECRET).",
+      code: "STRIPE_NOT_CONFIGURED",
+    });
   }
 
   const { amountCents } = parsed.data;
@@ -343,8 +350,37 @@ router.get("/wallet/deposit/stripe/return", async (req, res) => {
       return res.redirect(appDoneUrl("failed", transaction_id));
     }
 
+    // ── Settle on return, mirroring the Razorpay verify path ──────────────────
+    // This route previously only recorded metadata and redirected, leaving the webhook as the
+    // ONLY thing that could ever credit a Stripe deposit — so with no webhook registered, a
+    // paid Stripe deposit never reached the wallet while Razorpay (which settles inside
+    // /verify) worked fine. That asymmetry is the reason "Razorpay works, Stripe doesn't".
+    //
+    // This does not settle on the client's say-so: settleStripeCheckoutSession re-retrieves
+    // the session from Stripe and settleDepositOnce re-checks provider/order/amount/currency/
+    // metadata under a row lock, keyed by an idempotent ledger entry. The webhook arriving
+    // later (or a reconciliation tick) therefore cannot double-credit.
+    let settledStatus: string | null = null;
+    if (session.payment_status === "paid" || session.status === "complete") {
+      try {
+        const settlement = await settleStripeCheckoutSession(session.id, depositTx.id);
+        settledStatus = settlement.status;
+        req.log.info(
+          { transactionId: transaction_id, sessionId: session.id, settlementStatus: settlement.status, settled: settlement.settled },
+          "[PaymentBackend] stripe: settled on return",
+        );
+      } catch (settleErr) {
+        // Never fail the user's return page on a settlement error — the webhook and the
+        // deposit reconciliation tick both retry this transaction.
+        req.log.error(
+          { err: settleErr, transactionId: transaction_id, sessionId: session.id },
+          "[PaymentBackend] stripe: settle-on-return failed (webhook/reconciler will retry)",
+        );
+      }
+    }
+
     const displayStatus = getStripeReturnDisplayStatus({
-      depositStatus: depositTx.status,
+      depositStatus: settledStatus ?? depositTx.status,
       sessionPaymentStatus: session.payment_status,
       sessionStatus: session.status,
     });
@@ -353,6 +389,7 @@ router.get("/wallet/deposit/stripe/return", async (req, res) => {
       returnSeenAt: new Date().toISOString(),
       returnSessionIdVerified: true,
       returnDisplayStatus: displayStatus,
+      returnSettlementStatus: settledStatus,
     });
 
     return res.redirect(appDoneUrl(displayStatus, transaction_id));
