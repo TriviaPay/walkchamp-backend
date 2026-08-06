@@ -1263,7 +1263,9 @@ router.get("/sponsored-events/:roomId/results", requireAuth, async (req, res) =>
 
 // ── PATCH /api/sponsored-events/:roomId/target-steps ─────────────────────────
 // Admin/testing: update targetSteps for a scheduled or in_progress event.
-router.patch("/sponsored-events/:roomId/target-steps", requireAuth, async (req, res) => {
+// Admin-gated: sponsored rooms are global objects, so a plain requireAuth let any
+// authenticated user write to any event. Matches /sponsored-events/generate-weekend.
+router.patch("/sponsored-events/:roomId/target-steps", requireAuth, requireAdminKey, async (req, res) => {
   try {
     const roomId = String(req.params.roomId);
     const { targetSteps } = req.body as { targetSteps?: number };

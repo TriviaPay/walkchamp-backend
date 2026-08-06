@@ -103,6 +103,11 @@ function isRacePodiumRank(rank: number | null | undefined): boolean {
   return typeof rank === "number" && rank >= 1 && rank <= 3;
 }
 
+// Per-request work bounds for the unauthenticated GET /profile/public/:username route.
+// A streak stops at the first gap, so ~2 years of daily rows can always resolve it.
+const PUBLIC_STREAK_SCAN_DAYS = 750;
+const PUBLIC_RACE_HISTORY_LIMIT = 1000;
+
 // Compute consecutive-day streak from step_daily_totals rows (ordered by date desc).
 // A streak is consecutive days ending on today or yesterday with steps > 0.
 function computeStreak(rows: { date: string | Date; steps: number | null }[]): number {
@@ -560,21 +565,30 @@ router.get("/profile/public/:username", async (req, res) => {
   const p = rows[0];
   if (!p) return res.status(404).json({ error: "User not found" });
 
-  const [raceRows, pubStreakRows] = await Promise.all([
+  // This route is unauthenticated, so the work per request must be bounded regardless of how
+  // long an account has existed. The all-time total is aggregated in SQL rather than by
+  // transferring every daily row, and the streak scan is capped — a streak cannot extend past
+  // the first gap, so PUBLIC_STREAK_SCAN_DAYS of history is always enough to compute it.
+  const [raceRows, pubStreakRows, [pubAllTimeRow]] = await Promise.all([
     db.select({
         rank: raceResultsTable.rank,
         prizeCents: raceResultsTable.prizeCents,
         eligibleForPrize: raceResultsTable.eligibleForPrize,
       })
       .from(raceResultsTable)
-      .where(eq(raceResultsTable.userId, p.id)),
+      .where(eq(raceResultsTable.userId, p.id))
+      .limit(PUBLIC_RACE_HISTORY_LIMIT),
     db.select({ date: stepDailyTotalsTable.date, steps: stepDailyTotalsTable.steps })
       .from(stepDailyTotalsTable)
       .where(eq(stepDailyTotalsTable.userId, p.id))
-      .orderBy(desc(stepDailyTotalsTable.date)),
+      .orderBy(desc(stepDailyTotalsTable.date))
+      .limit(PUBLIC_STREAK_SCAN_DAYS),
+    db.select({ total: sql<number>`coalesce(sum(${stepDailyTotalsTable.steps}), 0)` })
+      .from(stepDailyTotalsTable)
+      .where(eq(stepDailyTotalsTable.userId, p.id)),
   ]);
 
-  const pubAllTime = pubStreakRows.reduce((sum, r) => sum + (r.steps ?? 0), 0);
+  const pubAllTime = Number(pubAllTimeRow?.total ?? 0);
   const lifetimeXP = computeXP(pubAllTime, raceRows);
   const levelData  = computeLevelData(lifetimeXP);
   const pubStreak  = computeStreak(pubStreakRows);

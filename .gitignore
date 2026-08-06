@@ -42,3 +42,7 @@ crash.log
 
 # Test / coverage
 coverage/
+
+# Security audit reports (local only — contain unpatched findings)
+SECURITY-SCAN.md
+security-scan-*.md

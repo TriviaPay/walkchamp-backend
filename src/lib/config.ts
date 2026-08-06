@@ -69,6 +69,7 @@ const envSchema = z
     DESCOPE_PROJECT_ID: z.string().optional(),
     DESCOPE_MANAGEMENT_KEY: z.string().optional(),
     MIN_SESSION_ENFORCE_VERSION: z.string().optional(),
+    OAUTH_ALLOWED_REDIRECT_URLS: z.string().optional(),
     SESSION_SECRET: z.string().optional(),
     CASH_FEATURES_ENABLED: z.enum(["true", "false"]).optional(),
     FEATURE_CASH_FEATURES: z.enum(["true", "false"]).optional(),
@@ -344,6 +345,23 @@ const absentVerificationPolicy: "strict_hold" | "pragmatic_fallback" | "strict_c
   return "pragmatic_fallback";
 })();
 
+// ── OAuth redirect allowlist ─────────────────────────────────────────────────
+// The mobile client sends the native deep-link callback; the web client sends
+// <origin>/auth-callback for its own origin (see frontend getOAuthCallbackUrl).
+// Derive both, and let OAUTH_ALLOWED_REDIRECT_URLS replace the list outright when a
+// deployment needs something else.
+const oauthAllowedRedirectUrls: string[] = (() => {
+  const explicit = splitCsv(rawEnv.OAUTH_ALLOWED_REDIRECT_URLS);
+  if (explicit.length > 0) return explicit;
+
+  const appBase = rawEnv.APP_BASE_URL?.trim().replace(/\/$/, "");
+  const webOrigins = [...allowedOrigins, ...(appBase ? [appBase] : [])];
+  return [
+    "globalwalkerleague://auth-callback",
+    ...webOrigins.map((origin) => `${origin.replace(/\/$/, "")}/auth-callback`),
+  ];
+})();
+
 export const config = {
   nodeEnv,
   isProduction,
@@ -443,6 +461,12 @@ export const config = {
     // (e.g. "1.5.0") to additionally require any client at/above that version to present a valid
     // active session.
     minSessionEnforceVersion: rawEnv.MIN_SESSION_ENFORCE_VERSION?.trim() || null,
+    /**
+     * Exact-match allowlist for the `redirectUrl` accepted by POST /api/auth/oauth/start.
+     * Anything not on this list is refused, so an attacker cannot point the OAuth callback
+     * (and therefore the authorization `code`) at a host they control.
+     */
+    oauthRedirectUrls: oauthAllowedRedirectUrls,
   },
   payments: {
     stripeSecretKey: rawEnv.STRIPE_SECRET_KEY?.trim() ?? null,

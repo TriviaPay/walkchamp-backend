@@ -21,7 +21,13 @@ import {
   awardAdReward,
   MAX_DAILY_AD_REWARDS,
 } from "../lib/coinsService.js";
+import { validateRecentLocalDate } from "../lib/localDate.js";
 import { z } from "zod";
+
+/** Server UTC date, used when the client sends no localDate. */
+function serverUtcDate(): string {
+  return new Date().toISOString().split("T")[0]!;
+}
 
 const EARNING_RULES = [
   { id: "walk_any_steps",      icon: "🚶", title: "Walk any steps today",         rewardText: "+1"                             },
@@ -464,8 +470,19 @@ router.post("/coins/ad-reward", requireAuth, requireActiveAccount, async (req, r
       return res.status(400).json({ error: "Invalid ad reward payload" });
     }
 
-    const rawLD = typeof parsed.data.localDate === "string" ? parsed.data.localDate : "";
-    const today = /^\d{4}-\d{2}-\d{2}$/.test(rawLD) ? rawLD : new Date().toISOString().split("T")[0]!;
+    // The daily cap and the reward code are both keyed on this date, so an unbounded
+    // localDate hands out a fresh MAX_DAILY_AD_REWARDS allowance per date the client asks
+    // for. Same guard POST /api/walk/steps applies for the same reason.
+    let today: string;
+    if (parsed.data.localDate !== undefined) {
+      const dv = validateRecentLocalDate(parsed.data.localDate, { pastDays: 1, futureDays: 1 });
+      if (!dv.ok) {
+        return res.status(400).json({ error: "Ad reward date is out of the allowed range.", code: dv.code });
+      }
+      today = dv.normalized;
+    } else {
+      today = serverUtcDate();
+    }
 
     const result = await awardAdReward(userId, today, {
       claimId: parsed.data.claim_id,
@@ -485,8 +502,9 @@ router.post("/coins/ad-reward", requireAuth, requireActiveAccount, async (req, r
   } catch (err) {
     const code = (err as { code?: string }).code;
     if (code === "AD_REWARD_LIMIT") {
-      const rawLD = typeof req.body?.localDate === "string" ? req.body.localDate : "";
-      const today = /^\d{4}-\d{2}-\d{2}$/.test(rawLD) ? rawLD : new Date().toISOString().split("T")[0]!;
+      // Re-derive through the same validator — never fall back to the raw body value.
+      const dv = validateRecentLocalDate(req.body?.localDate, { pastDays: 1, futureDays: 1 });
+      const today = dv.ok ? dv.normalized : serverUtcDate();
       const status = await getDailyAdRewardStatus(userId, today);
       return res.status(429).json({
         error: "You've reached today's ad reward limit. Come back tomorrow!",

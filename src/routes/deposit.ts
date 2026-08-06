@@ -56,6 +56,8 @@ const MAX_STRIPE_CENTS = 50000;
 const MIN_RAZORPAY_PAISE = 1000;
 const MAX_RAZORPAY_PAISE = 5000000;
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9._:-]{8,160}$/;
+/** Deposit transaction ids are UUIDs. Anything else must never reach a DB query or an HTML page. */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function getBaseUrl(): string {
   const appBase = config.appBaseUrl;
@@ -649,7 +651,9 @@ router.post("/wallet/deposit/razorpay/create-order", requireAuth, async (req, re
  */
 router.get("/wallet/deposit/razorpay/checkout", async (req, res) => {
   const { tid } = req.query as Record<string, string>;
-  if (!tid) return res.status(400).send("Missing transaction ID.");
+  // Validate before the DB call: a non-UUID against a uuid column raises a driver error,
+  // and `tid` is interpolated into the inline script below.
+  if (!tid || !UUID_PATTERN.test(tid)) return res.status(400).send("Missing transaction ID.");
 
   const [depositTx] = await db
     .select()
@@ -663,6 +667,13 @@ router.get("/wallet/deposit/razorpay/checkout", async (req, res) => {
 
   if (depositTx.status === "succeeded") {
     return res.redirect(appDoneUrl("success", tid));
+  }
+
+  // This page is opened by the payment browser, which carries no auth header, so ownership
+  // cannot be checked here. Limit the blast radius of a leaked transaction id by refusing to
+  // render provider order details for any deposit that is no longer awaiting payment.
+  if (depositTx.status !== "pending" && depositTx.status !== "processing") {
+    return res.status(409).send("This payment is no longer open.");
   }
 
   const keyId = process.env.RAZORPAY_KEY_ID ?? "";
@@ -902,7 +913,13 @@ router.get("/wallet/deposit/razorpay/verify", async (req, res) => {
 router.get("/wallet/deposit/done", (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
-  const transactionId = (req.query as Record<string, string>).transaction_id ?? "";
+  // Only a well-formed UUID is ever interpolated into the inline script below.
+  // JSON.stringify does NOT escape "<" or "/", so an unvalidated value containing
+  // "</script>" would close the script element and inject arbitrary HTML.
+  const rawTransactionId = (req.query as Record<string, unknown>).transaction_id;
+  const transactionId = typeof rawTransactionId === "string" && UUID_PATTERN.test(rawTransactionId)
+    ? rawTransactionId
+    : "";
   return res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -930,7 +947,8 @@ router.get("/wallet/deposit/done", (req, res) => {
   <script>
     var params = new URLSearchParams(location.search);
     var status = params.get('status') || 'success';
-    var tid = ${JSON.stringify(transactionId)} || params.get('transaction_id') || '';
+    /* Server-validated UUID only — no raw query-param fallback. */
+    var tid = ${JSON.stringify(transactionId)};
     var icons = { success:'✅', processing:'⏳', failed:'❌', cancelled:'↩️' };
     var titles = { success:'Payment Complete', processing:'Payment Processing', failed:'Payment Failed', cancelled:'Payment Cancelled' };
     var bodies = {
@@ -939,7 +957,8 @@ router.get("/wallet/deposit/done", (req, res) => {
       failed:    'Your payment could not be processed.',
       cancelled: 'Payment was cancelled.'
     };
-    var s = (icons[status] ? status : 'success');
+    /* hasOwnProperty, not truthiness — "constructor"/"toString" would pass a bare lookup. */
+    var s = Object.prototype.hasOwnProperty.call(icons, status) ? status : 'success';
     var deepLink = 'globalwalkerleague://payment-complete?status=' + s + (tid ? '&transaction_id=' + encodeURIComponent(tid) : '');
     document.getElementById('root').innerHTML =
       '<div class="icon">' + icons[s] + '</div>' +
@@ -1231,17 +1250,17 @@ router.post("/webhooks/razorpay", async (req, res) => {
     ? JSON.parse(req.body.toString())
     : req.body) as Record<string, unknown>;
   const eventType = String(body.event ?? "");
-  const headerEventId = typeof req.headers["x-razorpay-event-id"] === "string"
-    && req.headers["x-razorpay-event-id"].trim()
-    ? req.headers["x-razorpay-event-id"].trim()
-    : null;
+  // The HMAC covers the raw body only — x-razorpay-event-id is NOT signed. Keying dedupe on
+  // that header would let a replay of a captured webhook pick a fresh id and bypass the
+  // already-processed check, so the id is derived exclusively from signed material: the body's
+  // own event id when present, otherwise a digest of the exact signed bytes.
   const bodyEventId = typeof body.id === "string" && body.id.trim() ? body.id.trim() : null;
-  const eventId = headerEventId ?? bodyEventId ?? `rzp-${createHash("sha256").update(rawBody).digest("hex").slice(0, 32)}`;
+  const eventId = bodyEventId ?? `rzp-${createHash("sha256").update(rawBody).digest("hex").slice(0, 32)}`;
 
-  if (!headerEventId) {
+  if (!bodyEventId) {
     req.log.warn(
-      { eventType, eventId, hasBodyEventId: Boolean(bodyEventId) },
-      "[PaymentBackend] razorpay webhook missing x-razorpay-event-id; using fallback id",
+      { eventType, eventId },
+      "[PaymentBackend] razorpay webhook body carried no event id; using signed-payload digest",
     );
   }
 

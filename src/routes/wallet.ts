@@ -222,7 +222,16 @@ router.get("/wallet/withdrawals", requireAuth, async (req, res) => {
 const withdrawSchema = z.object({
   amount: z.number().positive().finite(),
   payoutMethod: z.enum(["paypal", "bank_transfer", "upi", "gift_card"]),
-  payoutDetails: z.record(z.string()),
+  // Bounded: this map is persisted verbatim as JSON, so an unbounded record lets a single
+  // request write up to the whole body limit into the withdrawals row.
+  payoutDetails: z
+    .record(z.string().max(200))
+    .refine((details) => Object.keys(details).length <= 20, {
+      message: "payoutDetails may contain at most 20 fields",
+    })
+    .refine((details) => Object.keys(details).every((key) => key.length <= 64), {
+      message: "payoutDetails keys must be 64 characters or fewer",
+    }),
   idempotencyKey: z.string().optional(),
 });
 

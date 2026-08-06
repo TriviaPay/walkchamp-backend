@@ -299,6 +299,7 @@ type CreateProfileData = z.infer<typeof createProfileSchema>;
 // JWT-only: onboarding runs before the client holds a session id.
 router.post("/auth/profile", requireJwtOnly, async (req, res) => {
   const authUserId = (req as AuthenticatedRequest).descopeUserId;
+  const verifiedEmail = (req as AuthenticatedRequest).descopeEmail?.trim().toLowerCase() || null;
 
   const parse = createProfileSchema.safeParse(req.body);
   if (!parse.success) {
@@ -309,6 +310,13 @@ router.post("/auth/profile", requireJwtOnly, async (req, res) => {
   // Security: ignore descopeUserId from body — always use the verified JWT subject
   if (data.descopeUserId !== authUserId) {
     return res.status(403).json({ error: "User ID mismatch" });
+  }
+
+  // Same rule for email. The row is written with emailVerified: true, so accepting the body
+  // value would let a user register a profile under someone else's address. The JWT claim is
+  // the only trustworthy source; reject rather than silently rewrite so the client sees why.
+  if (verifiedEmail && data.email.trim().toLowerCase() !== verifiedEmail) {
+    return res.status(403).json({ error: "Email mismatch" });
   }
 
   if (isBlockedUsername(data.username)) {
@@ -337,7 +345,7 @@ router.post("/auth/profile", requireJwtOnly, async (req, res) => {
       .insert(profilesTable)
       .values({
         id: authUserId,
-        email: data.email.toLowerCase().trim(),
+        email: verifiedEmail ?? data.email.toLowerCase().trim(),
         fullName: data.fullName.trim(),
         username: data.username.toLowerCase().trim(),
         dateOfBirth: dob.normalized,
@@ -602,10 +610,15 @@ router.post("/auth/password/signin", async (req, res) => {
     const client = getDescopeClient();
     const signInResult = await client.password.signIn(loginId, parse.data.password);
     if (!signInResult.ok || !signInResult.data) {
-      req.log.warn({ descopeCode: signInResult.code }, "password/signin: Descope rejected credentials");
+      req.log.warn(
+        { descopeCode: signInResult.code, descopeError: signInResult.error },
+        "password/signin: Descope rejected credentials",
+      );
+      // Uniform message regardless of cause — the provider's errorDescription distinguishes
+      // "no such user" from "wrong password", which enables account enumeration.
       return res.status(401).json({
         error: "invalid_credentials",
-        message: signInResult.error?.errorDescription ?? "Invalid login credentials",
+        message: "Invalid login credentials",
       });
     }
 
@@ -686,7 +699,9 @@ router.post("/auth/reset-password/complete", async (req, res) => {
     if (e.message?.toLowerCase().includes("expired") || e.message?.toLowerCase().includes("used")) {
       return res.status(401).json({ error: "token_expired", message: "Reset link has expired. Please request a new one." });
     }
-    return res.status(500).json({ error: "server_error", message: e.message ?? "Password reset failed" });
+    // Do not forward the provider's message — it is already logged above, and echoing it
+    // leaks account-existence and internal detail to an unauthenticated caller.
+    return res.status(500).json({ error: "server_error", message: "Password reset failed" });
   }
 });
 
@@ -795,9 +810,17 @@ router.post("/auth/apple/native", async (req, res) => {
       return res.status(401).json({ error: "invalid_token", message: msg });
     }
     const { sub: appleUserId, email, emailVerified } = claims;
-    // Use email as loginId; Apple private-relay / missing email falls back to apple:<sub>
-    const loginId = email || `apple:${appleUserId}`;
-    req.log.info({ loginId, hasEmail: !!email }, "[AuthApple] token verified");
+    // Only a VERIFIED Apple email may be used as the login id. An unverified email would let
+    // an Apple identity resolve to — and mint a session for — a pre-existing account created
+    // through the email/password flow, because the branch below treats "user already exists"
+    // as "sign this user in". Unverified/private-relay/missing email falls back to the Apple
+    // subject, which is unique to this identity and cannot collide with another account.
+    const verifiedEmail = emailVerified && email ? email : null;
+    const loginId = verifiedEmail ?? `apple:${appleUserId}`;
+    req.log.info(
+      { loginId, hasEmail: !!email, emailVerified: !!emailVerified },
+      "[AuthApple] token verified",
+    );
 
     const client = getDescopeClient();
 
@@ -807,14 +830,14 @@ router.post("/auth/apple/native", async (req, res) => {
       const displayName = appleUser?.name ?? undefined;
       const createResp = await client.management.user.create(
         loginId,
-        email ?? undefined,
+        verifiedEmail ?? undefined,
         undefined,
         displayName ?? undefined,
         [],
         [],
         {},
         undefined,
-        !!(emailVerified && email),
+        Boolean(verifiedEmail),
       );
       if (!createResp.ok) {
         const msg = createResp.error?.errorDescription ?? "Failed to create user account";
@@ -875,20 +898,26 @@ router.post("/auth/apple/native", async (req, res) => {
 const DESCOPE_OAUTH_PROVIDERS = ["google", "apple"] as const;
 type DescopeOAuthProvider = (typeof DESCOPE_OAUTH_PROVIDERS)[number];
 
-// Accept both standard HTTP/HTTPS URLs and native deep-link schemes (e.g. globalwalkerleague://)
+// Exact-match allowlist. A permissive check here is an account-takeover primitive: this
+// endpoint is unauthenticated, so anyone could mint a Descope OAuth URL that delivers the
+// authorization `code` to a host they control, then trade it for a session at
+// /auth/oauth/exchange (also unauthenticated). Normalize only a trailing slash so
+// "https://app.example/auth-callback/" and "…/auth-callback" are treated alike.
+function normalizeRedirectUrl(url: string): string {
+  return url.trim().replace(/\/$/, "");
+}
+
 function isValidRedirectUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol.length > 0;
-  } catch {
-    return false;
-  }
+  const candidate = normalizeRedirectUrl(url);
+  return config.auth.oauthRedirectUrls.some(
+    (allowed) => normalizeRedirectUrl(allowed) === candidate,
+  );
 }
 
 const oauthStartSchema = z.object({
   provider: z.enum(DESCOPE_OAUTH_PROVIDERS),
   redirectUrl: z.string().min(1, "redirectUrl required").refine(isValidRedirectUrl, {
-    message: "Invalid redirect URL — must be a valid URL or deep-link scheme",
+    message: "Redirect URL is not on the allowlist",
   }),
 });
 

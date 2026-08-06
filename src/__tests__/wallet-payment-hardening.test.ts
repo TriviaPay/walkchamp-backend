@@ -198,7 +198,10 @@ describe("wallet payment hardening", () => {
     const processor = readFileSync("src/lib/depositWebhookProcessor.ts", "utf8");
 
     expect(depositRoute).toContain("processingStatus: \"signature_verified\"");
-    expect(depositRoute).toContain("req.headers[\"x-razorpay-event-id\"]");
+    // The Razorpay HMAC covers the raw body only. Deriving the dedupe id from the unsigned
+    // x-razorpay-event-id header would let a replay pick a fresh id and slip past the
+    // already-processed check, so the id must come from signed material exclusively.
+    expect(depositRoute).not.toContain("req.headers[\"x-razorpay-event-id\"]");
     expect(depositRoute).toContain("createHash(\"sha256\").update(rawBody)");
     expect(depositRoute).toContain("recordOutboxEvent");
     expect(depositRoute).toContain("eventType: \"deposit_webhook.process\"");
