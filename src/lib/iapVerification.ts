@@ -298,10 +298,18 @@ async function verifyApple(input: IapVerifyInput): Promise<IapVerifyResult> {
 
   // Production first; a sandbox transaction id simply is not present there (404), which is
   // how Apple expects servers to route TestFlight and App Review purchases.
+  //
+  // 401/403 also retries in sandbox: an app that is not yet live on the App Store has no
+  // production StoreKit environment, so a perfectly valid In-App Purchase key is accepted by
+  // the sandbox host and rejected by the production one. Without this retry every TestFlight
+  // and App Review purchase fails as a server misconfiguration. If sandbox rejects the key
+  // too, the 401 handling below still reports it as one.
   let environment: "production" | "sandbox" = "production";
   let outcome = await httpJson(`${APPLE_PRODUCTION_HOST}${path}`, { method: "GET", headers });
 
-  if (outcome.kind === "http" && outcome.status === 404 && appleSandboxAllowed()) {
+  const retryableInSandbox =
+    outcome.kind === "http" && (outcome.status === 404 || outcome.status === 401 || outcome.status === 403);
+  if (retryableInSandbox && appleSandboxAllowed()) {
     environment = "sandbox";
     outcome = await httpJson(`${APPLE_SANDBOX_HOST}${path}`, { method: "GET", headers });
   }

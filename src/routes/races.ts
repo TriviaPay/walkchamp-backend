@@ -2892,6 +2892,15 @@ router.post("/rooms/:roomId/register", requireAuth, async (req, res) => {
     registered_count: registeredCount,
   }).catch(() => {});
 
+  // Waiting Room of the scheduled room itself — refresh its roster live.
+  triggerEvent(`public-live-race-${roomId}`, "race:player-joined", { userId, raceId: roomId }).catch(() => {});
+  triggerEvent(`public-live-race-${roomId}`, "room:registered", {
+    room_id: roomId,
+    raceId: roomId,
+    userId,
+    registered_count: registeredCount,
+  }).catch(() => {});
+
   return res.json({
     success: true,
     registered: true,
@@ -2944,6 +2953,14 @@ router.post("/rooms/:roomId/cancel-registration", requireAuth, async (req, res) 
 
   triggerEvent("public-rooms-available", "room:registration_cancelled", {
     room_id: roomId,
+    registered_count: registeredCount,
+  }).catch(() => {});
+
+  triggerEvent(`public-live-race-${roomId}`, "race:player-left", { userId, raceId: roomId }).catch(() => {});
+  triggerEvent(`public-live-race-${roomId}`, "room:registration_cancelled", {
+    room_id: roomId,
+    raceId: roomId,
+    userId,
     registered_count: registeredCount,
   }).catch(() => {});
 
@@ -5317,7 +5334,11 @@ router.get("/races/:id", requireAuth, async (req, res) => {
   //  d) fixed free/coins/cash hit the 24h max (cleanupOverdueRaces).
   // Do NOT end a race just because a short local timer elapsed.
 
-  const isWaitingRoom = room.status === "open" || room.status === "full";
+  // Scheduled (future) rooms hold their roster in scheduled_room_registrations until
+  // materialize-at-start copies it into race_participants. Treat them as a waiting room so the
+  // lobby grid gets the same enriched roster as open/full rooms.
+  const isScheduledLobby = room.status === "scheduled";
+  const isWaitingRoom = room.status === "open" || room.status === "full" || isScheduledLobby;
 
   // Base participant shape — extended for waiting rooms
   type BaseParticipant = {
@@ -5346,6 +5367,8 @@ router.get("/races/:id", requireAuth, async (req, res) => {
   };
 
   let participantRows: BaseParticipant[];
+  // userIds sourced from scheduled_room_registrations — surfaced separately in the response.
+  const registeredUserIds = new Set<string>();
 
   if (room.status === "completed") {
     const results = await db
@@ -5579,6 +5602,65 @@ router.get("/races/:id", requireAuth, async (req, res) => {
       }
     }
 
+    // Scheduled rooms: race_participants is empty until start, so the roster lives in
+    // scheduled_room_registrations. Fold registered users into participants (deduped against any
+    // rows that already exist) so the Waiting Room grid matches registeredCount.
+    if (isScheduledLobby) {
+      const registrations = await db
+        .select({
+          registrationId: scheduledRoomRegistrationsTable.id,
+          userId: scheduledRoomRegistrationsTable.userId,
+          username: profilesTable.username,
+          country: profilesTable.country,
+          countryFlag: profilesTable.countryFlag,
+          avatarColor: profilesTable.avatarColor,
+          avatarUrl: profilesTable.avatarUrl,
+          updatedAt: profilesTable.updatedAt,
+        })
+        .from(scheduledRoomRegistrationsTable)
+        .leftJoin(profilesTable, eq(scheduledRoomRegistrationsTable.userId, profilesTable.id))
+        .where(and(
+          eq(scheduledRoomRegistrationsTable.raceRoomId, raceId),
+          inArray(scheduledRoomRegistrationsTable.status, ["registered", "active"]),
+        ))
+        .orderBy(asc(scheduledRoomRegistrationsTable.registeredAt));
+
+      const existingUserIds = new Set(participantRows.map((p) => p.userId));
+      for (const r of registrations) {
+        registeredUserIds.add(r.userId);
+        if (existingUserIds.has(r.userId)) continue;
+        existingUserIds.add(r.userId);
+        participantRows.push({
+          // Registration id keeps the grid key stable until the participant row is materialized.
+          id: r.registrationId,
+          userId: r.userId,
+          currentSteps: 0,
+          status: "registered",
+          rank: null,
+          displayRank: null,
+          prizeCents: 0,
+          prizeCoins: 0,
+          isTied: false,
+          tieGroupSize: 1,
+          eligibleForPrize: false,
+          // Missing profile must not drop the registrant from the roster.
+          username: r.username?.trim() || "Walker",
+          country: r.country ?? null,
+          countryFlag: r.countryFlag ?? null,
+          avatarColor: r.avatarColor ?? null,
+          avatarUrl: r.avatarUrl ?? null,
+          avatarVersion: r.updatedAt?.getTime() ?? 0,
+          isHost: r.userId === room.creatorId,
+          isCurrentUser: r.userId === userId,
+          friendStatus: "none",
+          friendRequestId: null,
+          activeTitle: null,
+        });
+      }
+      // Host first, then registration order.
+      participantRows.sort((a, b) => Number(b.isHost) - Number(a.isHost));
+    }
+
     // For waiting rooms: enrich with friendStatus and activeTitle
     if (isWaitingRoom && participantRows.length > 0) {
       const allIds = participantRows.map((p) => p.userId);
@@ -5647,6 +5729,21 @@ router.get("/races/:id", requireAuth, async (req, res) => {
   const trackTheme = trackThemeForCode(room.trackLayout, mediaMap);
   const challengeTime = buildChallengeTimeFields(room);
 
+  const responseParticipants = participantRows.map((p) => ({
+    ...p,
+    prizeAmount: p.prizeCents / 100,
+    isWinner: room.type === "sponsored"
+      ? p.eligibleForPrize && p.prizeCents > 0
+      : p.rank !== null && p.rank <= winnerCount,
+  }));
+  // Scheduled rooms have currentPlayers = 0 until start; the lobby count is the registered roster.
+  const displayParticipantCount = isScheduledLobby
+    ? Math.max(room.registeredCount, responseParticipants.length)
+    : room.currentPlayers;
+  const registeredParticipants = isScheduledLobby
+    ? responseParticipants.filter((p) => registeredUserIds.has(p.userId))
+    : [];
+
   return res.json({
     race: {
       ...room,
@@ -5673,8 +5770,8 @@ router.get("/races/:id", requireAuth, async (req, res) => {
       minParticipants: room.minimumParticipants ?? config.waitingRoom.minimumParticipants,
       minimum_participants: room.minimumParticipants ?? config.waitingRoom.minimumParticipants,
       min_players: room.minimumParticipants ?? config.waitingRoom.minimumParticipants,
-      participantCount: room.currentPlayers,
-      participant_count: room.currentPlayers,
+      participantCount: displayParticipantCount,
+      participant_count: displayParticipantCount,
       maximumParticipants: room.maxPlayers,
       roomCreatedAt: room.createdAt,
       room_created_at: room.createdAt,
@@ -5687,13 +5784,10 @@ router.get("/races/:id", requireAuth, async (req, res) => {
       cancelReason: room.cancellationReason,
       cancelled_at: room.cancelledAt,
     },
-    participants: participantRows.map((p) => ({
-      ...p,
-      prizeAmount: p.prizeCents / 100,
-      isWinner: room.type === "sponsored"
-        ? p.eligibleForPrize && p.prizeCents > 0
-        : p.rank !== null && p.rank <= winnerCount,
-    })),
+    participants: responseParticipants,
+    // Same roster under the aliases the Waiting Room reads for scheduled rooms.
+    registrations: registeredParticipants,
+    registeredParticipants,
   });
 });
 

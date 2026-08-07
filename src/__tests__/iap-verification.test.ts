@@ -213,6 +213,33 @@ describe("Apple App Store verification", () => {
     expect(calls).toHaveLength(1); // sandbox host never tried
   });
 
+  it("retries in sandbox when production 401s, so a not-yet-live app still verifies", async () => {
+    // Observed in production 2026-08-07: the same In-App Purchase key that sandbox accepts
+    // (404 "Transaction id not found") is 401'd by the production host until the app ships.
+    // Treating that 401 as terminal would fail every TestFlight and App Review purchase.
+    configureApple();
+    const calls = stubFetch((url) =>
+      url.startsWith("https://api.storekit-sandbox")
+        ? { status: 200, body: { signedTransactionInfo: appleJws(appleTransaction({ environment: "Sandbox" })) } }
+        : { status: 401, body: "" },
+    );
+
+    const result = await verifyStorePurchase(micPassInput);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.purchase.environment).toBe("sandbox");
+    expect(calls).toHaveLength(2);
+  });
+
+  it("still reports NOT_CONFIGURED when sandbox rejects the key as well", async () => {
+    configureApple();
+    const calls = stubFetch(() => ({ status: 401, body: "" }));
+
+    const result = await verifyStorePurchase(micPassInput);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("IAP_VERIFICATION_NOT_CONFIGURED");
+    expect(calls).toHaveLength(2);
+  });
+
   it("rejects a receipt whose product is not the one the client claimed", async () => {
     configureApple();
     stubFetch(() => ({
