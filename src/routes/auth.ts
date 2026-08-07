@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { getDescopeClient } from "../lib/descope.js";
 import { requireAuth, requireJwtOnly, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { parseAndValidateDob } from "../lib/dateOfBirth.js";
-import { generateReferralCode } from "../lib/inviteCodes.js";
+import { withUniqueReferralCode } from "../lib/uniqueCodes.js";
 import { config } from "../lib/config.js";
 import {
   registerOrReplaceSession,
@@ -338,10 +338,11 @@ router.post("/auth/profile", requireJwtOnly, async (req, res) => {
   }
   const age = dob.age;
   const isAdult = age >= 18;
-  const referralCode = generateReferralCode();
 
   try {
-    const [profile] = await db
+    // The invitation code is issued once here and never rotated, so it is allocated against the
+    // unique index (and retried if another signup claims it first).
+    const [profile] = await withUniqueReferralCode((referralCode) => db
       .insert(profilesTable)
       .values({
         id: authUserId,
@@ -370,7 +371,7 @@ router.post("/auth/profile", requireJwtOnly, async (req, res) => {
         profileCompleted: true,
         lastLoginAt: new Date(),
       })
-      .returning();
+      .returning());
 
     return res.status(201).json({ profile });
   } catch (err: unknown) {
@@ -518,10 +519,10 @@ router.post("/auth/complete-signup", requireJwtOnly, async (req, res) => {
 
   const age = dob.age;
   const isAdult = age >= 18;
-  const referralCode = generateReferralCode();
 
   try {
-    const [profile] = await db.transaction(async (tx) => {
+    // Issued once, never rotated — allocate against the unique index (see withUniqueReferralCode).
+    const [profile] = await withUniqueReferralCode((referralCode) => db.transaction(async (tx) => {
       const [p] = await tx
         .insert(profilesTable)
         .values({
@@ -559,7 +560,7 @@ router.post("/auth/complete-signup", requireJwtOnly, async (req, res) => {
         .onConflictDoNothing();
 
       return [p];
-    });
+    }));
 
     return res.status(201).json({ profile });
   } catch (err: unknown) {

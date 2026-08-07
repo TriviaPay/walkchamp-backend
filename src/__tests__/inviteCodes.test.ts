@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
-import { generateInviteCode, generateReferralCode } from "../lib/inviteCodes.js";
+import {
+  REFERRAL_CODE_LENGTH,
+  ROOM_CODE_LENGTH,
+  generateInviteCode,
+  generateReferralCode,
+  generateRoomCode,
+} from "../lib/inviteCodes.js";
 
 const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -39,14 +45,25 @@ describe("invite code generation (H-8)", () => {
     }
   });
 
-  it("referral codes carry the WC prefix and a secure body", () => {
-    const ref = generateReferralCode();
-    expect(ref.startsWith("WC")).toBe(true);
-    expect(ref.length).toBe(14);
+  it("room and invitation codes are 6 alphanumeric characters", () => {
+    for (const code of [generateRoomCode(), generateReferralCode()]) {
+      expect(code.length).toBe(6);
+      expect(code).toMatch(/^[A-Z2-9]{6}$/);
+      for (const ch of code) expect(ALPHABET).toContain(ch);
+    }
+    expect(ROOM_CODE_LENGTH).toBe(6);
+    expect(REFERRAL_CODE_LENGTH).toBe(6);
+  });
+
+  it("short codes are still drawn from the CSPRNG, not a counter or timestamp", () => {
+    const seen = new Set(Array.from({ length: 2000 }, () => generateRoomCode()));
+    // 32^6 ≈ 1.07e9, so 2000 draws should essentially never repeat. Duplicates here would mean
+    // the source is not random — real collision risk is handled by the DB-backed allocator.
+    expect(seen.size).toBeGreaterThan(1990);
   });
 
   it("never uses Math.random for codes in the code paths that generate them", () => {
-    for (const file of ["src/lib/inviteCodes.ts", "src/routes/groups.ts", "src/routes/auth.ts", "src/routes/races.ts"]) {
+    for (const file of ["src/lib/inviteCodes.ts", "src/lib/uniqueCodes.ts", "src/routes/groups.ts", "src/routes/auth.ts", "src/routes/races.ts"]) {
       const src = readFileSync(file, "utf8");
       expect(src).not.toContain("Math.random().toString(36)");
     }

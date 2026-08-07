@@ -11,7 +11,7 @@ import { debitWalletForCashChallenge, createRefundForRaceParticipantTx } from ".
 import { creditEntryRefunds } from "./cashChallengePayments.js";
 import { computeIsAdult } from "./dateOfBirth.js";
 import { isCashChallengeUnsupportedForCountry } from "./cashChallengeFees.js";
-import { generateInviteCode } from "./inviteCodes.js";
+import { allocateChallengeCode } from "./uniqueCodes.js";
 import { isValidTimezone, validateUnlimitedSchedule } from "./challengeDayWindow.js";
 import {
   UNLIMITED_PLATFORM_FEE_CENTS,
@@ -116,7 +116,8 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
   // Settlement waits until all days are finalized; the timer just needs to be past the last window +
   // grace. Add a timezone safety margin so far-east/west participants' last days are covered.
   const settlementNotBeforeUtc = new Date(challengeEndAtUtc.getTime() + config.unlimitedGoal.graceMs + 26 * 60 * 60_000);
-  const inviteCode = input.visibility === "private" ? generateInviteCode() : null;
+  // 6-char code, allocated against the unique index (see allocateChallengeCode).
+  const inviteCode = input.visibility === "private" ? await allocateChallengeCode() : null;
 
   const result = await db.transaction(async (tx) => {
     await acquireOneChallengeLock(tx, userId);

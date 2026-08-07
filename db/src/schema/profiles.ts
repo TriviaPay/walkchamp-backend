@@ -31,7 +31,9 @@ export const profilesTable = pgTable("profiles", {
   countryFlag: text("country_flag"),
   region: text("region"),
   phoneNumber: text("phone_number"),
-  referralCode: text("referral_code"),
+  // 6-char invitation code, issued at signup and never rotated. Unique because the short code
+  // space (32^6) is small enough that two users could otherwise be handed the same one.
+  referralCode: text("referral_code").unique(),
   referredBy: text("referred_by"),
   authProvider: text("auth_provider").notNull().default("email"),
   emailVerified: boolean("email_verified").notNull().default(false),

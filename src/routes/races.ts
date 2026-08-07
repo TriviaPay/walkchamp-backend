@@ -28,7 +28,7 @@ import {
 import { eq, and, desc, asc, sql, ne, inArray, notInArray, or, lt } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
-import { generateInviteCode } from "../lib/inviteCodes.js";
+import { allocateRoomCode } from "../lib/uniqueCodes.js";
 import { triggerEvent } from "../lib/pusher.js";
 import { logger } from "../lib/logger.js";
 import { config } from "../lib/config.js";
@@ -3374,9 +3374,10 @@ router.post("/races/host", requireAuth, async (req, res) => {
     coins_battle: "Coins Battle",
   };
 
-  // CSPRNG code with rejection sampling (no modulo bias) and ≥64 bits of
-  // entropy so private/cash rooms cannot be enumerated by brute force.
-  const inviteCode = isPrivate ? generateInviteCode() : null;
+  // 6-char CSPRNG code with rejection sampling (no modulo bias), allocated against the unique
+  // index so two private rooms can never share a code. Enumeration is held off by the enforced
+  // join-by-code rate limiter rather than by code length.
+  const inviteCode = isPrivate ? await allocateRoomCode() : null;
 
   const durationDays = challengeDurationDays ?? 0;
   let challengeEndAt: Date | null = null;
@@ -4447,9 +4448,8 @@ router.post("/races", requireAuth, async (req, res) => {
     if ((profile.fraudScore ?? 0) >= 70) return res.status(403).json({ error: "Your account is under review." });
   }
 
-  // CSPRNG code with ≥64 bits of entropy (replaces the brute-forceable 4-byte
-  // hex code) so private rooms cannot be enumerated.
-  const inviteCode = data.isPrivate ? generateInviteCode() : null;
+  // 6-char CSPRNG code, allocated against the unique index (see allocateRoomCode).
+  const inviteCode = data.isPrivate ? await allocateRoomCode() : null;
 
   let createConflict: RegularRaceRegistrationRow | null = null;
   const [room] = await db.transaction(async (tx) => {

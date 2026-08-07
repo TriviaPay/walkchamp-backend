@@ -36,7 +36,23 @@ export function generateInviteCode(length = 13): string {
   return out.join("");
 }
 
-/** Referral codes: `WC` prefix + secure body (kept short but ≥60 bits). */
+// ── Short, human-shareable codes ─────────────────────────────────────────────
+// Room and invitation codes are read aloud, typed by hand, and screenshotted, so they are 6
+// characters. That is ~30 bits (32^6 ≈ 1.07e9) — small enough that collisions are a real
+// possibility at scale, so these MUST be allocated through src/lib/uniqueCodes.ts, which
+// retries against the unique index instead of trusting entropy alone.
+export const ROOM_CODE_LENGTH = 6;
+export const REFERRAL_CODE_LENGTH = 6;
+
+/** Private room / private challenge join code (6 chars, no ambiguous glyphs). */
+export function generateRoomCode(): string {
+  return generateInviteCode(ROOM_CODE_LENGTH);
+}
+
+/**
+ * Invitation (referral) code — one per user, issued at signup and never rotated, so it can be
+ * printed, shared, and remembered for the lifetime of the account.
+ */
 export function generateReferralCode(): string {
-  return "WC" + generateInviteCode(12);
+  return generateInviteCode(REFERRAL_CODE_LENGTH);
 }

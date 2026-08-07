@@ -314,6 +314,21 @@ if (config.features.rateLimitingEnabled) {
     dimensions: ["ip", "actor", "device", "token"],
     enforcement: "monitor",
   }));
+  // Room codes are 6 characters (~30 bits), so code length alone no longer makes private rooms
+  // unguessable — this enforced limiter is what keeps enumeration infeasible. Mounted before the
+  // broader /api/races bucket (which only monitors) so lookups are actually blocked, not counted.
+  for (const path of ["/api/races/by-code", "/api/races/join-with-code"]) {
+    app.use(path, createRedisRateLimit({
+      bucket: "room-code-lookup",
+      windowMs: 60 * 1000,
+      max: 10,
+      failureMode: "closed",
+      message: "Too many room code attempts — please try again in a minute.",
+      code: "ROOM_CODE_RATE_LIMITED",
+      key: rateLimitByActorOrIp,
+      dimensions: ["ip", "actor", "device", "token"],
+    }));
+  }
   app.use("/api/races", createRedisRateLimit({
     bucket: "race-join",
     windowMs: 60 * 1000,
