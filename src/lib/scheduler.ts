@@ -14,6 +14,8 @@ import { lockRaceRoom } from "./raceIntegrity.js";
 import { sendPushToUser } from "../routes/push.js";
 import { reconcileWaitingRooms } from "./waitingRoomJobs.js";
 import { reconcileUnlimitedChallenges } from "./unlimitedChallengeJobs.js";
+import { config } from "./config.js";
+import { getSchedulerNextDueAtMs, setSchedulerNextDueAtMs } from "./idleGate.js";
 
 const DAILY_GOAL_REMINDER_TEMPLATE = "daily_goal_reminder";
 const DAILY_GOAL_REMINDER_SCAN_INTERVAL_MS = 10 * 60 * 1000;
@@ -225,9 +227,115 @@ async function finalizeDurationRoom(roomId: string): Promise<void> {
   }
 }
 
-export async function runSchedulerTick(): Promise<void> {
+/** Rooms stuck in "starting" are recovered this long after their last update. */
+const STUCK_STARTING_GRACE_MS = 2 * 60_000;
+/** The reminder scan is only productive once a user's local hour reaches this. */
+const DAILY_GOAL_REMINDER_LOCAL_HOUR = 18;
+
+function msUntilNextLocalHour(now: Date, timezone: string, targetHour: number): number | null {
+  try {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+      hourCycle: "h23",
+    });
+    const p = Object.fromEntries(fmt.formatToParts(now).map((x) => [x.type, x.value]));
+    const h = Number(p.hour);
+    const m = Number(p.minute);
+    const s = Number(p.second);
+    if (!Number.isFinite(h) || !Number.isFinite(m) || !Number.isFinite(s)) return null;
+
+    const secondsIntoDay = h * 3600 + m * 60 + s;
+    const targetSeconds = targetHour * 3600;
+    // Already past the boundary today → the scan for this timezone has had its chance; the
+    // next productive moment is tomorrow's boundary.
+    const deltaSeconds = secondsIntoDay < targetSeconds
+      ? targetSeconds - secondsIntoDay
+      : 24 * 3600 - secondsIntoDay + targetSeconds;
+    return now.getTime() + deltaSeconds * 1000;
+  } catch {
+    return null; // invalid timezone → ignore this one rather than pinning the gate open
+  }
+}
+
+/**
+ * Earliest epoch-ms at which the scheduler could next have work, derived entirely from
+ * Postgres. `null` means nothing is pending anywhere. Runs only at the tail of a pass that
+ * has already woken the database, so its cost rides along with work that was happening anyway.
+ */
+export async function computeSchedulerNextDueAtMs(now = new Date()): Promise<number | null> {
+  const graceMs = config.unlimitedGoal.graceMs;
+
+  const rows = await db.execute(sql`
+    select
+      (select min(scheduled_start_at) from race_rooms
+        where status = 'scheduled' and type <> 'sponsored')                       as next_scheduled_start,
+      (select min(room_expires_at) from race_rooms
+        where status in ('open','full') and mode = 'open_window')                 as next_room_expiry,
+      (select min(updated_at) from race_rooms where status = 'starting')          as oldest_starting,
+      (select min(challenge_end_at) from race_rooms where status = 'in_progress') as next_challenge_end,
+      (select min(start_at_utc) from unlimited_challenges where status = 'waiting')            as next_unlimited_start,
+      (select count(*)::int from unlimited_challenges where status = 'starting')               as unlimited_starting,
+      (select min(settlement_not_before_utc) from unlimited_challenges
+        where status in ('active','settling'))                                    as next_unlimited_settle,
+      (select min(window_end_utc) from unlimited_challenge_days
+        where status in ('pending','in_progress'))                                as next_day_window_end,
+      (select min(window_end_utc) from unlimited_challenge_days
+        where status in ('pending','in_progress','pending_verification'))         as next_day_finalize_base
+  `);
+
+  const r = ((rows as unknown as { rows?: Record<string, unknown>[] }).rows ?? (rows as unknown as Record<string, unknown>[]))[0] ?? {};
+  const at = (v: unknown): number | null => {
+    if (v == null) return null;
+    const t = v instanceof Date ? v.getTime() : new Date(String(v)).getTime();
+    return Number.isFinite(t) ? t : null;
+  };
+
+  const candidates: (number | null)[] = [
+    at(r.next_scheduled_start),
+    at(r.next_room_expiry),
+    at(r.oldest_starting) == null ? null : at(r.oldest_starting)! + STUCK_STARTING_GRACE_MS,
+    at(r.next_challenge_end),
+    at(r.next_unlimited_start),
+    Number(r.unlimited_starting ?? 0) > 0 ? now.getTime() : null,
+    at(r.next_unlimited_settle),
+    at(r.next_day_window_end),
+    at(r.next_day_finalize_base) == null ? null : at(r.next_day_finalize_base)! + graceMs,
+  ];
+
+  // Daily-goal reminders are wall-clock work: wake at the next 18:00 local among the
+  // timezones users actually have, instead of polling every 10 minutes forever.
+  try {
+    const tzRows = await db
+      .selectDistinct({ timezone: userPreferencesTable.timezone })
+      .from(userPreferencesTable);
+    const zones = tzRows.map((x) => x.timezone).filter(Boolean);
+    for (const tz of zones.length > 0 ? zones : [DEFAULT_TIMEZONE]) {
+      candidates.push(msUntilNextLocalHour(now, tz, DAILY_GOAL_REMINDER_LOCAL_HOUR));
+    }
+  } catch (err) {
+    logger.warn({ err }, "[ScheduleRoomJob] timezone scan failed — keeping gate open");
+    return now.getTime(); // unknown → do not suppress the next tick
+  }
+
+  const due = candidates.filter((x): x is number => x != null);
+  return due.length === 0 ? null : Math.min(...due);
+}
+
+export async function runSchedulerTick(opts?: { force?: boolean }): Promise<void> {
   try {
     const now = new Date();
+
+    // Idle gate: skip the whole Postgres pass until the earliest moment work could exist.
+    // A missing/unreadable hint reads as `null` → run anyway. `force` is the hourly
+    // maintenance pass, which always runs and re-derives the hint from DB truth.
+    if (!opts?.force) {
+      const nextDueAtMs = await getSchedulerNextDueAtMs();
+      if (nextDueAtMs != null && now.getTime() < nextDueAtMs) return;
+    }
 
     // Shared Waiting Room reconciliation: scheduled rooms past their start time auto-start (or
     // cancel when the minimum isn't met), open-window rooms past their 30-minute window expire,
@@ -257,6 +365,14 @@ export async function runSchedulerTick(): Promise<void> {
       nextDailyGoalReminderScanAt = now.getTime() + DAILY_GOAL_REMINDER_SCAN_INTERVAL_MS;
       await runDailyGoalReminderTick(now);
     }
+
+    // Re-derive the gate from DB truth now that the pass is complete. Done in a nested try so
+    // a failure here can never mask or abort the work above — it just leaves the gate open.
+    try {
+      await setSchedulerNextDueAtMs(await computeSchedulerNextDueAtMs(new Date()));
+    } catch (err) {
+      logger.warn({ err }, "[ScheduleRoomJob] next-due refresh failed (non-fatal)");
+    }
   } catch (err) {
     logger.error({ err }, "[ScheduleRoomJob] tick error");
   }
@@ -264,5 +380,6 @@ export async function runSchedulerTick(): Promise<void> {
 
 export function startScheduler(): void {
   setInterval(() => { runSchedulerTick().catch(() => {}); }, 60_000);
-  runSchedulerTick().catch(() => {});
+  // Boot pass is unconditional: it seeds the gate from DB truth after a restart or a Redis flush.
+  runSchedulerTick({ force: true }).catch(() => {});
 }

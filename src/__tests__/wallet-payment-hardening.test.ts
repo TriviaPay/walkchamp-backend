@@ -228,7 +228,12 @@ describe("wallet payment hardening", () => {
     expect(reconciliation).toContain("wallet.ledger_reconciliation");
     expect(operationalLocks).toContain("WALLET_LEDGER_ANOMALY_LOCK");
     expect(backgroundJobs).toContain("runWalletLedgerReconciliationTick");
-    expect(backgroundJobs).toContain("wallet ledger reconciliation tick failed");
+    // Reconciliation no longer owns a dedicated hourly timer: it runs inside the single
+    // coalesced maintenance wake so idle Neon compute pays one autosuspend tail per hour
+    // instead of one per backstop. Failures are logged per-step by that pass.
+    expect(backgroundJobs).toContain("walletLedgerReconciliation");
+    expect(backgroundJobs).toContain("maintenance pass step failed");
+    expect(backgroundJobs).toContain("wallet ledger reconciliation bootstrap failed");
   });
 
   it("blocks withdrawals and withdrawal approvals while ledger anomalies are active", () => {

@@ -97,6 +97,24 @@ const envSchema = z
     // validated part of the environment contract.
     ENABLE_INR_CASH_CHALLENGES: z.enum(["true", "false"]).optional(),
     CASH_CHALLENGE_RAZORPAY_PROCESSING_BASIS_POINTS: z.string().optional(),
+    // ── In-app purchases (Mic Pass + coin packs) ────────────────────────────
+    // Store receipts are verified server-side in lib/iapVerification.ts, which reads these
+    // at call time; they are declared here so they are a documented, validated part of the
+    // environment contract. Without them POST /api/purchases/verify answers
+    // IAP_VERIFICATION_NOT_CONFIGURED for that platform rather than granting anything.
+    APPLE_IAP_ISSUER_ID: z.string().optional(),
+    APPLE_IAP_KEY_ID: z.string().optional(),
+    APPLE_IAP_PRIVATE_KEY: z.string().optional(),
+    APPLE_BUNDLE_ID: z.string().optional(),
+    APPLE_IAP_ALLOW_SANDBOX: z.enum(["true", "false"]).optional(),
+    GOOGLE_PLAY_PACKAGE_NAME: z.string().optional(),
+    GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: z.string().optional(),
+    GOOGLE_PLAY_CLIENT_EMAIL: z.string().optional(),
+    GOOGLE_PLAY_PRIVATE_KEY: z.string().optional(),
+    GOOGLE_PLAY_ALLOW_TEST_PURCHASES: z.enum(["true", "false"]).optional(),
+    // Staging/QA escape hatch: lets platform:"dev" unlock without a store receipt. Defaults
+    // to on outside production and off in production; set true only on a prod-mode QA env.
+    ENABLE_DEV_IAP_PURCHASES: z.enum(["true", "false"]).optional(),
     OBJECT_STORAGE_ENDPOINT: z.string().optional(),
     OBJECT_STORAGE_REGION: z.string().optional(),
     OBJECT_STORAGE_BUCKET: z.string().optional(),

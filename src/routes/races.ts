@@ -95,6 +95,7 @@ import {
   reconcileActive,
   type ActiveRaceEntry,
 } from "../lib/raceRegistry.js";
+import { invalidateSchedulerGate } from "../lib/idleGate.js";
 import { resolveLiveStateModeForNewRace, initializeRaceLiveState, ensureRaceHydrated, ensureParticipantHydrated } from "../lib/raceLiveHydration.js";
 import { computeIsAdult } from "../lib/dateOfBirth.js";
 import {
@@ -513,6 +514,33 @@ function buildChallengeTimeFields(room: Pick<typeof raceRoomsTable.$inferSelect,
     days_left: daysLeft,
   };
 }
+
+type RoomTimeSource = Pick<
+  typeof raceRoomsTable.$inferSelect,
+  "challengeEndAt" | "challengeDurationDays" | "startedAt" | "scheduledStartAt"
+>;
+
+/**
+ * Same clock as the race detail payload (`buildChallengeTimeFields`), plus the scheduled start
+ * so a waiting card can render a countdown before `startedAt` exists. Every list/card surface
+ * uses this so the Walk "My Race" card never has to guess a time it isn't given.
+ */
+function buildCardTimeFields(room: RoomTimeSource) {
+  const scheduledStartAt = room.scheduledStartAt?.toISOString() ?? null;
+  return {
+    ...buildChallengeTimeFields(room),
+    scheduledStartAt,
+    scheduled_start_at: scheduledStartAt,
+  };
+}
+
+/** Null-filled clock for cards with no room behind them (host_available), so the shape is stable. */
+const EMPTY_CARD_TIME_FIELDS = buildCardTimeFields({
+  challengeEndAt: null,
+  challengeDurationDays: 0,
+  startedAt: null,
+  scheduledStartAt: null,
+});
 
 const MANUAL_COMPLETION_REASONS = new Set(["admin_force_complete", "manual_force_complete"]);
 // Reasons that bypass the duration-challenge end-date wait. In addition to explicit admin/manual
@@ -2279,6 +2307,10 @@ export async function getChallengeCardsForUser(userId: string) {
           maxPlayers: raceRoomsTable.maxPlayers,
           targetSteps: raceRoomsTable.targetSteps,
           entryAmountCents: raceRoomsTable.entryAmountCents,
+          startedAt: raceRoomsTable.startedAt,
+          scheduledStartAt: raceRoomsTable.scheduledStartAt,
+          challengeDurationDays: raceRoomsTable.challengeDurationDays,
+          challengeEndAt: raceRoomsTable.challengeEndAt,
         })
         .from(raceRoomsTable)
         .innerJoin(
@@ -2306,10 +2338,12 @@ export async function getChallengeCardsForUser(userId: string) {
         // Active race the user is in
         const lc = countsMap[et].in_progress;
         const wc = countsMap[et].open;
+        const cardTime = buildCardTimeFields(room);
 
         if (room.status === "in_progress") {
           return {
             entryType: et,
+            ...cardTime,
             status: isHost ? "user_hosting_active" : "user_joined_active",
             raceId: room.id,
             isHost, isParticipant: true,
@@ -2325,6 +2359,7 @@ export async function getChallengeCardsForUser(userId: string) {
         // Waiting room (open or full) the user is in
         return {
           entryType: et,
+          ...cardTime,
           status: isHost ? "user_hosting_waiting" : "user_joined_waiting",
           raceId: room.id,
           isHost, isParticipant: true,
@@ -2346,6 +2381,10 @@ export async function getChallengeCardsForUser(userId: string) {
           currentPlayers: raceRoomsTable.currentPlayers,
           maxPlayers: raceRoomsTable.maxPlayers,
           entryAmountCents: raceRoomsTable.entryAmountCents,
+          startedAt: raceRoomsTable.startedAt,
+          scheduledStartAt: raceRoomsTable.scheduledStartAt,
+          challengeDurationDays: raceRoomsTable.challengeDurationDays,
+          challengeEndAt: raceRoomsTable.challengeEndAt,
         })
         .from(raceRoomsTable)
         .where(
@@ -2367,6 +2406,7 @@ export async function getChallengeCardsForUser(userId: string) {
         const best = joinable[0];
         return {
           entryType: et,
+          ...buildCardTimeFields(best),
           status: "join_available",
           raceId: best.id,
           isHost: false, isParticipant: false,
@@ -2380,7 +2420,15 @@ export async function getChallengeCardsForUser(userId: string) {
 
       // ── Step 3: Is there an active race the user is not in? ──
       const activeOther = await db
-        .select({ id: raceRoomsTable.id, currentPlayers: raceRoomsTable.currentPlayers, entryAmountCents: raceRoomsTable.entryAmountCents })
+        .select({
+          id: raceRoomsTable.id,
+          currentPlayers: raceRoomsTable.currentPlayers,
+          entryAmountCents: raceRoomsTable.entryAmountCents,
+          startedAt: raceRoomsTable.startedAt,
+          scheduledStartAt: raceRoomsTable.scheduledStartAt,
+          challengeDurationDays: raceRoomsTable.challengeDurationDays,
+          challengeEndAt: raceRoomsTable.challengeEndAt,
+        })
         .from(raceRoomsTable)
         .where(
           and(
@@ -2394,6 +2442,7 @@ export async function getChallengeCardsForUser(userId: string) {
       if (activeOther.length > 0) {
         return {
           entryType: et,
+          ...buildCardTimeFields(activeOther[0]),
           status: "active_other",
           raceId: activeOther[0].id,
           isHost: false, isParticipant: false,
@@ -2408,6 +2457,7 @@ export async function getChallengeCardsForUser(userId: string) {
       // ── Step 4: No room exists — user can host ──
       return {
         entryType: et,
+        ...EMPTY_CARD_TIME_FIELDS,
         status: "host_available",
         raceId: null,
         isHost: false, isParticipant: false,
@@ -2508,6 +2558,7 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
         registeredCount: raceRoomsTable.registeredCount,
         isPrivate: raceRoomsTable.isPrivate,
         trackLayout: raceRoomsTable.trackLayout,
+        startedAt: raceRoomsTable.startedAt,
         scheduledStartAt: raceRoomsTable.scheduledStartAt,
         challengeDurationDays: raceRoomsTable.challengeDurationDays,
         challengeEndAt: raceRoomsTable.challengeEndAt,
@@ -2553,8 +2604,12 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
 
     const formatted = upcoming.map((r) => {
       const trackTheme = trackThemeForCode(r.trackLayout, trackThemeMediaMap);
+      // Same clock as race detail: a scheduled room derives its end from scheduledStartAt +
+      // duration, so challenge_end_at is real whenever the duration is known.
+      const cardTime = buildCardTimeFields(r);
       return {
         room_id: r.id,
+        ...cardTime,
         status: "scheduled",
         challenge_type: r.entryType,
         entry_fee: r.entryAmountCents / 100,
@@ -2563,9 +2618,6 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
         target_steps: r.targetSteps,
         max_players: r.maxPlayers,
         registered_count: r.registeredCount,
-        scheduled_start_at: r.scheduledStartAt?.toISOString() ?? null,
-        challenge_duration_days: r.challengeDurationDays,
-        challenge_end_at: r.challengeEndAt?.toISOString() ?? null,
         selected_track_theme_id: r.trackLayout,
         theme_name: TRACK_NAMES2[r.trackLayout] ?? r.trackLayout,
         trackTheme,
@@ -2917,6 +2969,9 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
         trackLayout: raceRoomsTable.trackLayout,
         creatorId: raceRoomsTable.creatorId,
         startedAt: raceRoomsTable.startedAt,
+        scheduledStartAt: raceRoomsTable.scheduledStartAt,
+        challengeDurationDays: raceRoomsTable.challengeDurationDays,
+        challengeEndAt: raceRoomsTable.challengeEndAt,
         createdAt: raceRoomsTable.createdAt,
       })
       .from(raceRoomsTable)
@@ -2965,6 +3020,10 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
     const trackTheme = trackThemeForCode(row.trackLayout, mediaMap);
     return {
       ...row,
+      // Overrides the raw Date columns with the derived clock (ISO + snake_case aliases), so
+      // challengeEndAt is populated whenever the duration is known rather than only when the
+      // column was materialized.
+      ...buildCardTimeFields(row),
       isHost: row.creatorId === userId,
       entryType: entryTypeLabel(row.entryType),
       entryAmountDollars: row.entryAmountCents / 100,
@@ -2977,29 +3036,42 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
     };
   });
 
-  const unlimitedRaces = unlimitedRows.map((r) => ({
-    id: r.id,
-    title: r.title,
-    entryType: "unlimited_goal",
-    entryAmountCents: r.entryFeeCents,
-    entryAmountDollars: r.entryFeeCents / 100,
-    targetSteps: r.dailyGoalSteps,
-    maxPlayers: null as number | null,
-    currentPlayers: r.paidParticipantCount,
-    status:
-      r.status === "active" || r.status === "starting" || r.status === "settling"
-        ? "in_progress"
-        : "open",
-    trackLayout: "bg",
-    creatorId: r.hostUserId,
-    startedAt: r.startAtUtc,
-    createdAt: r.createdAt,
-    isHost: r.hostUserId === userId,
-    challengeType: "unlimited_goal",
-    capacityMode: "unlimited",
-    challengeEndAt: r.challengeEndAtUtc,
-    currentUserParticipating: true,
-  }));
+  const unlimitedRaces = unlimitedRows.map((r) => {
+    const hasStarted = r.status === "active" || r.status === "starting" || r.status === "settling";
+    const startAt = r.startAtUtc?.toISOString() ?? null;
+    const endAt = r.challengeEndAtUtc?.toISOString() ?? null;
+    const timeLeftSeconds = r.challengeEndAtUtc
+      ? Math.max(0, Math.floor((r.challengeEndAtUtc.getTime() - Date.now()) / 1000))
+      : null;
+    return {
+      id: r.id,
+      title: r.title,
+      entryType: "unlimited_goal",
+      entryAmountCents: r.entryFeeCents,
+      entryAmountDollars: r.entryFeeCents / 100,
+      targetSteps: r.dailyGoalSteps,
+      maxPlayers: null as number | null,
+      currentPlayers: r.paidParticipantCount,
+      status: hasStarted ? "in_progress" : "open",
+      trackLayout: "bg",
+      creatorId: r.hostUserId,
+      createdAt: r.createdAt,
+      isHost: r.hostUserId === userId,
+      challengeType: "unlimited_goal",
+      capacityMode: "unlimited",
+      currentUserParticipating: true,
+      // startedAt is the *actual* start, so a still-waiting challenge reports null and the card
+      // counts down to scheduledStartAt instead of showing a future "started" time.
+      startedAt: hasStarted ? startAt : null,
+      started_at: hasStarted ? startAt : null,
+      scheduledStartAt: startAt,
+      scheduled_start_at: startAt,
+      challengeEndAt: endAt,
+      challenge_end_at: endAt,
+      timeLeftSeconds,
+      time_left_seconds: timeLeftSeconds,
+    };
+  });
 
   const races = [...unlimitedRaces, ...classicRaces];
   if (races.length === 0) return res.json({ race: null, races: [] });
@@ -3382,6 +3454,11 @@ router.post("/races/host", requireAuth, async (req, res) => {
 
     return { room, participant };
   });
+
+  // A scheduled / open-window room may now be the earliest due work. Clear the idle gate so
+  // the next scheduler tick re-derives it rather than sleeping on a stale "nothing due".
+  // Fire-and-forget and fail-open by design: the worst case is one extra scheduler pass.
+  void invalidateSchedulerGate();
 
   if (scheduledCreateConflict) {
     return res.status(409).json(futureRoomCreationConflictBody(scheduledCreateConflict, userId));
@@ -4384,6 +4461,9 @@ router.post("/races", requireAuth, async (req, res) => {
       .returning();
   });
 
+  // New open-window room → its 30-minute expiry may be the earliest due work.
+  void invalidateSchedulerGate();
+
   if (createConflict) {
     return res.status(409).json(regularRaceRegistrationConflictBody(createConflict, userId));
   }
@@ -4524,6 +4604,9 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
 
       return { newRoom, newParticipant };
     });
+
+    // New open-window room → its 30-minute expiry may be the earliest due work.
+    void invalidateSchedulerGate();
 
     if (createConflict) {
       return res.status(409).json(regularRaceRegistrationConflictBody(createConflict, userId));

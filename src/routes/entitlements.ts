@@ -16,6 +16,7 @@ import { z } from "zod";
 import { recordCoinLedgerEntry } from "../lib/coinsService.js";
 import { writeAuditLog } from "../lib/auditLog.js";
 import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
+import { androidPackageName, verifyStorePurchase } from "../lib/iapVerification.js";
 
 const router = Router();
 
@@ -119,26 +120,8 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
 
   const { product_id, platform, transaction_id, purchase_token, receipt, package_name } = parse.data;
 
-  if (process.env.NODE_ENV === "production") {
-    req.log.error({ userId, product_id, platform }, "[IAP] rejecting unverified client-side purchase in production");
-    return res.status(503).json({
-      success: false,
-      code: "IAP_VERIFICATION_NOT_CONFIGURED",
-      message: "Secure store receipt verification is not configured on this server.",
-    });
-  }
-
-  if (platform === "dev") {
-    req.log.warn({ userId, product_id, transaction_id }, "[IAP] allowing development-only purchase verification");
-  } else if (!purchase_token && !receipt) {
-    return res.status(400).json({
-      success: false,
-      code: "MISSING_PURCHASE_PROOF",
-      message: "receipt or purchase_token is required.",
-    });
-  }
-
-  // Validate product exists
+  // Validate product first: an unknown product can never grant anything, so there is no
+  // reason to spend a store round-trip on it.
   if (!ALL_VALID_PRODUCT_IDS.has(product_id)) {
     return res.status(400).json({
       success: false,
@@ -147,8 +130,12 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
     });
   }
 
+  const coinAmount = COIN_PRODUCT_MAP[product_id];
+  const entitlementKey = NON_CONSUMABLE_MAP[product_id];
+  const productType = coinAmount !== undefined ? "consumable" : "non_consumable";
+
   // Android: validate package name
-  if (platform === "android" && package_name && package_name !== "com.globalwalkerleague.app") {
+  if (platform === "android" && package_name && package_name !== androidPackageName()) {
     return res.status(400).json({
       success: false,
       code: "INVALID_PLATFORM",
@@ -156,14 +143,91 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
     });
   }
 
+  if (platform === "android" && !purchase_token) {
+    return res.status(400).json({
+      success: false,
+      code: "MISSING_PURCHASE_PROOF",
+      message: "purchase_token is required.",
+    });
+  }
+
+  // ── Store verification ────────────────────────────────────────────────────
+  // Nothing below this point runs on client assertions: the product id, ownership and
+  // purchase state used from here on come from Apple/Google, not from the request body.
+  const verification = await verifyStorePurchase({
+    platform,
+    productId: product_id,
+    transactionId: transaction_id,
+    purchaseToken: purchase_token ?? null,
+    packageName: package_name ?? null,
+    productType,
+  });
+
+  if (!verification.ok) {
+    const logPayload = {
+      userId,
+      product_id,
+      platform,
+      code: verification.code,
+      detail: verification.detail ?? null,
+    };
+    // A misconfiguration or an unreachable store is our problem, not the buyer's — those
+    // page as errors; a rejected receipt is an expected outcome and only warns.
+    if (verification.status >= 500) req.log.error(logPayload, "[IAP] verification unavailable");
+    else req.log.warn(logPayload, "[IAP] verification rejected");
+
+    return res.status(verification.status).json({
+      success: false,
+      code: verification.code,
+      message: verification.message,
+    });
+  }
+
+  const verified = verification.purchase;
+  // Replay protection and storage key off the STORE's identity, never the client's — a
+  // client that renames its transaction id cannot slip past the unique index this way.
+  const verifiedTransactionId = verified.transactionId;
+  const verifiedPurchaseToken = verified.purchaseToken ?? purchase_token ?? null;
+  const receiptJson = {
+    provider: verified.provider,
+    environment: verified.environment,
+    verifiedAt: new Date().toISOString(),
+    claimedTransactionId: transaction_id,
+    store: verified.raw,
+    ...(receipt ? { clientReceipt: receipt } : {}),
+  };
+
+  if (verified.provider === "dev") {
+    req.log.warn({ userId, product_id, transaction_id }, "[IAP] granting development-only purchase (ENABLE_DEV_IAP_PURCHASES)");
+  } else {
+    req.log.info(
+      { userId, product_id, platform, environment: verified.environment, transactionId: verifiedTransactionId },
+      "[IAP] store receipt verified",
+    );
+  }
+
   // Duplicate detection: reject replay across the entire system, not just per-user.
   const [existing] = await db
     .select({ id: userPurchasesTable.id, userId: userPurchasesTable.userId })
     .from(userPurchasesTable)
     .where(
-      eq(userPurchasesTable.transactionId, transaction_id),
+      eq(userPurchasesTable.transactionId, verifiedTransactionId),
     )
     .limit(1);
+
+  if (existing && existing.userId !== userId) {
+    // A verified receipt that already belongs to someone else: one store purchase grants one
+    // account. Say nothing about who owns it.
+    req.log.warn(
+      { userId, product_id, transactionId: verifiedTransactionId },
+      "[IAP] purchase already claimed by another account",
+    );
+    return res.status(409).json({
+      success: false,
+      code: "PURCHASE_ALREADY_CLAIMED",
+      message: "This purchase is already linked to another account.",
+    });
+  }
 
   if (existing) {
     // Return success with current state — do not double-credit
@@ -185,7 +249,7 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
       )
       .limit(1);
 
-    req.log.info({ userId, product_id, transaction_id }, "[IAP] duplicate purchase detected");
+    req.log.info({ userId, product_id, transactionId: verifiedTransactionId }, "[IAP] duplicate purchase detected");
     return res.json({
       success: true,
       duplicate: true,
@@ -197,24 +261,23 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
     });
   }
 
-  if (purchase_token) {
+  if (verifiedPurchaseToken) {
     const [existingToken] = await db
-      .select({ id: userPurchasesTable.id })
+      .select({ id: userPurchasesTable.id, userId: userPurchasesTable.userId })
       .from(userPurchasesTable)
-      .where(eq(userPurchasesTable.purchaseToken, purchase_token))
+      .where(eq(userPurchasesTable.purchaseToken, verifiedPurchaseToken))
       .limit(1);
 
     if (existingToken) {
       return res.status(409).json({
         success: false,
         code: "PURCHASE_TOKEN_REPLAYED",
-        message: "Purchase token has already been processed.",
+        message: existingToken.userId === userId
+          ? "Purchase token has already been processed."
+          : "This purchase is already linked to another account.",
       });
     }
   }
-
-  const coinAmount = COIN_PRODUCT_MAP[product_id];
-  const entitlementKey = NON_CONSUMABLE_MAP[product_id];
 
   // ── Consumable coin purchase ──────────────────────────────────────────────
   if (coinAmount !== undefined) {
@@ -227,10 +290,10 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
           productType:     "consumable",
           platform,
           paymentProvider: providerNameForPlatform(platform),
-          transactionId:   transaction_id,
-          purchaseToken:   purchase_token,
+          transactionId:   verifiedTransactionId,
+          purchaseToken:   verifiedPurchaseToken,
           status:          "verified",
-          rawReceiptJson:  receipt ? { receipt } : null,
+          rawReceiptJson:  receiptJson,
         });
 
         const ledger = await recordCoinLedgerEntry(tx, {
@@ -238,15 +301,16 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
           amount: coinAmount,
           transactionType: "earn",
           source: "iap_purchase",
-          sourceId: transaction_id ?? product_id,
+          sourceId: verifiedTransactionId,
           rewardCode: null,
           reasonCode: "iap_purchase",
-          idempotencyKey: `iap:${userId}:${transaction_id}`,
+          idempotencyKey: `iap:${userId}:${verifiedTransactionId}`,
           description: `${coinAmount} coins from in-app purchase (${product_id})`,
           metadata: {
             productId: product_id,
             platform,
             provider: providerNameForPlatform(platform),
+            environment: verified.environment,
           },
         });
 
@@ -259,9 +323,15 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
         actorType: "user",
         action: "coin.iap_credit",
         entityType: "purchase",
-        entityId: transaction_id,
+        entityId: verifiedTransactionId,
         reason: product_id,
-        metadata: { productId: product_id, amount: coinAmount, platform },
+        metadata: {
+          productId: product_id,
+          amount: coinAmount,
+          platform,
+          provider: verified.provider,
+          environment: verified.environment,
+        },
       });
 
       return res.json({
@@ -305,10 +375,10 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
         productType:     "non_consumable",
         platform,
         paymentProvider: providerNameForPlatform(platform),
-        transactionId:   transaction_id,
-        purchaseToken:   purchase_token,
+        transactionId:   verifiedTransactionId,
+        purchaseToken:   verifiedPurchaseToken,
         status:          "verified",
-        rawReceiptJson:  receipt ? { receipt } : null,
+        rawReceiptJson:  receiptJson,
       });
 
       // Upsert entitlement
@@ -318,12 +388,12 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
           userId,
           entitlementKey,
           status:          "active",
-          source:          platform === "dev" ? "dev" : "iap",
+          source:          verified.provider === "dev" ? "dev" : "iap",
           platform,
           productId:       product_id,
-          purchaseToken:   purchase_token,
-          transactionId:   transaction_id,
-          purchasedAt:     new Date(),
+          purchaseToken:   verifiedPurchaseToken,
+          transactionId:   verifiedTransactionId,
+          purchasedAt:     verified.purchasedAt ?? new Date(),
         })
         .onConflictDoUpdate({
           target: [userEntitlementsTable.userId, userEntitlementsTable.entitlementKey],
@@ -331,9 +401,9 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
             status:          "active",
             platform,
             productId:       product_id,
-            purchaseToken:   purchase_token,
-            transactionId:   transaction_id,
-            purchasedAt:     new Date(),
+            purchaseToken:   verifiedPurchaseToken,
+            transactionId:   verifiedTransactionId,
+            purchasedAt:     verified.purchasedAt ?? new Date(),
             updatedAt:       new Date(),
           },
         });
@@ -346,7 +416,12 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
         entityType: "entitlement",
         entityId: entitlementKey,
         reason: product_id,
-        metadata: { platform, transactionId: transaction_id },
+        metadata: {
+          platform,
+          transactionId: verifiedTransactionId,
+          provider: verified.provider,
+          environment: verified.environment,
+        },
       });
 
       return res.json({

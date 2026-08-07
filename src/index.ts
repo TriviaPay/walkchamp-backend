@@ -4,6 +4,7 @@ import { config } from "./lib/config.js";
 import { pool } from "../db/src/index.js";
 import { closeQueues } from "./lib/queue.js";
 import { installProcessSafetyHandlers } from "./lib/processSafety.js";
+import { iapConfigStatus } from "./lib/iapVerification.js";
 
 // Background startup readiness: warm the pool and surface early warnings if the DB is briefly
 // unreachable at boot (e.g. a cold Neon wake). Non-blocking — the server still starts listening
@@ -24,8 +25,23 @@ async function warmDatabase(): Promise<void> {
   logger.error("Database still unreachable after startup retries; serving anyway (queries will retry)");
 }
 
+/**
+ * Purchase verification is credential-gated, and a missing credential is invisible until a
+ * real buyer hits it. Say so at boot instead: unconfigured platforms cannot unlock Mic Pass,
+ * and dev purchases enabled in production is a deliberate QA choice worth seeing in the log.
+ */
+function logIapReadiness(): void {
+  const status = iapConfigStatus();
+  const level = config.isProduction && !(status.appleConfigured && status.googleConfigured) ? "warn" : "info";
+  logger[level](status, "IAP receipt verification configuration");
+  if (config.isProduction && status.devPurchasesEnabled) {
+    logger.warn("ENABLE_DEV_IAP_PURCHASES=true in production: platform:\"dev\" can unlock without a store receipt");
+  }
+}
+
 const server = app.listen(config.port, () => {
   logger.info({ port: config.port, trustProxy: config.trustProxy }, "Server listening");
+  logIapReadiness();
 });
 
 // Actually surface bind/listen errors (the plain listen callback never receives them).

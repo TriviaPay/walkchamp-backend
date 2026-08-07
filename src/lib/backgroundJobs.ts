@@ -1,6 +1,6 @@
 import { logger } from "./logger.js";
 import { recoverStaleRaces, cleanupOverdueRaces, recoverPendingRedisFinishes } from "../routes/races.js";
-import { startScheduler } from "./scheduler.js";
+import { startScheduler, runSchedulerTick } from "./scheduler.js";
 import { startSponsoredEventsJob } from "../routes/sponsoredEvents.js";
 import { runDepositReconciliationTick } from "./depositSettlement.js";
 import { runWalletLedgerReconciliationTick } from "./walletLedgerReconciliation.js";
@@ -8,6 +8,27 @@ import { flushSessionLastSeen } from "./sessionService.js";
 import { checkpointRedisRaces } from "./raceLiveHydration.js";
 
 let started = false;
+
+/**
+ * Runs every backstop sequentially inside one compute wake. Each step is independently
+ * guarded so a single failure cannot skip the rest of the pass.
+ */
+async function runCoalescedMaintenancePass(): Promise<void> {
+  const steps: [string, () => Promise<unknown>][] = [
+    ["cleanupOverdueRaces", () => cleanupOverdueRaces({ force: true })],
+    ["depositReconciliation", () => runDepositReconciliationTick(new Date(), { force: true })],
+    ["scheduler", () => runSchedulerTick({ force: true })],
+    ["walletLedgerReconciliation", () => runWalletLedgerReconciliationTick()],
+  ];
+
+  for (const [name, run] of steps) {
+    try {
+      await run();
+    } catch (err) {
+      logger.error({ err, step: name }, "maintenance pass step failed");
+    }
+  }
+}
 
 export async function startWorkerOwnedRecurringJobs(): Promise<void> {
   if (started) return;
@@ -31,14 +52,6 @@ export async function startWorkerOwnedRecurringJobs(): Promise<void> {
     });
   }, 15_000);
 
-  // Hourly backstop: one unconditional full scan that also re-seeds/reconciles the
-  // registry, bounding any drift from a missed start-hook to at most one hour.
-  setInterval(() => {
-    cleanupOverdueRaces({ force: true }).catch((err) => {
-      logger.error({ err }, "cleanupOverdueRaces hourly backstop failed");
-    });
-  }, 60 * 60_000);
-
   setInterval(() => {
     runDepositReconciliationTick().catch((err) => {
       logger.error({ err }, "deposit reconciliation tick failed");
@@ -49,10 +62,19 @@ export async function startWorkerOwnedRecurringJobs(): Promise<void> {
     logger.error({ err }, "wallet ledger reconciliation bootstrap failed");
   });
 
+  // Single coalesced maintenance wake — deliberately ONE timer, not one per job.
+  //
+  // Every gated tick above skips Postgres while idle, so the only thing still able to wake a
+  // suspended Neon compute is this backstop. Neon restarts its inactivity timer on *any*
+  // activity, so each separate hourly timer would cost a full autosuspend tail (~5 min by
+  // default): four independent hourly backstops firing at different offsets bill ~4× the idle
+  // compute of one. Running them back-to-back in a single wake pays that tail once an hour.
+  //
+  // Everything here is forced: it is the recovery path that re-derives every Redis hint from
+  // DB truth, bounding drift from a lost key or a missed writer hook to at most one hour.
+  // If you add another periodic DB job, add it to this pass — do not add a timer.
   setInterval(() => {
-    runWalletLedgerReconciliationTick().catch((err) => {
-      logger.error({ err }, "wallet ledger reconciliation tick failed");
-    });
+    void runCoalescedMaintenancePass();
   }, 60 * 60_000);
 
   // Flush buffered session lastSeen telemetry in batches. DB-silent when no sessions are

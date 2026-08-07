@@ -27,6 +27,7 @@ import { emitUnlimitedRealtime } from "./unlimitedRealtime.js";
 import { sendNotification } from "../routes/notifications.js";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
+import { invalidateSchedulerGate } from "./idleGate.js";
 
 /** Non-terminal challenge statuses that still block membership / appear as "open". */
 export const UNLIMITED_OPEN_STATUSES = ["waiting", "starting", "active", "settling"] as const;
@@ -184,6 +185,10 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
     jobId: `ult-start:${result.challenge.id}`,
     delay: Math.max(0, startAtUtc.getTime() - Date.now()),
   }).catch((err) => logger.warn({ err, challengeId: result.challenge.id }, "[Unlimited] start-job enqueue failed (reconciler covers)"));
+
+  // This challenge's startAtUtc may now be the earliest due work — clear the scheduler idle
+  // gate so the reconciler tick re-derives it instead of sleeping on a stale "nothing due".
+  void invalidateSchedulerGate();
 
   logger.info({ challengeId: result.challenge.id, userId, startAtUtc }, "[Unlimited] challenge created");
   return { ok: true, data: result.challenge };

@@ -31,6 +31,7 @@ import { createHash, randomUUID } from "crypto";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
 import { config } from "../lib/config.js";
 import { recordOutboxEvent } from "../lib/outbox.js";
+import { markDepositsMaybePending } from "../lib/idleGate.js";
 import { processDepositWebhookEvent } from "../lib/depositWebhookProcessor.js";
 import {
   getRazorpay,
@@ -241,6 +242,8 @@ router.post("/wallet/deposit/stripe/create-payment-intent", requireAuth, async (
       })
       .returning();
     depositTx = row;
+    // Open the reconciliation gate: a non-terminal deposit now exists.
+    void markDepositsMaybePending();
   } catch (err) {
     req.log.error({ err, userId, amountCents }, "[PaymentBackend] stripe: DB insert failed");
     return res.status(500).json({ error: "Failed to create payment record." });
@@ -517,6 +520,9 @@ router.post("/wallet/deposit/razorpay/create-order", requireAuth, async (req, re
       if (!row) {
         throw new RazorpayCreateOrderHttpError(500, { error: "Failed to reserve payment record." });
       }
+
+      // Open the reconciliation gate: a non-terminal deposit now exists.
+      void markDepositsMaybePending();
 
       const rowCurrency = row.currency.trim().toUpperCase();
       if (row.userId !== userId || row.provider !== "razorpay" || row.amountMinorUnits !== amountPaise || rowCurrency !== "INR") {

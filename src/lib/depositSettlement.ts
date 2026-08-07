@@ -1,6 +1,6 @@
 import StripeConstructor from "stripe";
 import Razorpay from "razorpay";
-import { and, eq, lt, or, sql } from "drizzle-orm";
+import { and, eq, inArray, lt, or, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import {
   depositTransactionsTable,
@@ -10,6 +10,7 @@ import {
 import { config } from "./config.js";
 import { logger } from "./logger.js";
 import { lockDepositTransactionById, lockWalletByUserId, type DbTx } from "./raceIntegrity.js";
+import { clearDepositsMaybePending, depositsMaybePending, markDepositsMaybePending } from "./idleGate.js";
 
 export type DepositProvider = "stripe" | "razorpay";
 export type ProviderSettlementStatus =
@@ -155,6 +156,11 @@ async function updateDepositState(
       updatedAt: new Date(),
     })
     .where(eq(depositTransactionsTable.id, depositId));
+
+  // Re-open the reconciliation gate whenever a deposit lands in a state this tick still owns.
+  if (status === "processing" || status === "settlement_error") {
+    void markDepositsMaybePending();
+  }
 }
 
 function validationFailure(
@@ -760,7 +766,24 @@ async function reconcileOneDeposit(deposit: typeof depositTransactionsTable.$inf
   }
 }
 
-export async function runDepositReconciliationTick(now = new Date()) {
+/**
+ * Deposit states from which future reconciliation work can still arise. `requires_review` is
+ * deliberately excluded: this tick cannot progress one (it only selects processing /
+ * settlement_error), so including it would hold the gate open forever for rows that need a
+ * human. Those are surfaced by the admin review queue, not by this scan.
+ */
+const NON_TERMINAL_DEPOSIT_STATES = ["pending", "order_creating", "processing", "settlement_error"] as const;
+
+export async function runDepositReconciliationTick(now = new Date(), opts?: { force?: boolean }) {
+  // Idle gate: skip the Postgres pass only when Redis positively reports zero non-terminal
+  // deposits. Unknown (missing key / Redis down) reconciles — a cache must never be able to
+  // strand an unsettled payment. `force` is the hourly maintenance pass, which always scans
+  // and re-derives the flag from DB truth.
+  if (!opts?.force) {
+    const maybePending = await depositsMaybePending();
+    if (maybePending === false) return { scanned: 0, processed: 0, failed: 0, skipped: true };
+  }
+
   const tenMinutesAgo = new Date(now.getTime() - 10 * 60_000);
   const retryCutoff = new Date(now.getTime() - 2 * 60_000);
   const reviewCutoff = new Date(now.getTime() - 24 * 60 * 60_000);
@@ -807,6 +830,23 @@ export async function runDepositReconciliationTick(now = new Date()) {
           eq(depositTransactionsTable.status, deposit.status),
         ));
     }
+  }
+
+  // Re-derive the gate from DB truth. The flag may only be cleared when *no* non-terminal
+  // deposit rows remain — not merely when this pass found no due candidates. A `pending` row
+  // that has not yet aged into the 10-minute window is future work, and clearing on
+  // "no candidates" would strand it until the hourly backstop.
+  try {
+    const [{ open }] = await db
+      .select({ open: sql<number>`count(*)::int` })
+      .from(depositTransactionsTable)
+      .where(inArray(depositTransactionsTable.status, [...NON_TERMINAL_DEPOSIT_STATES]));
+
+    if (Number(open) === 0) await clearDepositsMaybePending();
+    else await markDepositsMaybePending();
+  } catch (err) {
+    // Leave the gate as-is: the next tick then sees "1"/unknown and scans again.
+    logger.warn({ err }, "[DepositReconcile] gate refresh failed (non-fatal)");
   }
 
   return { scanned: candidates.length, processed, failed };
