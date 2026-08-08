@@ -30,7 +30,12 @@ jobs:
   secret-scan:
     runs-on: ubuntu-latest
     steps:
+      # gitleaks scans the pushed commit range, so it needs the parent commit present. The
+      # default shallow checkout leaves it out and the scan dies on "unknown revision".
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
       - uses: gitleaks/gitleaks-action@v3
 
   # Pushes to main deploy themselves once verify + secret-scan are green. Coolify always builds
