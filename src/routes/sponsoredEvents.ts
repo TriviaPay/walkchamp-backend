@@ -105,7 +105,12 @@ async function autoFillSchedule(): Promise<void> {
     .limit(1);
 
   if (!recent) {
-    logger.info("[SponsoredEventsJob] autoFill skipped — no creator found yet");
+    // Deadlock, not a quiet no-op: autoFill borrows creatorId from an existing sponsored room, so
+    // on a database with none it can never create the first one and sponsored events stay empty
+    // forever. Bootstrap it with POST /api/sponsored-events/generate-weekend (admin) or
+    // scripts/src/seedSponsoredWeekends.ts — after that this self-sustains. WARN so log scans
+    // catch it instead of it blending into per-minute INFO chatter.
+    logger.warn("[SponsoredEventsJob] autoFill skipped — no sponsored room exists to borrow a creatorId from; seed one to bootstrap");
     return;
   }
 
