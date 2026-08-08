@@ -20,6 +20,61 @@ function toDayNumber(year: number, month: number, day: number): number {
   return Math.floor(Date.UTC(year, month - 1, day) / 86_400_000);
 }
 
+/**
+ * Normalize a client-supplied `YYYY-M-D` / `YYYY-MM-DD` to `YYYY-MM-DD`, or null when it is not a
+ * real calendar date. (The client's getTodayKey() returns un-padded month/day — that is fine.)
+ */
+export function normalizeLocalDate(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const match = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(raw.trim());
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) return null;
+  return `${match[1]}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+// Intl formatters are expensive to build and we key most reads off one, so cache per zone.
+const dateFormatters = new Map<string, Intl.DateTimeFormat>();
+
+/**
+ * `YYYY-MM-DD` for `now` as seen in an IANA timezone. Falls back to the UTC calendar date when
+ * the zone is missing or unrecognised.
+ */
+export function localDateInTimeZone(timeZone: string | null | undefined, now: Date = new Date()): string {
+  const zone = timeZone?.trim();
+  if (!zone || zone.toUpperCase() === "UTC") return now.toISOString().slice(0, 10);
+  let formatter = dateFormatters.get(zone);
+  if (!formatter) {
+    try {
+      // en-CA renders as YYYY-MM-DD.
+      formatter = new Intl.DateTimeFormat("en-CA", { timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit" });
+    } catch {
+      return now.toISOString().slice(0, 10); // unknown zone — never throw on a read path
+    }
+    dateFormatters.set(zone, formatter);
+  }
+  const formatted = formatter.format(now);
+  return normalizeLocalDate(formatted) ?? now.toISOString().slice(0, 10);
+}
+
+/**
+ * Resolve which calendar day "today" means for a user, most specific source first:
+ * the client-supplied localDate, then their stored IANA timezone, then UTC.
+ *
+ * LOAD-BEARING for daily step reads: step_daily_totals rows are written keyed by the user's LOCAL
+ * date, so reading them with the server's UTC date returns yesterday's bucket for every user east
+ * of UTC between their local midnight and UTC midnight (e.g. all of India, 00:00–05:30 IST).
+ */
+export function resolveTodayKey(
+  clientLocalDate: unknown,
+  timeZone?: string | null,
+  now: Date = new Date(),
+): string {
+  return normalizeLocalDate(clientLocalDate) ?? localDateInTimeZone(timeZone, now);
+}
+
 export type LocalDateResult =
   | { ok: true; normalized: string }
   | { ok: false; code: "malformed" | "out_of_range" | "invalid_calendar_date" | "outside_window"; message: string };

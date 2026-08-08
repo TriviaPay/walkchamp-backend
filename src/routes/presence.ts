@@ -7,6 +7,7 @@ import {
   friendsTable,
   walkingGroupMembersTable,
   spectateSessionsTable,
+  scheduledRoomRegistrationsTable,
 } from "../../db/src/schema/index.js";
 import { and, eq, gte, inArray, ne, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
@@ -20,6 +21,9 @@ const router = Router();
 // Online  = last_seen_at within 90 seconds
 // Walking = last_walk_activity_at within 5 minutes
 // Racing  = participant in an in_progress race (computed from race tables, not flags)
+// A scheduled registration counts as room membership while it is live; "active" is the state a
+// registration moves to at materialize-at-start, so both belong here.
+const ACTIVE_REGISTRATION_STATUSES = ["registered", "active"] as const;
 const ONLINE_THRESHOLD_MS  = 90_000;
 const WALKING_THRESHOLD_MS = 5 * 60_000;
 
@@ -147,7 +151,10 @@ router.get("/presence/races/:raceId/online", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const raceId = String(req.params.raceId);
 
-  const [participantAccess, spectatorAccess] = await Promise.all([
+  // A scheduled (future) room has no race_participants rows until materialize-at-start — its
+  // roster lives in scheduled_room_registrations. Membership must consider both, or the Waiting
+  // Room of every future race 403s and shows no online dots.
+  const [participantAccess, spectatorAccess, registrationAccess] = await Promise.all([
     db
       .select({ id: raceParticipantsTable.id })
       .from(raceParticipantsTable)
@@ -164,24 +171,47 @@ router.get("/presence/races/:raceId/online", requireAuth, async (req, res) => {
         eq(spectateSessionsTable.userId, userId),
       ))
       .limit(1),
+    db
+      .select({ id: scheduledRoomRegistrationsTable.id })
+      .from(scheduledRoomRegistrationsTable)
+      .where(and(
+        eq(scheduledRoomRegistrationsTable.raceRoomId, raceId),
+        eq(scheduledRoomRegistrationsTable.userId, userId),
+        inArray(scheduledRoomRegistrationsTable.status, ACTIVE_REGISTRATION_STATUSES),
+      ))
+      .limit(1),
   ]);
 
-  if (!participantAccess[0] && !spectatorAccess[0]) {
+  if (!participantAccess[0] && !spectatorAccess[0] && !registrationAccess[0]) {
     return res.status(403).json({ error: "Race access required" });
   }
 
-  const participants = await db
-    .selectDistinct({ userId: raceParticipantsTable.userId })
-    .from(raceParticipantsTable)
-    .where(eq(raceParticipantsTable.raceRoomId, raceId));
+  const [participants, registrants] = await Promise.all([
+    db
+      .selectDistinct({ userId: raceParticipantsTable.userId })
+      .from(raceParticipantsTable)
+      .where(eq(raceParticipantsTable.raceRoomId, raceId)),
+    db
+      .selectDistinct({ userId: scheduledRoomRegistrationsTable.userId })
+      .from(scheduledRoomRegistrationsTable)
+      .where(and(
+        eq(scheduledRoomRegistrationsTable.raceRoomId, raceId),
+        inArray(scheduledRoomRegistrationsTable.status, ACTIVE_REGISTRATION_STATUSES),
+      )),
+  ]);
 
-  const rows = participants.length === 0
+  const memberIds = [...new Set([
+    ...participants.map((row) => row.userId),
+    ...registrants.map((row) => row.userId),
+  ])];
+
+  const rows = memberIds.length === 0
     ? []
     : await db
         .select({ userId: userPresenceTable.userId })
         .from(userPresenceTable)
         .where(and(
-          inArray(userPresenceTable.userId, participants.map((row) => row.userId)),
+          inArray(userPresenceTable.userId, memberIds),
           gte(userPresenceTable.lastSeenAt, onlineAfter()),
           ne(userPresenceTable.status, "offline"),
         ));

@@ -7408,20 +7408,34 @@ router.get("/races/:id/online-invite-candidates", requireAuth, async (req, res) 
 
   if (!room) return res.status(404).json({ error: "Room not found" });
   if (room.creatorId !== currentUserId) return res.status(403).json({ error: "Only the host can view candidates" });
-  if (room.status !== "open") return res.status(409).json({ error: "Room is no longer open" });
+  // Scheduled (future) rooms take invites too — the host fills them before start.
+  if (room.status !== "open" && room.status !== "scheduled") {
+    return res.status(409).json({ error: "Room is no longer open" });
+  }
 
   const cutoff = new Date(Date.now() - 90_000);
 
-  // IDs already in the room
-  const joined = await db
-    .select({ userId: raceParticipantsTable.userId })
-    .from(raceParticipantsTable)
-    .where(and(
-      eq(raceParticipantsTable.raceRoomId, raceId),
-      ne(raceParticipantsTable.status, "left"),
-      ne(raceParticipantsTable.status, "forfeited"),
-    ));
-  const joinedIds = new Set(joined.map((j) => j.userId));
+  // IDs already in the room. A scheduled room's roster is in scheduled_room_registrations
+  // (race_participants stays empty until start), so both sources must be excluded — otherwise the
+  // host is offered people who have already registered.
+  const [joined, registered] = await Promise.all([
+    db
+      .select({ userId: raceParticipantsTable.userId })
+      .from(raceParticipantsTable)
+      .where(and(
+        eq(raceParticipantsTable.raceRoomId, raceId),
+        ne(raceParticipantsTable.status, "left"),
+        ne(raceParticipantsTable.status, "forfeited"),
+      )),
+    db
+      .select({ userId: scheduledRoomRegistrationsTable.userId })
+      .from(scheduledRoomRegistrationsTable)
+      .where(and(
+        eq(scheduledRoomRegistrationsTable.raceRoomId, raceId),
+        inArray(scheduledRoomRegistrationsTable.status, ["registered", "active"]),
+      )),
+  ]);
+  const joinedIds = new Set([...joined, ...registered].map((j) => j.userId));
   joinedIds.add(currentUserId);
 
   // IDs with pending invites to this room
@@ -7506,9 +7520,15 @@ router.post("/races/:id/invites", requireAuth, async (req, res) => {
     .limit(1);
 
   if (!room) return res.status(404).json({ error: "Room not found" });
-  if (room.status !== "open") return res.status(409).json({ error: "Room is no longer open" });
+  // Scheduled rooms accept invites before start; their occupancy is registeredCount, since
+  // race_participants stays empty until materialize-at-start.
+  const isScheduledRoom = room.status === "scheduled";
+  if (room.status !== "open" && !isScheduledRoom) {
+    return res.status(409).json({ error: "Room is no longer open" });
+  }
   if (room.creatorId !== currentUserId) return res.status(403).json({ error: "Only the host can invite" });
-  if (room.currentPlayers >= room.maxPlayers) return res.status(409).json({ error: "Room is full" });
+  const occupancy = isScheduledRoom ? room.registeredCount : room.currentPlayers;
+  if (occupancy >= room.maxPlayers) return res.status(409).json({ error: "Room is full" });
 
   // Check no active pending invite already
   const [existing] = await db

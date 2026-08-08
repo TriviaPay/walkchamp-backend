@@ -5,7 +5,8 @@ import { profilesTable, walletsTable, achievementDefinitionsTable, userTitlesTab
 import { raceResultsTable } from "../../db/src/schema/index.js";
 import { stepDailyTotalsTable, userStepSourcesTable } from "../../db/src/schema/index.js";
 import { coinBalancesTable } from "../../db/src/schema/index.js";
-import { raceParticipantsTable, raceRoomsTable } from "../../db/src/schema/index.js";
+import { raceParticipantsTable, raceRoomsTable, userPreferencesTable } from "../../db/src/schema/index.js";
+import { localDateInTimeZone, resolveTodayKey } from "../lib/localDate.js";
 import { eq, and, or, desc, ne, gt, notInArray, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import {
@@ -108,12 +109,20 @@ function isRacePodiumRank(rank: number | null | undefined): boolean {
 const PUBLIC_STREAK_SCAN_DAYS = 750;
 const PUBLIC_RACE_HISTORY_LIMIT = 1000;
 
+/** Shift a `YYYY-MM-DD` key by `days`, purely as calendar arithmetic (no timezone involved). */
+function shiftDateKey(key: string, days: number): string {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+}
+
 // Compute consecutive-day streak from step_daily_totals rows (ordered by date desc).
 // A streak is consecutive days ending on today or yesterday with steps > 0.
-function computeStreak(rows: { date: string | Date; steps: number | null }[]): number {
+//
+// `todayKey` MUST be the user's local calendar day, not the server's UTC day: rows are written
+// keyed by the local date, so a UTC "today" makes a user east of UTC look like they missed today
+// (and their streak restart from yesterday) for the hours between local and UTC midnight.
+function computeStreak(rows: { date: string | Date; steps: number | null }[], todayKey: string): number {
   if (rows.length === 0) return 0;
-  const today = new Date();
-  today.setUTCHours(0, 0, 0, 0);
 
   // Build a set of date strings (YYYY-MM-DD) that have steps > 0
   const activeDates = new Set<string>();
@@ -126,27 +135,21 @@ function computeStreak(rows: { date: string | Date; steps: number | null }[]): n
   if (activeDates.size === 0) return 0;
 
   // Walk backwards from today; allow starting from yesterday if today has no steps
-  const todayStr = today.toISOString().slice(0, 10);
-  const yesterday = new Date(today);
-  yesterday.setUTCDate(today.getUTCDate() - 1);
-  const yesterdayStr = yesterday.toISOString().slice(0, 10);
+  const yesterdayKey = shiftDateKey(todayKey, -1);
 
-  let cursor: Date;
-  if (activeDates.has(todayStr)) {
-    cursor = today;
-  } else if (activeDates.has(yesterdayStr)) {
-    cursor = yesterday;
+  let cursor: string;
+  if (activeDates.has(todayKey)) {
+    cursor = todayKey;
+  } else if (activeDates.has(yesterdayKey)) {
+    cursor = yesterdayKey;
   } else {
     return 0; // Streak is broken — neither today nor yesterday was active
   }
 
   let streak = 0;
-  while (true) {
-    const key = cursor.toISOString().slice(0, 10);
-    if (!activeDates.has(key)) break;
+  while (activeDates.has(cursor)) {
     streak++;
-    cursor = new Date(cursor);
-    cursor.setUTCDate(cursor.getUTCDate() - 1);
+    cursor = shiftDateKey(cursor, -1);
   }
   return streak;
 }
@@ -163,13 +166,23 @@ function isBlocked(username: string) {
 // ── GET /api/profile/me ───────────────────────────────────────────────────────
 router.get("/profile/me", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
-  const today  = new Date().toISOString().slice(0, 10);
 
   // Critical queries — if these fail, we return 404/500 as appropriate
-  const [profiles, wallets] = await Promise.all([
+  const [profiles, wallets, prefs] = await Promise.all([
     db.select().from(profilesTable).where(eq(profilesTable.id, userId)).limit(1),
     db.select().from(walletsTable).where(eq(walletsTable.userId, userId)).limit(1),
+    db.select({ timezone: userPreferencesTable.timezone })
+      .from(userPreferencesTable)
+      .where(eq(userPreferencesTable.userId, userId))
+      .limit(1)
+      .catch(() => []),
   ]);
+
+  // Daily rows are keyed by the user's LOCAL date (POST /walk/steps writes them that way), so
+  // "today" must be resolved the same way here — client localDate first, then their stored
+  // timezone, then UTC. Using the server's UTC date served yesterday's bucket to every user east
+  // of UTC until UTC midnight.
+  const today = resolveTodayKey(req.query.localDate, prefs[0]?.timezone);
 
   const p = profiles[0];
   if (!p) return res.status(404).json({ error: "Profile not found" });
@@ -255,7 +268,7 @@ router.get("/profile/me", requireAuth, async (req, res) => {
 
   const w              = wallets[0];
   const todaySteps     = todayRows[0]?.steps ?? 0;
-  const liveStreak     = computeStreak(streakRows);
+  const liveStreak     = computeStreak(streakRows, today);
   const liveAllTime    = streakRows.reduce((sum, r) => sum + (r.steps ?? 0), 0);
   const lifetimeXP     = computeXP(liveAllTime, allRaceRows);
   const levelData      = computeLevelData(lifetimeXP);
@@ -569,7 +582,7 @@ router.get("/profile/public/:username", async (req, res) => {
   // long an account has existed. The all-time total is aggregated in SQL rather than by
   // transferring every daily row, and the streak scan is capped — a streak cannot extend past
   // the first gap, so PUBLIC_STREAK_SCAN_DAYS of history is always enough to compute it.
-  const [raceRows, pubStreakRows, [pubAllTimeRow]] = await Promise.all([
+  const [raceRows, pubStreakRows, [pubAllTimeRow], pubPrefs] = await Promise.all([
     db.select({
         rank: raceResultsTable.rank,
         prizeCents: raceResultsTable.prizeCents,
@@ -586,12 +599,19 @@ router.get("/profile/public/:username", async (req, res) => {
     db.select({ total: sql<number>`coalesce(sum(${stepDailyTotalsTable.steps}), 0)` })
       .from(stepDailyTotalsTable)
       .where(eq(stepDailyTotalsTable.userId, p.id)),
+    db.select({ timezone: userPreferencesTable.timezone })
+      .from(userPreferencesTable)
+      .where(eq(userPreferencesTable.userId, p.id))
+      .limit(1)
+      .catch(() => []),
   ]);
 
   const pubAllTime = Number(pubAllTimeRow?.total ?? 0);
   const lifetimeXP = computeXP(pubAllTime, raceRows);
   const levelData  = computeLevelData(lifetimeXP);
-  const pubStreak  = computeStreak(pubStreakRows);
+  // No caller context on this unauthenticated route, so anchor the streak to the profile owner's
+  // own timezone rather than the server's.
+  const pubStreak  = computeStreak(pubStreakRows, localDateInTimeZone(pubPrefs[0]?.timezone));
 
   return res.json({
     success: true,
