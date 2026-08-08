@@ -30,10 +30,11 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/db ./db
 COPY --from=build /app/tsconfig.json ./tsconfig.json
 COPY deploy/coolify/run-migrations.sh /usr/local/bin/run-migrations
+COPY deploy/coolify/api-entrypoint.sh /usr/local/bin/api-entrypoint
 COPY deploy/coolify/worker-entrypoint.sh /usr/local/bin/worker-entrypoint
 COPY deploy/coolify/worker-healthcheck.sh /usr/local/bin/worker-healthcheck
 
-RUN chmod +x /usr/local/bin/run-migrations /usr/local/bin/worker-entrypoint /usr/local/bin/worker-healthcheck
+RUN chmod +x /usr/local/bin/run-migrations /usr/local/bin/api-entrypoint /usr/local/bin/worker-entrypoint /usr/local/bin/worker-healthcheck
 
 ENTRYPOINT ["tini", "--"]
 CMD ["node", "--enable-source-maps", "./dist/index.mjs"]

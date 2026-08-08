@@ -32,3 +32,72 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: gitleaks/gitleaks-action@v3
+
+  # Pushes to main deploy themselves once verify + secret-scan are green. Coolify always builds
+  # the current head of main, so a deploy triggered here can pick up a newer commit than the one
+  # that triggered it; the concurrency group keeps those from overlapping rather than racing.
+  deploy:
+    name: Deploy to production
+    needs: [verify, secret-scan]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    env:
+      COOLIFY_URL: ${{ secrets.COOLIFY_URL }}
+      COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+      COOLIFY_APP_UUID: ${{ secrets.COOLIFY_APP_UUID }}
+    steps:
+      - name: Queue Coolify deployment
+        id: queue
+        run: |
+          set -euo pipefail
+          body=$(curl -fsS -X POST \
+            -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+            "${COOLIFY_URL}/api/v1/deploy?uuid=${COOLIFY_APP_UUID}&force=false")
+          uuid=$(jq -r '.deployments[0].deployment_uuid // empty' <<<"$body")
+          if [ -z "$uuid" ]; then
+            echo "Coolify refused to queue a deployment:"
+            jq -r '.deployments[0].message // .message // "unknown error"' <<<"$body"
+            exit 1
+          fi
+          echo "uuid=${uuid}" >>"$GITHUB_OUTPUT"
+          echo "Queued deployment ${uuid} for ${GITHUB_SHA}"
+
+      - name: Wait for deployment to finish
+        run: |
+          set -euo pipefail
+          uuid='${{ steps.queue.outputs.uuid }}'
+          deadline=$((SECONDS + 1800))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            status=$(curl -fsS -H "Authorization: Bearer ${COOLIFY_TOKEN}" \
+              "${COOLIFY_URL}/api/v1/deployments/${uuid}" | jq -r '.status // "unknown"')
+            case "$status" in
+              finished)
+                echo "Deployment ${uuid} finished."
+                exit 0
+                ;;
+              failed|cancelled-by-user)
+                echo "Deployment ${uuid} ended as '${status}'. See the Coolify deployment log."
+                exit 1
+                ;;
+              *)
+                echo "status=${status}"
+                ;;
+            esac
+            sleep 15
+          done
+          echo "Timed out after 30m waiting on deployment ${uuid}."
+          exit 1
+
+      - name: Smoke-check the public API
+        run: |
+          set -euo pipefail
+          for url in \
+            https://api.walkchamp.miragaming.com/api/healthz \
+            https://api.walkchamp.miragaming.com/api/readyz; do
+            echo "GET ${url}"
+            curl -fsS --retry 5 --retry-delay 5 --retry-all-errors --max-time 15 "$url"
+            echo
+          done

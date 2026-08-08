@@ -86,13 +86,17 @@ services:
       <<: *app-env
       APP_PROCESS_ROLE: api
       RUN_BACKGROUND_JOBS: "false"
-    command: ["node", "--enable-source-maps", "./dist/index.mjs"]
+    # Applies pending migrations, then execs the server. See deploy/coolify/api-entrypoint.sh for
+    # why migrations live here instead of in a Coolify deployment hook.
+    command: ["/usr/local/bin/api-entrypoint"]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/api/healthz >/dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      # Generous enough that a slow migration doesn't start burning healthcheck retries before
+      # the server has had a chance to bind.
+      start_period: 120s
 
   worker:
     build:
@@ -109,6 +113,10 @@ services:
       # a redis-live problem must not block the whole fleet's startup (feature is OFF by default).
       redis-live:
         condition: service_started
+      # api runs the migrations, so the worker must not start draining queues against a schema
+      # that hasn't been brought forward yet.
+      api:
+        condition: service_healthy
     environment:
       <<: *app-env
       APP_PROCESS_ROLE: worker
