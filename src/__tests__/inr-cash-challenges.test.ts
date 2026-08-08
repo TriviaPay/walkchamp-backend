@@ -7,6 +7,7 @@ import {
   formatQuoteForApi,
   inrCashChallengesEnabled,
   isCashChallengeUnsupportedForCountry,
+  isCashChallengeUnsupportedForUser,
   resolvePaymentProvider,
 } from "../lib/cashChallengeFees.js";
 
@@ -129,8 +130,13 @@ describe("the gate is enforced in exactly one place", () => {
   it("every cash country gate calls the shared predicate", () => {
     // Flipping the flag must open quote, host, start-debit, paid join and unlimited
     // together. A site that compared countryCode to "IN" itself would be left behind.
-    expect(races.match(/isCashChallengeUnsupportedForCountry\(/g)?.length).toBeGreaterThanOrEqual(5);
-    expect(unlimited).toContain("isCashChallengeUnsupportedForCountry(");
+    // Call sites use the wallet-aware predicate; it delegates to the country rule internally.
+    expect(races.match(/isCashChallengeUnsupportedForUser\(/g)?.length).toBeGreaterThanOrEqual(5);
+    expect(unlimited).toContain("isCashChallengeUnsupportedForUser(");
+    // The country-only predicate must not leak back into call sites — it ignores wallet currency
+    // and blocks India-registered accounts that pay in USD.
+    expect(races).not.toContain("isCashChallengeUnsupportedForCountry(");
+    expect(unlimited).not.toContain("isCashChallengeUnsupportedForCountry(");
 
     const routeBody = races.slice(races.indexOf("const router = Router()"));
     expect(/countryCode\s*===\s*"IN"/.test(routeBody)).toBe(false);
@@ -143,5 +149,39 @@ describe("the gate is enforced in exactly one place", () => {
     const debit = refunds.slice(refunds.indexOf("export async function debitWalletForCashChallenge"));
     expect(debit).toContain('wallet.currency.toLowerCase() !== "usd"');
     expect(debit).not.toContain("isCashChallengeUnsupportedForCountry");
+  });
+});
+
+// The gate exists to stop INR/Razorpay payers, but cash entries are always a USD wallet debit —
+// Razorpay only funds the wallet. Keying on the registration country blocked an India-registered
+// account holding a USD wallet, which is transacting entirely in USD.
+describe("availability is decided by the payment rail, not the passport", () => {
+  it("allows an India-registered account that holds a USD wallet", () => {
+    expect(inrCashChallengesEnabled()).toBe(false);
+    expect(isCashChallengeUnsupportedForCountry("IN")).toBe(true); // country alone still says no
+    expect(isCashChallengeUnsupportedForUser({ countryCode: "IN", walletCurrency: "usd" })).toBe(false);
+    expect(isCashChallengeUnsupportedForUser({ countryCode: "IN", walletCurrency: "USD" })).toBe(false);
+    expect(isCashChallengeUnsupportedForUser({ countryCode: "IN", walletCurrency: " usd " })).toBe(false);
+  });
+
+  it("still blocks an India account on an INR wallet, which the debit would reject anyway", () => {
+    expect(isCashChallengeUnsupportedForUser({ countryCode: "IN", walletCurrency: "inr" })).toBe(true);
+  });
+
+  it("falls back to the country rule when there is no wallet to judge by", () => {
+    expect(isCashChallengeUnsupportedForUser({ countryCode: "IN" })).toBe(true);
+    expect(isCashChallengeUnsupportedForUser({ countryCode: "IN", walletCurrency: null })).toBe(true);
+  });
+
+  it("leaves every other country supported regardless of wallet state", () => {
+    for (const cc of ["US", "GB", "DE", "AU", null, undefined, ""]) {
+      expect(isCashChallengeUnsupportedForUser({ countryCode: cc })).toBe(false);
+      expect(isCashChallengeUnsupportedForUser({ countryCode: cc, walletCurrency: "inr" })).toBe(false);
+    }
+  });
+
+  it("opens INR wallets too once the rollout flag is on", () => {
+    process.env[INR_FLAG] = "true";
+    expect(isCashChallengeUnsupportedForUser({ countryCode: "IN", walletCurrency: "inr" })).toBe(false);
   });
 });

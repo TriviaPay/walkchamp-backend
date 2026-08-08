@@ -79,7 +79,7 @@ import {
   cashChallengeUnsupportedForCurrencyBody,
   formatQuoteForApi,
   isAllowedEntryAmountCents,
-  isCashChallengeUnsupportedForCountry,
+  isCashChallengeUnsupportedForUser,
   resolvePaymentProvider,
 } from "../lib/cashChallengeFees.js";
 import {
@@ -3236,12 +3236,13 @@ router.get("/races/cash-challenge/payment-quote", requireAuth, async (req, res) 
   }
 
   const [profileForQuote] = await db
-    .select({ countryCode: profilesTable.countryCode })
+    .select({ countryCode: profilesTable.countryCode, walletCurrency: walletsTable.currency })
     .from(profilesTable)
+    .leftJoin(walletsTable, eq(walletsTable.userId, profilesTable.id))
     .where(eq(profilesTable.id, userId))
     .limit(1);
   const effectiveCountryCode = profileForQuote?.countryCode ?? countryCode;
-  if (isCashChallengeUnsupportedForCountry(effectiveCountryCode)) {
+  if (isCashChallengeUnsupportedForUser({ countryCode: effectiveCountryCode, walletCurrency: profileForQuote?.walletCurrency })) {
     req.log.info(
       { userId, countryCode: effectiveCountryCode },
       "[CashChallenge] INR/Razorpay quote blocked until multi-currency support ships",
@@ -3356,9 +3357,14 @@ router.post("/races/host", requireAuth, async (req, res) => {
     if (!computeIsAdult(profile.dateOfBirth, profile.isAdult)) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
     if (!profile.paidRaceEnabled) return res.status(403).json({ error: "Paid challenges are not available for your account." });
     if (profile.accountStatus !== "active") return res.status(403).json({ error: "Your account is under review." });
-    if (isCashChallengeUnsupportedForCountry(profile.countryCode)) {
+    const [hostWallet] = await db
+      .select({ currency: walletsTable.currency })
+      .from(walletsTable)
+      .where(eq(walletsTable.userId, userId))
+      .limit(1);
+    if (isCashChallengeUnsupportedForUser({ countryCode: profile.countryCode, walletCurrency: hostWallet?.currency })) {
       req.log.info(
-        { userId, countryCode: profile.countryCode },
+        { userId, countryCode: profile.countryCode, walletCurrency: hostWallet?.currency },
         "[CashChallenge] INR/Razorpay host blocked until multi-currency support ships",
       );
       return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());
@@ -3660,11 +3666,16 @@ export async function activateRoomAndStart(
 
     if (participants.length > 0) {
       const participantProfiles = await db
-        .select({ userId: profilesTable.id, countryCode: profilesTable.countryCode })
+        .select({
+          userId: profilesTable.id,
+          countryCode: profilesTable.countryCode,
+          walletCurrency: walletsTable.currency,
+        })
         .from(profilesTable)
+        .leftJoin(walletsTable, eq(walletsTable.userId, profilesTable.id))
         .where(inArray(profilesTable.id, participants.map((p) => p.userId)));
       const unsupportedParticipant = participantProfiles.find((profile) =>
-        isCashChallengeUnsupportedForCountry(profile.countryCode)
+        isCashChallengeUnsupportedForUser({ countryCode: profile.countryCode, walletCurrency: profile.walletCurrency })
       );
       if (unsupportedParticipant) {
         logger.warn(
@@ -3676,11 +3687,12 @@ export async function activateRoomAndStart(
       }
 
       const [hostProfile] = await db
-        .select({ countryCode: profilesTable.countryCode })
+        .select({ countryCode: profilesTable.countryCode, walletCurrency: walletsTable.currency })
         .from(profilesTable)
+        .leftJoin(walletsTable, eq(walletsTable.userId, profilesTable.id))
         .where(eq(profilesTable.id, room.creatorId))
         .limit(1);
-      if (isCashChallengeUnsupportedForCountry(hostProfile?.countryCode)) {
+      if (isCashChallengeUnsupportedForUser({ countryCode: hostProfile?.countryCode, walletCurrency: hostProfile?.walletCurrency })) {
         logger.warn(
           { raceId, hostUserId: room.creatorId, countryCode: hostProfile?.countryCode },
           "[CashChallenge] INR/Razorpay race start debit blocked until multi-currency support ships",
@@ -4678,16 +4690,16 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   if (!computeIsAdult(profile.dateOfBirth, profile.isAdult)) return res.status(403).json({ error: "You must be 18 or older to join paid challenges." });
   if (!profile.paidRaceEnabled) return res.status(403).json({ error: "Paid challenges are not available for your account." });
   if (profile.accountStatus !== "active") return res.status(403).json({ error: "Your account is under review." });
-  if (isCashChallengeUnsupportedForCountry(profile.countryCode)) {
+
+  // Wallet check — require total payable (entry + processing + platform service fees)
+  const [wallet] = await db.select().from(walletsTable).where(eq(walletsTable.userId, userId)).limit(1);
+  if (isCashChallengeUnsupportedForUser({ countryCode: profile.countryCode, walletCurrency: wallet?.currency })) {
     req.log.info(
-      { userId, raceId, countryCode: profile.countryCode },
+      { userId, raceId, countryCode: profile.countryCode, walletCurrency: wallet?.currency },
       "[CashChallenge] INR/Razorpay paid join blocked until multi-currency support ships",
     );
     return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());
   }
-
-  // Wallet check — require total payable (entry + processing + platform service fees)
-  const [wallet] = await db.select().from(walletsTable).where(eq(walletsTable.userId, userId)).limit(1);
   const balance = wallet?.availableBalanceCents ?? 0;
   const [profileForFees] = await db
     .select({ countryCode: profilesTable.countryCode })
@@ -5109,9 +5121,14 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
     if (!joinerProfile || !computeIsAdult(joinerProfile.dateOfBirth, joinerProfile.isAdult) || !joinerProfile.paidRaceEnabled || joinerProfile.accountStatus !== "active") {
       return res.status(403).json({ success: false, error: "Paid challenges are not available for your account." });
     }
-    if (isCashChallengeUnsupportedForCountry(joinerProfile.countryCode)) {
+    const [joinerWallet] = await db
+      .select({ currency: walletsTable.currency })
+      .from(walletsTable)
+      .where(eq(walletsTable.userId, userId))
+      .limit(1);
+    if (isCashChallengeUnsupportedForUser({ countryCode: joinerProfile.countryCode, walletCurrency: joinerWallet?.currency })) {
       req.log.info(
-        { userId, raceId: room.id, countryCode: joinerProfile.countryCode },
+        { userId, raceId: room.id, countryCode: joinerProfile.countryCode, walletCurrency: joinerWallet?.currency },
         "[CashChallenge] INR/Razorpay private paid join blocked until multi-currency support ships",
       );
       return res.status(403).json(cashChallengeUnsupportedForCurrencyBody());

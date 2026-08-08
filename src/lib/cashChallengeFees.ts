@@ -53,10 +53,33 @@ export function resolvePaymentProvider(countryCode?: string | null): PaymentProv
  * refuses any non-USD wallet regardless of this flag. Cash amounts are USD-denominated
  * (see formatQuoteForApi), so that guard is what keeps the ledger consistent; unblocking a
  * country never bypasses it.
+ *
+ * Prefer isCashChallengeUnsupportedForUser at call sites: country alone mis-classifies an
+ * India-registered account that holds a USD wallet.
  */
 export function isCashChallengeUnsupportedForCountry(countryCode?: string | null): boolean {
   if (normalizeCountryCode(countryCode) !== "IN") return false;
   return !inrCashChallengesEnabled();
+}
+
+/**
+ * Availability gate keyed on the rail the money will actually travel on.
+ *
+ * Cash entries are always a USD wallet debit (debitWalletForCashChallenge), and Razorpay only
+ * ever handles INR *deposits* into a wallet. So the thing that decides whether a user can pay is
+ * their wallet currency, not the country their profile was registered in — an India-registered
+ * account holding a USD wallet transacts entirely in USD and was being blocked for no reason.
+ *
+ * A USD wallet is therefore always supported. Without one, we fall back to the country proxy so
+ * an INR/Razorpay user is still stopped up front with a clear message rather than getting deep
+ * into a create/join flow and failing at the currency guard.
+ */
+export function isCashChallengeUnsupportedForUser(input: {
+  countryCode?: string | null;
+  walletCurrency?: string | null;
+}): boolean {
+  if (input.walletCurrency?.trim().toLowerCase() === "usd") return false;
+  return isCashChallengeUnsupportedForCountry(input.countryCode);
 }
 
 export function cashChallengeUnsupportedForCurrencyBody() {

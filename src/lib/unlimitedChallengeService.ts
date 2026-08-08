@@ -1,6 +1,7 @@
 import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { profilesTable } from "../../db/src/schema/profiles.js";
+import { walletsTable } from "../../db/src/schema/index.js";
 import { userPreferencesTable } from "../../db/src/schema/userPreferences.js";
 import {
   unlimitedChallengesTable,
@@ -10,7 +11,7 @@ import {
 import { debitWalletForCashChallenge, createRefundForRaceParticipantTx } from "./refundService.js";
 import { creditEntryRefunds } from "./cashChallengePayments.js";
 import { computeIsAdult } from "./dateOfBirth.js";
-import { isCashChallengeUnsupportedForCountry } from "./cashChallengeFees.js";
+import { isCashChallengeUnsupportedForUser } from "./cashChallengeFees.js";
 import { allocateChallengeCode } from "./uniqueCodes.js";
 import { isValidTimezone, validateUnlimitedSchedule } from "./challengeDayWindow.js";
 import {
@@ -45,15 +46,21 @@ async function checkPaidEligibility(userId: string, isCreate: boolean): Promise<
       profileCompleted: profilesTable.profileCompleted,
       fraudScore: profilesTable.fraudScore,
       countryCode: profilesTable.countryCode,
+      // The entry is a USD wallet debit, so the wallet's currency — not the registration
+      // country — decides whether this user can pay. See isCashChallengeUnsupportedForUser.
+      walletCurrency: walletsTable.currency,
     })
     .from(profilesTable)
+    .leftJoin(walletsTable, eq(walletsTable.userId, profilesTable.id))
     .where(eq(profilesTable.id, userId))
     .limit(1);
   if (!p) return { ok: false, httpStatus: 403, body: { error: "Paid challenges are not available for your account." } };
   if (!computeIsAdult(p.dateOfBirth, p.isAdult)) return { ok: false, httpStatus: 403, body: { error: "You must be 18 or older to join paid challenges." } };
   if (!p.paidRaceEnabled) return { ok: false, httpStatus: 403, body: { error: "Paid challenges are not available for your account." } };
   if (p.accountStatus !== "active") return { ok: false, httpStatus: 403, body: { error: "Your account is under review." } };
-  if (isCashChallengeUnsupportedForCountry(p.countryCode)) return { ok: false, httpStatus: 403, body: { error: "Cash challenges are not yet supported in your region.", code: "region_unsupported" } };
+  if (isCashChallengeUnsupportedForUser({ countryCode: p.countryCode, walletCurrency: p.walletCurrency })) {
+    return { ok: false, httpStatus: 403, body: { error: "Cash challenges are not yet supported in your region.", code: "region_unsupported" } };
+  }
   if (isCreate && !p.profileCompleted) return { ok: false, httpStatus: 403, body: { error: "Complete your profile to host paid challenges." } };
   if (isCreate && (p.fraudScore ?? 0) >= 70) return { ok: false, httpStatus: 403, body: { error: "Your account is under review." } };
   return { ok: true, data: { countryCode: p.countryCode } };
