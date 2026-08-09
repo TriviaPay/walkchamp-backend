@@ -196,6 +196,7 @@ async function buildViewerSchedule(
         .select({
           verifiedSteps: unlimitedChallengeDaysTable.verifiedSteps,
           goalSteps: unlimitedChallengeDaysTable.goalSteps,
+          startBaselineSteps: unlimitedChallengeDaysTable.startBaselineSteps,
         })
         .from(unlimitedChallengeDaysTable)
         .where(and(
@@ -239,6 +240,19 @@ async function buildViewerSchedule(
     failedDays: state.failedDays,
     dailyGoalSteps: currentDay?.goalSteps ?? challenge.dailyGoalSteps,
     currentSteps: currentDay?.verifiedSteps ?? 0,
+    // ── Tray cold-start restore ───────────────────────────────────────────────
+    // Everything the Unlimited tray needs to rebuild itself after process death, without opening
+    // Live Detail. challengeDayKey/participantTimezone are the PARTICIPANT's locked values — never
+    // the host's — so a restored tray writes provisional progress against the right day key.
+    challengeDayKey: state.currentDayLocalDate,
+    participantLocalDate: state.currentDayLocalDate,
+    participantTimezone: state.viewerTimezone,
+    challengeDaySteps: Math.max(0, (currentDay?.verifiedSteps ?? 0) - (currentDay?.startBaselineSteps ?? 0)),
+    raceStartBaselineSteps: currentDay?.startBaselineSteps ?? 0,
+    // The tray must drive step sync through these, never through /api/races/:id/progress.
+    unlimitedDailyMode: true,
+    verifiedStepsEndpoint: "/api/walk/steps",
+    provisionalStepsEndpoint: `/api/unlimited-challenges/${challenge.id}/live-progress`,
   };
 }
 
@@ -430,7 +444,11 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
     loadChallengePlayers(challengeId, userId, challenge.hostUserId),
     buildViewerSchedule(challenge, userId),
   ]);
+  // The VIEWER's own locked day key wins. The roster-derived value is only a fallback for a
+  // spectator who is not a participant — using another participant's day key to drive this
+  // viewer's provisional writes is exactly the host-day-key bug we removed.
   const challengeDayKey =
+    viewer.challengeDayKey ??
     players.find((p) => p.userId === userId)?.challengeDayKey ??
     players.find((p) => p.challengeDayKey)?.challengeDayKey ??
     null;
@@ -446,8 +464,8 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
     // instead of the host's.
     prospectiveStartAtUtc: membership ? null : wouldStartAt,
     prospectiveTimezone: membership ? null : viewerTimezone,
-    challengeDayKey,
     ...viewer,
+    challengeDayKey,
     players,
     participants: players,
   });

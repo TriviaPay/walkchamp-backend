@@ -129,8 +129,13 @@ describe("verified step totals broadcast progress_updated immediately", () => {
     expect(handler.indexOf("applyVerifiedStepsToUnlimitedDays")).toBeLessThan(
       handler.indexOf("findActiveUnlimitedDaysForUser"),
     );
-    // One block, so the ordering actually holds rather than racing two IIFEs.
-    expect(handler).toContain("// Credit + broadcast, in that order and in ONE block");
+    // The credit is now AWAITED before the broadcast is even scheduled — a stronger ordering
+    // guarantee than the previous single fire-and-forget block, and it lets the response report
+    // what was credited.
+    expect(handler).toContain("unlimitedCredits = await applyVerifiedStepsToUnlimitedDays({");
+    expect(handler.indexOf("unlimitedCredits = await")).toBeLessThan(
+      handler.indexOf("// Broadcast, fire-and-forget"),
+    );
   });
 
   it("emits the same payload shape as the provisional endpoint", () => {
@@ -197,6 +202,8 @@ describe("live-display baseline never reaches money", () => {
       for (const line of derivations) {
         if (line.includes("??")) continue; // fallback form, no subtraction
         if (/challengeDaySteps: (number|string);/.test(line)) continue; // type declaration
+        // Pass-through of an already-floored value (e.g. the walk response echoing a credit).
+        if (/challengeDaySteps: [a-z]\w*\.challengeDaySteps[,;]/.test(line)) continue;
         expect(line).toContain("Math.max(0,");
       }
     }

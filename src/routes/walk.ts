@@ -584,27 +584,30 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   // Evaluate achievement titles — fire-and-forget so step sync never fails on this
   evaluateAndNotify(userId).catch(() => {});
 
-  // Credit + broadcast, in that order and in ONE block so the event carries the value that was
-  // just written rather than racing the credit. Fire-and-forget: step sync must never fail
-  // because a challenge write or a Pusher call did.
-  (async () => {
+  // Credit this verified total to the participant's OWN Unlimited challenge day, resolved from
+  // their locked-timezone window rather than the device's calendar date. The day row is the
+  // qualification authority, so a traveller's steps can never be scored against the wrong window.
+  //
+  // AWAITED, unlike the broadcast below: the response reports exactly which challenge days were
+  // credited and which were skipped, so the client can explain "your steps aren't counting yet"
+  // instead of silently showing a stalled goal. A failure here still never fails step sync.
+  let unlimitedCredits: import("../lib/unlimitedStepIngest.js").UnlimitedDayCredit[] = [];
+  if (sessionVerified) {
     try {
-      // Credit this verified total to the participant's OWN Unlimited challenge day, resolved
-      // from their locked-timezone window rather than the device's calendar date. The day row is
-      // the qualification authority, so a traveller's steps can never be scored against the
-      // wrong window.
-      if (sessionVerified) {
-        const { applyVerifiedStepsToUnlimitedDays } = await import("../lib/unlimitedStepIngest.js");
-        await applyVerifiedStepsToUnlimitedDays({
-          userId,
-          verifiedTotal: updatedForCoins?.steps ?? 0,
-          deviceLocalDate: today,
-        });
-      }
+      const { applyVerifiedStepsToUnlimitedDays } = await import("../lib/unlimitedStepIngest.js");
+      unlimitedCredits = await applyVerifiedStepsToUnlimitedDays({
+        userId,
+        verifiedTotal: updatedForCoins?.steps ?? 0,
+        deviceLocalDate: today,
+      });
     } catch (err) {
       req.log.error({ err, userId }, "[Unlimited] challenge-day credit failed");
     }
+  }
 
+  // Broadcast, fire-and-forget. Runs after the credit above has already committed, so the event
+  // carries the value that was just written.
+  (async () => {
     // Broadcast live progress to any active Unlimited challenge day whose locked window contains
     // now (authoritative). Do not require client localDate === day.localDate. This is what makes
     // a VERIFIED total appear on other viewers' boards immediately instead of on their next poll —
@@ -827,6 +830,47 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
       calories: row?.caloriesBurned ?? totalCals,
       activeMinutes: finalActiveMinutes,
       dailyRank: syncDailyRank,
+    },
+    // What this submission did to the caller's Unlimited challenge day(s). Present on every
+    // response (empty arrays when they are in no challenge) so the client never has to guess
+    // whether steps are counting.
+    unlimited: {
+      // Only verified Health Connect / HealthKit totals may touch qualification state.
+      verifiedSource: sessionVerified,
+      deviceLocalDate: today,
+      credited: unlimitedCredits
+        .filter((c) => !c.timezoneDrift)
+        .map((c) => ({
+          challengeId: c.challengeId,
+          dayNumber: c.dayNumber,
+          challengeDayKey: c.localDate,
+          participantLocalDate: c.localDate,
+          participantTimezone: c.timezone,
+          verifiedSteps: c.verifiedSteps,
+          dailyGoalSteps: c.goalSteps,
+          goalReached: c.goalReached,
+          challengeDaySteps: c.challengeDaySteps,
+          raceStartBaselineSteps: c.startBaselineSteps,
+        })),
+      // Steps were NOT applied to these days. The device's calendar day and the participant's
+      // locked challenge day describe different 24h spans, so the incoming absolute total would
+      // over- or under-credit a day that decides real money.
+      skipped: unlimitedCredits
+        .filter((c) => c.timezoneDrift)
+        .map((c) => ({
+          challengeId: c.challengeId,
+          dayNumber: c.dayNumber,
+          reason: "timezone_drift",
+          code: "DEVICE_DAY_NOT_CHALLENGE_DAY",
+          challengeDayKey: c.localDate,
+          participantLocalDate: c.localDate,
+          deviceLocalDate: today,
+          lockedTimezone: c.timezone,
+          verifiedSteps: c.verifiedSteps,
+          message:
+            `Your device is on ${today} but this challenge day is ${c.localDate} in ${c.timezone} `
+            + "(the timezone locked when you joined). Steps will credit once the two line up.",
+        })),
     },
   });
 });

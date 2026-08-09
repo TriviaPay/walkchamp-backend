@@ -6352,7 +6352,31 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
     }
   }
 
-  if (!participantData) return res.status(404).json({ error: "Participant not found" });
+  if (!participantData) {
+    // ── Unlimited Daily Goal challenges never use classic race progress ──────
+    // Their progress lives in unlimited_challenge_days, written by POST /api/walk/steps
+    // (verified) and POST /api/unlimited-challenges/:id/live-progress (provisional). An Unlimited
+    // id has no race_rooms row and no race_participants row, so it used to fall out here as a 404
+    // — which native/outbox layers treat as retryable, producing an endless retry storm.
+    //
+    // Answer 200 with skipped:true instead: terminal for the client, and explicit about where the
+    // steps should go. Deliberately placed on the not-found path so a valid classic race never
+    // pays for the extra lookup. NO race_participants row is created for an Unlimited id.
+    const [unlimited] = await db
+      .select({ id: unlimitedChallengesTable.id })
+      .from(unlimitedChallengesTable)
+      .where(eq(unlimitedChallengesTable.id, raceId))
+      .limit(1);
+    if (unlimited) {
+      req.log.info({ raceId, userId }, "[StepSync] classic progress skipped — Unlimited challenge id");
+      return res.json({
+        skipped: true,
+        code: "UNLIMITED_USES_WALK_STEPS",
+        message: "Unlimited challenges use /api/walk/steps and /api/unlimited-challenges/:id/live-progress.",
+      });
+    }
+    return res.status(404).json({ error: "Participant not found" });
+  }
 
   // ── Forfeit / removal guard (§12/§23) ─────────────────────────────────────
   // Once a participant has forfeited, left, or been disqualified, no race-step update is
