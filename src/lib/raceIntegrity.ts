@@ -235,3 +235,44 @@ export async function registerOrReviveScheduledRegistration(
 
   return { changed: false, reason: "already_registered", registration: existing };
 }
+
+/**
+ * Releases a user's seat in a scheduled room: cancels the registration row AND decrements the
+ * room's registeredCount, in the caller's transaction.
+ *
+ * Every path that removes someone from a scheduled room must call this. Leaving only marked
+ * race_participants "left" and decremented currentPlayers, which is the wrong counter for a
+ * scheduled room — a scheduled room has no participant rows at all until materialize-at-start, so
+ * the registration stayed live and the next roster poll put the leaver straight back into the
+ * Waiting Room while "Joined" never dropped.
+ *
+ * Only "registered" is releasable, matching POST /api/rooms/:roomId/cancel-registration.
+ * Materialize-at-start moves the row to "activated"; from there the race has begun and leaving is
+ * a forfeit, which must not give the seat back.
+ *
+ * `room` must be the row already locked by lockRaceRoom, so registeredCount is a consistent read.
+ */
+export async function releaseScheduledRegistration(
+  tx: DbTx,
+  raceRoomId: string,
+  userId: string,
+  room: { registeredCount: number },
+): Promise<{ changed: boolean; registeredCount: number; hadRegistration: boolean }> {
+  const existing = await lockScheduledRegistration(tx, raceRoomId, userId);
+  if (!existing || existing.status !== "registered") {
+    // Already cancelled (or never registered): idempotent no-op, count untouched.
+    return { changed: false, registeredCount: room.registeredCount, hadRegistration: existing != null };
+  }
+
+  const registeredCount = Math.max(0, room.registeredCount - 1);
+  await tx
+    .update(scheduledRoomRegistrationsTable)
+    .set({ status: "cancelled", cancelledAt: new Date(), activatedAt: null })
+    .where(eq(scheduledRoomRegistrationsTable.id, existing.id));
+  await tx
+    .update(raceRoomsTable)
+    .set({ registeredCount, updatedAt: new Date() })
+    .where(eq(raceRoomsTable.id, raceRoomId));
+
+  return { changed: true, registeredCount, hadRegistration: true };
+}

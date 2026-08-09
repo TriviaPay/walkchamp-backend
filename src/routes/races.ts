@@ -45,6 +45,7 @@ import {
   lockRaceRoom,
   lockScheduledRegistration,
   registerOrReviveScheduledRegistration,
+  releaseScheduledRegistration,
 } from "../lib/raceIntegrity.js";
 import {
   buildLiveRaceProgressContext,
@@ -69,6 +70,7 @@ import {
   tryAcquireBroadcastLease,
   LIVE_RACE_STATE,
 } from "../lib/raceLiveState.js";
+import { isOnlineNow } from "../lib/presence.js";
 import { triggerLiveActivityUpdate } from "../lib/liveActivityUpdateService.js";
 import { liveActivityTokensTable } from "../../db/src/schema/index.js";
 import {
@@ -2913,6 +2915,7 @@ router.post("/rooms/:roomId/cancel-registration", requireAuth, async (req, res) 
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const roomId = String(req.params.roomId);
   let registeredCount = 0;
+  let changed = false;
   let errorStatus: number | null = null;
   let errorBody: Record<string, string> | null = null;
 
@@ -2929,42 +2932,32 @@ router.post("/rooms/:roomId/cancel-registration", requireAuth, async (req, res) 
       return;
     }
 
-    const reg = await lockScheduledRegistration(tx, roomId, userId);
-    if (!reg || reg.status !== "registered") {
+    const release = await releaseScheduledRegistration(tx, roomId, userId, room);
+    if (!release.hadRegistration) {
       errorStatus = 404;
       errorBody = { error: "Registration not found." };
       return;
     }
-
-    registeredCount = Math.max(0, room.registeredCount - 1);
-    await tx
-      .update(scheduledRoomRegistrationsTable)
-      .set({ status: "cancelled", cancelledAt: new Date(), activatedAt: null })
-      .where(eq(scheduledRoomRegistrationsTable.id, reg.id));
-    await tx
-      .update(raceRoomsTable)
-      .set({ registeredCount, updatedAt: new Date() })
-      .where(eq(raceRoomsTable.id, roomId));
+    // An already-cancelled registration is a success, not a 404: POST /races/:id/leave now
+    // releases the seat itself, so the app's follow-up call here lands on an idempotent no-op.
+    registeredCount = release.registeredCount;
+    changed = release.changed;
   });
 
   if (errorStatus !== null && errorBody) {
     return res.status(errorStatus).json(errorBody);
   }
 
-  triggerEvent("public-rooms-available", "room:registration_cancelled", {
-    room_id: roomId,
-    registered_count: registeredCount,
-  }).catch(() => {});
+  // Broadcast even when the release was a no-op — a client that missed the first event still
+  // converges on the authoritative count.
+  broadcastPreStartDeparture(roomId, userId, { registrationCancelled: true, registeredCount });
 
-  triggerEvent(`public-live-race-${roomId}`, "race:player-left", { userId, raceId: roomId }).catch(() => {});
-  triggerEvent(`public-live-race-${roomId}`, "room:registration_cancelled", {
-    room_id: roomId,
-    raceId: roomId,
-    userId,
+  return res.json({
+    success: true,
+    registered: false,
+    registrationCancelled: changed,
     registered_count: registeredCount,
-  }).catch(() => {});
-
-  return res.json({ success: true, registered: false });
+  });
 });
 
 // ── GET /api/races/my-active ──────────────────────────────────────────────────
@@ -4000,6 +3993,36 @@ router.post("/races/:id/cancel", requireAuth, async (req, res) => {
   return res.json({ success: true, raceStatus: "cancelled", cancellationReason: "HOST_CANCELLED" });
 });
 
+// Fan-out for a pre-start departure. Trending derives its "Joined" count from the
+// public-rooms-available events; the Waiting Room derives its roster from the per-room channel.
+// Both have to hear about it or the leaver lingers until the next screen-focus refetch.
+// Shapes match POST /api/rooms/:roomId/cancel-registration so clients need one handler, not two.
+function broadcastPreStartDeparture(
+  raceId: string,
+  userId: string,
+  opts: { registrationCancelled: boolean; registeredCount: number },
+) {
+  triggerEvent(`public-live-race-${raceId}`, "race:player-left", { userId, raceId }).catch(() => {});
+  triggerEvent("public-rooms-available", "room:participant_left", {
+    room_id: raceId,
+    userId,
+    registered_count: opts.registeredCount,
+  }).catch(() => {});
+
+  if (!opts.registrationCancelled) return;
+  triggerEvent("public-rooms-available", "room:registration_cancelled", {
+    room_id: raceId,
+    userId,
+    registered_count: opts.registeredCount,
+  }).catch(() => {});
+  triggerEvent(`public-live-race-${raceId}`, "room:registration_cancelled", {
+    room_id: raceId,
+    raceId,
+    userId,
+    registered_count: opts.registeredCount,
+  }).catch(() => {});
+}
+
 // ── POST /api/races/:id/leave ─────────────────────────────────────────────────
 // Participant leaves a race. Supports both waiting rooms (open) and active
 // races (in_progress). For active races, only the caller's participation ends —
@@ -4049,6 +4072,51 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
     .limit(1);
 
   if (!participant) {
+    // A scheduled room has NO race_participants rows until materialize-at-start — its whole
+    // pre-start roster lives in scheduled_room_registrations. Without this branch, leaving an
+    // upcoming challenge 404s here and the seat is never released, which is why the app had to
+    // chase /leave with a best-effort cancel-registration call. Nothing has been charged yet
+    // (entry fees are debited by activateRoomAndStart), so there is nothing to refund.
+    if (isPreStart && room.status === "scheduled") {
+      const release = await db.transaction(async (tx) => {
+        const lockedRoom = await lockRaceRoom(tx, raceId);
+        if (!lockedRoom || lockedRoom.status !== "scheduled") return null;
+        return releaseScheduledRegistration(tx, raceId, userId, lockedRoom);
+      });
+
+      if (release?.hadRegistration) {
+        broadcastPreStartDeparture(raceId, userId, {
+          registrationCancelled: release.changed,
+          registeredCount: release.registeredCount,
+        });
+        req.log.info(
+          { raceId, userId, isHost, registeredCount: release.registeredCount, changed: release.changed },
+          "participant left scheduled race (registration released)",
+        );
+        return res.json({
+          success: true,
+          room_id: raceId,
+          message: "You left the race.",
+          participationStatus: "left",
+          participant_status: "left",
+          currentUserRegistered: false,
+          registered: false,
+          registrationCancelled: release.changed,
+          registeredCount: release.registeredCount,
+          registered_count: release.registeredCount,
+          prizeEligible: false,
+          // Pre-start scheduled registrations are never charged, so there is no refund to issue.
+          refundEligible: true,
+          refundIssued: false,
+          refundAmount: 0,
+          refundAmountCents: 0,
+          activeChallengeReleased: true,
+          challengeStatus: room.status,
+          hostLeft: isHost,
+          can_rejoin: true,
+        });
+      }
+    }
     return res.status(404).json({ error: "You are not an active participant in this race." });
   }
 
@@ -4058,10 +4126,15 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
     try {
       const leaveResult = await createRefundForRaceLeave({ raceId, userId, reasonCode: leaveReason });
       const refund = leaveResult.refund;
-      await triggerEvent(`public-live-race-${raceId}`, "race:player-left", { userId, raceId });
-      triggerEvent("public-rooms-available", "room:participant_left", { room_id: raceId }).catch(() => {});
+      broadcastPreStartDeparture(raceId, userId, {
+        registrationCancelled: leaveResult.registrationCancelled,
+        registeredCount: leaveResult.registeredCount,
+      });
       const refundAmount = refund.succeededCashCents ?? 0;
-      req.log.info({ raceId, userId, isHost, refundAmount }, "participant left race (pre-start, refunded)");
+      req.log.info(
+        { raceId, userId, isHost, refundAmount, registrationCancelled: leaveResult.registrationCancelled },
+        "participant left race (pre-start, refunded)",
+      );
       return res.json({
         success: true,
         room_id: raceId,
@@ -4069,6 +4142,9 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
         participationStatus: "left",
         participant_status: "left",
         currentUserRegistered: false,
+        registrationCancelled: leaveResult.registrationCancelled,
+        registeredCount: leaveResult.registeredCount,
+        registered_count: leaveResult.registeredCount,
         prizeEligible: false,
         refundEligible: true,
         refundIssued: refundAmount > 0,
@@ -7326,7 +7402,31 @@ router.post("/races/:id/participants/:userId/remove", requireAuth, async (req, r
     ))
     .limit(1);
 
-  if (!participant) return res.status(404).json({ error: "Player not found in this room." });
+  // Server-authoritative pre-start boundary, same rule as leaving: a scheduled room is pre-start
+  // until its start instant, even if the scheduler hasn't flipped the status yet.
+  const scheduledStartMs = room.scheduledStartAt?.getTime() ?? null;
+  const scheduledPreStart = room.status === "scheduled"
+    && (scheduledStartMs === null || Date.now() < scheduledStartMs);
+
+  // A scheduled room has no race_participants rows until materialize-at-start, so everyone the
+  // host can remove from an upcoming challenge exists only in scheduled_room_registrations.
+  // Without this the endpoint 404s for every scheduled room despite listing "scheduled" as
+  // removable. Nothing is charged before start, so there is no refund to issue here.
+  let seatReleased = false;
+  if (!participant) {
+    const release = scheduledPreStart
+      ? await db.transaction(async (tx) => {
+          const lockedRoom = await lockRaceRoom(tx, raceId);
+          if (!lockedRoom || lockedRoom.status !== "scheduled") return null;
+          return releaseScheduledRegistration(tx, raceId, targetUserId, lockedRoom);
+        })
+      : null;
+
+    if (!release?.hadRegistration) {
+      return res.status(404).json({ error: "Player not found in this room." });
+    }
+    seatReleased = release.changed;
+  }
 
   // If room was "full", removing a player opens a slot — reset to "open"
   const newRoomStatus = room.status === "full" ? "open" : room.status;
@@ -7336,14 +7436,33 @@ router.post("/races/:id/participants/:userId/remove", requireAuth, async (req, r
   // back idempotently inside one transaction, instead of silently forfeiting it.
   let refundProcessed = false;
   let refundAmount = 0;
-  if (room.entryAmountCents > 0) {
-    const leaveResult = await createRefundForRaceLeave({
-      raceId,
-      userId: targetUserId,
-      reasonCode: "host_removed",
-    });
+  if (!participant) {
+    // Registration-only removal: the seat is already released above, nothing else to unwind.
+  } else if (room.entryAmountCents > 0) {
+    let leaveResult;
+    try {
+      leaveResult = await createRefundForRaceLeave({
+        raceId,
+        userId: targetUserId,
+        reasonCode: "host_removed",
+      });
+    } catch (err) {
+      // The refund txn re-checks the start instant under lock, so a scheduled room that tipped
+      // past its start between our status read and here lands here. Report it as the same 409 the
+      // status guard above would have given, not a 500.
+      const msg = err instanceof Error ? err.message : "";
+      if (msg === "RACE_ALREADY_STARTED") {
+        return res.status(409).json({ success: false, code: "RACE_ALREADY_STARTED", error: "You cannot remove players after the race has started." });
+      }
+      if (msg === "PARTICIPANT_NOT_FOUND") {
+        return res.status(404).json({ error: "Player not found in this room." });
+      }
+      req.log.error({ raceId, targetUserId, err }, "host removal refund failed");
+      return res.status(409).json({ success: false, error: "Could not remove this player right now. Please try again." });
+    }
     refundAmount = leaveResult.refund.succeededCashCents ?? 0;
     refundProcessed = refundAmount > 0;
+    seatReleased = leaveResult.registrationCancelled;
     // createRefundForRaceLeave decremented currentPlayers but does not reopen a
     // full room; reset the status here so a freed slot is joinable again.
     if (newRoomStatus !== room.status) {
@@ -7354,6 +7473,14 @@ router.post("/races/:id/participants/:userId/remove", requireAuth, async (req, r
     }
   } else {
     await db.transaction(async (tx) => {
+      const lockedRoom = await lockRaceRoom(tx, raceId);
+      // Same seat-release rule as leaving: on a scheduled room the seat is the registration, so
+      // dropping only the participant row would leave registeredCount inflated. (The paid branch
+      // gets this from createRefundForRaceLeave.)
+      if (lockedRoom?.status === "scheduled") {
+        const release = await releaseScheduledRegistration(tx, raceId, targetUserId, lockedRoom);
+        seatReleased = release.changed;
+      }
       await tx
         .update(raceParticipantsTable)
         .set({ status: "left" })
@@ -7374,35 +7501,68 @@ router.post("/races/:id/participants/:userId/remove", requireAuth, async (req, r
   }
 
   const [updatedRoom] = await db
-    .select({ currentPlayers: raceRoomsTable.currentPlayers })
+    .select({
+      currentPlayers: raceRoomsTable.currentPlayers,
+      registeredCount: raceRoomsTable.registeredCount,
+    })
     .from(raceRoomsTable)
     .where(eq(raceRoomsTable.id, raceId))
     .limit(1);
 
-  const remainingParticipants = await db
-    .select({ userId: raceParticipantsTable.userId })
-    .from(raceParticipantsTable)
-    .where(and(eq(raceParticipantsTable.raceRoomId, raceId), ne(raceParticipantsTable.status, "left")));
+  // A scheduled room's roster is its live registrations; race_participants is empty until start.
+  const [remainingParticipants, remainingRegistrants] = await Promise.all([
+    db
+      .select({ userId: raceParticipantsTable.userId })
+      .from(raceParticipantsTable)
+      .where(and(eq(raceParticipantsTable.raceRoomId, raceId), ne(raceParticipantsTable.status, "left"))),
+    room.status === "scheduled"
+      ? db
+          .selectDistinct({ userId: scheduledRoomRegistrationsTable.userId })
+          .from(scheduledRoomRegistrationsTable)
+          .where(and(
+            eq(scheduledRoomRegistrationsTable.raceRoomId, raceId),
+            eq(scheduledRoomRegistrationsTable.status, "registered"),
+          ))
+      : Promise.resolve([]),
+  ]);
 
-  const participantCount = updatedRoom?.currentPlayers ?? 0;
+  const currentPlayers = updatedRoom?.currentPlayers ?? 0;
+  const registeredCount = updatedRoom?.registeredCount ?? 0;
+  // What the Waiting Room should render as occupancy for this room's mode.
+  const participantCount = room.status === "scheduled" ? registeredCount : currentPlayers;
+  const remainingIds = [...new Set([
+    ...remainingParticipants.map((p) => p.userId),
+    ...remainingRegistrants.map((r) => r.userId),
+  ])];
 
   await triggerEvent(`public-live-race-${raceId}`, "room:participant_removed", {
     raceId,
     removedUserId: targetUserId,
     removedByUserId: currentUserId,
-    currentPlayers: participantCount,
+    currentPlayers,
+    registeredCount,
+    participantCount,
     roomStatus: newRoomStatus,
-    participantIds: remainingParticipants.map((p) => p.userId),
+    participantIds: remainingIds,
     refundProcessed,
     refundAmount,
   });
 
-  req.log.info({ raceId, removedUserId: targetUserId, byUserId: currentUserId, newRoomStatus, refundProcessed, refundAmount }, "host removed participant from waiting room");
+  // Trending counts a removal exactly like a departure, so reuse the same fan-out.
+  if (seatReleased) {
+    broadcastPreStartDeparture(raceId, targetUserId, { registrationCancelled: true, registeredCount });
+  }
+
+  req.log.info({ raceId, removedUserId: targetUserId, byUserId: currentUserId, newRoomStatus, refundProcessed, refundAmount, seatReleased, registeredCount }, "host removed participant from waiting room");
   return res.json({
     success: true,
     raceId,
     removedUserId: targetUserId,
     participantCount,
+    currentPlayers,
+    registeredCount,
+    registered_count: registeredCount,
+    registrationCancelled: seatReleased,
     refundProcessed,
     refundAmount,
     message: "Player removed from room",
@@ -7410,9 +7570,18 @@ router.post("/races/:id/participants/:userId/remove", requireAuth, async (req, r
 });
 
 
+// How many online non-members the host is offered. Room members are returned on top of this and
+// are never truncated.
+const NON_MEMBER_CANDIDATE_LIMIT = 20;
+
 // ── GET /api/races/:id/online-invite-candidates ───────────────────────────────
-// Returns random online users eligible to be invited to this room.
-// Excludes: current user, joined participants, pending invitees, blocked users.
+// Returns the online people the host can act on for this room: users eligible to be invited, plus
+// the online users who are already in the room, tagged with hasJoined/membership so the client can
+// render "Joined" instead of "Invite". Members are NOT filtered out — this list is the client's
+// source of truth for the Online Players tab, so dropping them made the tab look empty or wrong.
+// Excludes: the host, anyone whose heartbeat is stale, and — among invitable users — anyone
+// blocked in either direction. A blocked user already in the room still comes back, tagged as
+// joined, so the roster the host sees stays complete.
 router.get("/races/:id/online-invite-candidates", requireAuth, async (req, res) => {
   const currentUserId = (req as AuthenticatedRequest).descopeUserId;
   const raceId = String(req.params.id);
@@ -7430,11 +7599,9 @@ router.get("/races/:id/online-invite-candidates", requireAuth, async (req, res) 
     return res.status(409).json({ error: "Room is no longer open" });
   }
 
-  const cutoff = new Date(Date.now() - 90_000);
-
   // IDs already in the room. A scheduled room's roster is in scheduled_room_registrations
-  // (race_participants stays empty until start), so both sources must be excluded — otherwise the
-  // host is offered people who have already registered.
+  // (race_participants stays empty until start), so membership must consider both — a registered
+  // user comes back as membership: "registered", a live participant as "joined".
   const [joined, registered] = await Promise.all([
     db
       .select({ userId: raceParticipantsTable.userId })
@@ -7452,8 +7619,12 @@ router.get("/races/:id/online-invite-candidates", requireAuth, async (req, res) 
         inArray(scheduledRoomRegistrationsTable.status, ["registered", "active"]),
       )),
   ]);
-  const joinedIds = new Set([...joined, ...registered].map((j) => j.userId));
-  joinedIds.add(currentUserId);
+  const membershipByUser = new Map<string, "joined" | "registered">();
+  for (const r of registered) membershipByUser.set(r.userId, "registered");
+  // A materialized participant row is the stronger signal, so it wins over a registration.
+  for (const j of joined) membershipByUser.set(j.userId, "joined");
+  membershipByUser.delete(currentUserId);
+  const memberIds = [...membershipByUser.keys()];
 
   // IDs with pending invites to this room
   const pendingInvites = await db
@@ -7486,25 +7657,44 @@ router.get("/races/:id/online-invite-candidates", requireAuth, async (req, res) 
     blockedIds.add(b.blockedId);
   }
   blockedIds.delete(currentUserId);
+  const excludedIds = [currentUserId, ...blockedIds];
 
-  // Online users (presence within 90s)
-  const online = await db
-    .select({
-      userId: profilesTable.id,
-      username: profilesTable.username,
-      countryFlag: profilesTable.countryFlag,
-      avatarColor: profilesTable.avatarColor,
-      avatarUrl: profilesTable.avatarUrl,
-      presenceStatus: userPresenceTable.status,
-    })
-    .from(userPresenceTable)
-    .innerJoin(profilesTable, eq(userPresenceTable.userId, profilesTable.id))
-    .where(sql`${userPresenceTable.lastSeenAt} > ${cutoff}`)
-    .limit(60);
+  // Online = the same freshness + status filter every other presence route uses, so this list can
+  // never disagree with the "X online" badge from /api/presence/summary.
+  const onlineSelection = {
+    userId: profilesTable.id,
+    username: profilesTable.username,
+    countryFlag: profilesTable.countryFlag,
+    avatarColor: profilesTable.avatarColor,
+    avatarUrl: profilesTable.avatarUrl,
+    presenceStatus: userPresenceTable.status,
+  };
+  const onlineFrom = () =>
+    db
+      .select(onlineSelection)
+      .from(userPresenceTable)
+      .innerJoin(profilesTable, eq(userPresenceTable.userId, profilesTable.id));
 
-  const candidates = online
-    .filter((u) => !joinedIds.has(u.userId) && !blockedIds.has(u.userId))
-    .map((u) => ({
+  // Two queries, not one: room members are always returned in full, while strangers compete for a
+  // bounded number of slots. A single capped query would let a busy lobby push the room's own
+  // players out of the response.
+  const [onlineMembers, onlineOthers] = await Promise.all([
+    memberIds.length === 0
+      ? Promise.resolve([])
+      : onlineFrom().where(and(isOnlineNow(), inArray(profilesTable.id, memberIds))),
+    onlineFrom()
+      .where(and(
+        isOnlineNow(),
+        notInArray(profilesTable.id, excludedIds),
+        ...(memberIds.length > 0 ? [notInArray(profilesTable.id, memberIds)] : []),
+      ))
+      .limit(NON_MEMBER_CANDIDATE_LIMIT),
+  ]);
+
+  const toCandidate = (u: (typeof onlineOthers)[number]) => {
+    const membership = membershipByUser.get(u.userId) ?? "none";
+    const hasJoined = membership !== "none";
+    return {
       userId: u.userId,
       username: u.username,
       countryFlag: u.countryFlag,
@@ -7512,11 +7702,26 @@ router.get("/races/:id/online-invite-candidates", requireAuth, async (req, res) 
       avatarUrl: u.avatarUrl ?? null,
       status: u.presenceStatus,
       isFriend: friendIds.has(u.userId),
-      inviteStatus: pendingIds.has(u.userId) ? "pending" : "none",
-    }))
-    .slice(0, 20);
+      // Someone already in the room is not invitable, whatever stale invite row still exists.
+      inviteStatus: hasJoined ? "none" : pendingIds.has(u.userId) ? "pending" : "none",
+      hasJoined,
+      membership,
+    };
+  };
 
-  req.log.info({ raceId, count: candidates.length }, "online-invite-candidates: fetched");
+  // Members first, then friends, then everyone else — the host's actionable rows stay above the
+  // fold even when the tail is truncated.
+  const others = onlineOthers.map(toCandidate);
+  const candidates = [
+    ...onlineMembers.map(toCandidate),
+    ...others.filter((c) => c.isFriend),
+    ...others.filter((c) => !c.isFriend),
+  ];
+
+  req.log.info(
+    { raceId, count: candidates.length, memberCount: onlineMembers.length },
+    "online-invite-candidates: fetched",
+  );
   return res.json({ candidates });
 });
 

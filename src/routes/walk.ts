@@ -584,9 +584,31 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   // Evaluate achievement titles — fire-and-forget so step sync never fails on this
   evaluateAndNotify(userId).catch(() => {});
 
-  // Broadcast live progress to any active Unlimited challenge day whose locked
-  // window contains now (authoritative). Do not require client localDate === day.localDate.
+  // Credit + broadcast, in that order and in ONE block so the event carries the value that was
+  // just written rather than racing the credit. Fire-and-forget: step sync must never fail
+  // because a challenge write or a Pusher call did.
   (async () => {
+    try {
+      // Credit this verified total to the participant's OWN Unlimited challenge day, resolved
+      // from their locked-timezone window rather than the device's calendar date. The day row is
+      // the qualification authority, so a traveller's steps can never be scored against the
+      // wrong window.
+      if (sessionVerified) {
+        const { applyVerifiedStepsToUnlimitedDays } = await import("../lib/unlimitedStepIngest.js");
+        await applyVerifiedStepsToUnlimitedDays({
+          userId,
+          verifiedTotal: updatedForCoins?.steps ?? 0,
+          deviceLocalDate: today,
+        });
+      }
+    } catch (err) {
+      req.log.error({ err, userId }, "[Unlimited] challenge-day credit failed");
+    }
+
+    // Broadcast live progress to any active Unlimited challenge day whose locked window contains
+    // now (authoritative). Do not require client localDate === day.localDate. This is what makes
+    // a VERIFIED total appear on other viewers' boards immediately instead of on their next poll —
+    // the provisional sensor endpoint is not the only source of progress_updated.
     try {
       const { findActiveUnlimitedDaysForUser } = await import("../lib/unlimitedLiveProgress.js");
       const emitNow = new Date();
@@ -653,6 +675,17 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
             localDate: d.localDate,
             timezone: d.timezone,
             challengeTimezone,
+            // Day identity, so a peer client never assumes every participant is on the same local
+            // challenge day. challengeDayIndex / participantLocalDate name what dayNumber and
+            // localDate have always meant here: this participant's own day.
+            challengeDayIndex: d.dayNumber,
+            participantLocalDate: d.localDate,
+            participantTimezone: d.timezone,
+            dayStatus: d.dayStatus,
+            qualificationStatus: d.qualificationStatus,
+            // Display only — qualification still reads the full daily total above.
+            raceStartBaselineSteps: d.startBaselineSteps,
+            challengeDaySteps: Math.max(0, displayedLiveSteps - d.startBaselineSteps),
             updatedAt,
             receivedLocalDate: today,
           };
@@ -703,6 +736,14 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
           localDate: d.localDate,
           timezone: d.timezone,
           challengeTimezone,
+          // Same per-participant day identity as the provisional payload above.
+          challengeDayIndex: d.dayNumber,
+          participantLocalDate: d.localDate,
+          participantTimezone: d.timezone,
+          dayStatus: d.dayStatus,
+          qualificationStatus: d.qualificationStatus,
+          raceStartBaselineSteps: d.startBaselineSteps,
+          challengeDaySteps: Math.max(0, currentSteps - d.startBaselineSteps),
           updatedAt,
           receivedLocalDate: today,
         };

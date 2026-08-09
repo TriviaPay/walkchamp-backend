@@ -9,26 +9,20 @@ import {
   spectateSessionsTable,
   scheduledRoomRegistrationsTable,
 } from "../../db/src/schema/index.js";
-import { and, eq, gte, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, sql } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { triggerEvent } from "../lib/pusher.js";
 import { z } from "zod";
 import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
 import { isFeatureEnabled } from "../lib/featureFlags.js";
+import { isOnlineNow, walkingAfter } from "../lib/presence.js";
 
 const router = Router();
 
-// Online  = last_seen_at within 90 seconds
-// Walking = last_walk_activity_at within 5 minutes
-// Racing  = participant in an in_progress race (computed from race tables, not flags)
+// Racing = participant in an in_progress race (computed from race tables, not flags)
 // A scheduled registration counts as room membership while it is live; "active" is the state a
 // registration moves to at materialize-at-start, so both belong here.
 const ACTIVE_REGISTRATION_STATUSES = ["registered", "active"] as const;
-const ONLINE_THRESHOLD_MS  = 90_000;
-const WALKING_THRESHOLD_MS = 5 * 60_000;
-
-function onlineAfter():  Date { return new Date(Date.now() - ONLINE_THRESHOLD_MS); }
-function walkingAfter(): Date { return new Date(Date.now() - WALKING_THRESHOLD_MS); }
 
 // ── Shared count calculator ────────────────────────────────────────────────────
 async function computeCounts() {
@@ -36,7 +30,7 @@ async function computeCounts() {
   const onlineRows = await db
     .select({ count: sql<number>`count(*)::int` })
     .from(userPresenceTable)
-    .where(gte(userPresenceTable.lastSeenAt, onlineAfter()));
+    .where(isOnlineNow());
   const online = onlineRows[0]?.count ?? 0;
 
   // 2. Walking: users who had step activity in the last 5 minutes
@@ -80,7 +74,7 @@ router.get("/presence/online-ids", requireAuth, async (_req, res) => {
   const rows = await db
     .select({ userId: userPresenceTable.userId })
     .from(userPresenceTable)
-    .where(gte(userPresenceTable.lastSeenAt, onlineAfter()));
+    .where(isOnlineNow());
   return res.json({ userIds: rows.map((r) => r.userId) });
 });
 
@@ -100,8 +94,7 @@ router.get("/presence/friends/online", requireAuth, async (req, res) => {
     .from(userPresenceTable)
     .where(and(
       inArray(userPresenceTable.userId, friends.map((row) => row.userId)),
-      gte(userPresenceTable.lastSeenAt, onlineAfter()),
-      ne(userPresenceTable.status, "offline"),
+      isOnlineNow(),
     ));
 
   return res.json({ userIds: rows.map((r) => r.userId) });
@@ -140,8 +133,7 @@ router.get("/presence/groups/:groupId/online", requireAuth, async (req, res) => 
         .from(userPresenceTable)
         .where(and(
           inArray(userPresenceTable.userId, memberRows.map((row) => row.userId)),
-          gte(userPresenceTable.lastSeenAt, onlineAfter()),
-          ne(userPresenceTable.status, "offline"),
+          isOnlineNow(),
         ));
 
   return res.json({ userIds: rows.map((r) => r.userId) });
@@ -212,8 +204,7 @@ router.get("/presence/races/:raceId/online", requireAuth, async (req, res) => {
         .from(userPresenceTable)
         .where(and(
           inArray(userPresenceTable.userId, memberIds),
-          gte(userPresenceTable.lastSeenAt, onlineAfter()),
-          ne(userPresenceTable.status, "offline"),
+          isOnlineNow(),
         ));
 
   return res.json({ userIds: rows.map((r) => r.userId) });

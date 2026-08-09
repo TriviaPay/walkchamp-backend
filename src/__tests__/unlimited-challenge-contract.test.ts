@@ -125,8 +125,13 @@ describe("daily qualification: one failed day permanently disqualifies", () => {
     expect(jobs).toContain('disqualificationReason: "missed_daily_goal"');
     expect(jobs).toContain("passed ? now : null"); // passedAt only when passed
   });
-  it("uses locked-tz per-day windows built at start (unique per participant/day)", () => {
-    expect(jobs).toContain("buildDayWindows(pre.startAtUtc, p.tz");
+  it("uses locked-tz per-day windows anchored to the challenge DATE (unique per participant/day)", () => {
+    // Superseded assertion: this used to require buildDayWindows(pre.startAtUtc, p.tz), i.e.
+    // projecting one shared UTC instant into each participant's zone. That is the India→US
+    // early-start bug — windows now come from the challenge's calendar date resolved in each
+    // participant's own timezone. See unlimitedLocalMidnightSchedule.test.ts.
+    expect(jobs).toContain("materializeParticipantSchedule(db, {");
+    expect(jobs).not.toContain("buildDayWindows(pre.startAtUtc");
     expect(schema).toContain("unlimited_days_participant_day_uniq");
   });
 });

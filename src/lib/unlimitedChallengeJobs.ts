@@ -1,4 +1,4 @@
-import { and, eq, ne, lte, inArray, sql } from "drizzle-orm";
+import { and, eq, ne, gte, lte, inArray, or, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { stepDailyTotalsTable } from "../../db/src/schema/steps.js";
 import {
@@ -6,7 +6,15 @@ import {
   unlimitedChallengeParticipantsTable,
   unlimitedChallengeDaysTable,
 } from "../../db/src/schema/unlimitedChallenge.js";
-import { buildDayWindows } from "./challengeDayWindow.js";
+import {
+  healMissingParticipantSchedules,
+  materializeParticipantSchedule,
+  minParticipantStartAtUtc,
+} from "./unlimitedParticipantSchedule.js";
+import {
+  captureSettlementPopulation,
+  refreshUnlimitedResultsStatus,
+} from "./unlimitedResults.js";
 import { settleUnlimitedChallenge } from "./unlimitedChallengeSettlement.js";
 import { enqueueJob } from "./queue.js";
 import { triggerEvent } from "./pusher.js";
@@ -26,7 +34,15 @@ export async function startUnlimitedChallenge(challengeId: string): Promise<void
   if (!pre) return;
   // Allow resume of stuck `starting` rows (crash between claim and active).
   if (pre.status !== "waiting" && pre.status !== "starting") return;
-  if (pre.status === "waiting" && Date.now() < pre.startAtUtc.getTime()) return;
+  if (pre.status === "waiting") {
+    // Activate when the EARLIEST participant's local day 1 opens, not when the host's does. A
+    // participant east of the host starts first, and their steps only count while the challenge
+    // is `active` (see findActiveUnlimitedDaysForUser). Falls back to the host anchor when no
+    // participant schedule is resolvable yet.
+    await healMissingParticipantSchedules(pre);
+    const earliest = (await minParticipantStartAtUtc(challengeId)) ?? pre.startAtUtc;
+    if (Date.now() < earliest.getTime()) return;
+  }
 
   if (pre.status === "waiting") {
     const [claimed] = await db
@@ -42,23 +58,22 @@ export async function startUnlimitedChallenge(challengeId: string): Promise<void
     .from(unlimitedChallengeParticipantsTable)
     .where(and(eq(unlimitedChallengeParticipantsTable.challengeId, challengeId), ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left")));
 
+  // Windows are normally written at join. This is the safety net for memberships created before
+  // that was true (or by a crash mid-join): same helper, same semantics, idempotent on
+  // (challenge, participant, dayNumber) so re-runs never duplicate or move an existing day.
   for (const p of participants) {
-    const windows = buildDayWindows(pre.startAtUtc, p.tz, pre.durationDays, pre.dailyGoalSteps);
-    await db
-      .insert(unlimitedChallengeDaysTable)
-      .values(windows.map((w) => ({
-        challengeId,
-        participantId: p.id,
-        userId: p.userId,
-        dayNumber: w.dayNumber,
-        localDate: w.localDate,
-        timezone: p.tz,
-        windowStartUtc: w.windowStartUtc,
-        windowEndUtc: w.windowEndUtc,
-        goalSteps: w.goalSteps,
-      })))
-      .onConflictDoNothing();
+    await materializeParticipantSchedule(db, {
+      challenge: pre,
+      participantId: p.id,
+      userId: p.userId,
+      timezone: p.tz,
+    });
   }
+
+  // §2 — freeze the settlement population now, so the denominator of the final result cannot
+  // drift as memberships change afterwards. Ghost hosts have no participant row and so are never
+  // included, never waited on, and never given day records.
+  await captureSettlementPopulation(challengeId);
 
   await db
     .update(unlimitedChallengesTable)
@@ -81,10 +96,42 @@ export async function startUnlimitedChallenge(challengeId: string): Promise<void
     raceId: challengeId,
     challengeType: "unlimited_goal",
   });
-  for (const p of participants) {
+  // Only the participants whose OWN local day 1 has opened. Telling a Chicago user "your
+  // challenge has started" at India's midnight is the notification form of the same bug — the
+  // rest are notified by notifyDueParticipantStarts when their own midnight arrives.
+  await notifyDueParticipantStarts(new Date());
+}
+
+/**
+ * Send the "challenge started" notification at each participant's OWN local start.
+ *
+ * Driven off participant_start_at_utc, deduped durably per (challenge, user), and bounded to
+ * starts in the recent past so a long-running challenge does not rescan every membership forever.
+ */
+export async function notifyDueParticipantStarts(now: Date = new Date()): Promise<void> {
+  const lookbackMs = 6 * 60 * 60_000;
+  const due = await db
+    .select({
+      challengeId: unlimitedChallengeParticipantsTable.challengeId,
+      userId: unlimitedChallengeParticipantsTable.userId,
+    })
+    .from(unlimitedChallengeParticipantsTable)
+    .innerJoin(
+      unlimitedChallengesTable,
+      eq(unlimitedChallengesTable.id, unlimitedChallengeParticipantsTable.challengeId),
+    )
+    .where(and(
+      inArray(unlimitedChallengesTable.status, ["starting", "active"]),
+      ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+      lte(unlimitedChallengeParticipantsTable.participantStartAtUtc, now),
+      gte(unlimitedChallengeParticipantsTable.participantStartAtUtc, new Date(now.getTime() - lookbackMs)),
+    ))
+    .limit(500);
+
+  for (const p of due) {
     void sendNotification(p.userId, "race_started", "Your challenge has started", "Your Unlimited Challenge has started — hit your daily goal every day!", {
-      challengeId,
-      dedupeKey: `unlimited_started:${challengeId}:${p.userId}`,
+      challengeId: p.challengeId,
+      dedupeKey: `unlimited_started:${p.challengeId}:${p.userId}`,
     }).catch(() => {});
   }
 }
@@ -111,7 +158,14 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
     const verified = await getVerifiedSteps(d.userId, d.localDate);
     await db
       .update(unlimitedChallengeDaysTable)
-      .set({ status: "pending_verification", verifiedSteps: verified, updatedAt: now })
+      // GREATEST, not assignment: verified_steps was already credited window-by-window by the
+      // ingest path, and step_daily_totals is only a fallback lane keyed by the DEVICE's local
+      // date. Overwriting would discard the window-accurate number for a traveller.
+      .set({
+        status: "pending_verification",
+        verifiedSteps: sql`GREATEST(${unlimitedChallengeDaysTable.verifiedSteps}, ${verified})`,
+        updatedAt: now,
+      })
       .where(and(eq(unlimitedChallengeDaysTable.id, d.id), inArray(unlimitedChallengeDaysTable.status, ["pending", "in_progress"])));
   }
 
@@ -125,6 +179,7 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
       userId: unlimitedChallengeDaysTable.userId,
       localDate: unlimitedChallengeDaysTable.localDate,
       goalSteps: unlimitedChallengeDaysTable.goalSteps,
+      creditedSteps: unlimitedChallengeDaysTable.verifiedSteps,
     })
     .from(unlimitedChallengeDaysTable)
     .where(and(
@@ -134,7 +189,9 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
     .limit(500);
 
   for (const d of due) {
-    const verified = await getVerifiedSteps(d.userId, d.localDate);
+    // Best of both lanes: what the window-mapped ingest credited to this exact day, and the
+    // device-local daily total. Neither lane may silently lose steps the user really walked.
+    const verified = Math.max(d.creditedSteps, await getVerifiedSteps(d.userId, d.localDate));
     const passed = verified >= d.goalSteps;
     const [updated] = await db
       .update(unlimitedChallengeDaysTable)
@@ -184,10 +241,25 @@ async function getVerifiedSteps(userId: string, localDate: string): Promise<numb
  */
 export async function reconcileUnlimitedChallenges(now: Date = new Date()): Promise<void> {
   try {
+    // Due to start = ANY eligible participant's own local day 1 has opened. The host anchor is
+    // kept as a fallback for challenges whose participants have no schedule yet.
     const dueStart = await db
-      .select({ id: unlimitedChallengesTable.id })
+      .selectDistinct({ id: unlimitedChallengesTable.id })
       .from(unlimitedChallengesTable)
-      .where(and(eq(unlimitedChallengesTable.status, "waiting"), lte(unlimitedChallengesTable.startAtUtc, now)));
+      .leftJoin(
+        unlimitedChallengeParticipantsTable,
+        and(
+          eq(unlimitedChallengeParticipantsTable.challengeId, unlimitedChallengesTable.id),
+          ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+        ),
+      )
+      .where(and(
+        eq(unlimitedChallengesTable.status, "waiting"),
+        or(
+          lte(unlimitedChallengeParticipantsTable.participantStartAtUtc, now),
+          lte(unlimitedChallengesTable.startAtUtc, now),
+        ),
+      ));
     for (const c of dueStart) await startUnlimitedChallenge(c.id);
 
     // Resume challenges stuck in `starting` (crash between claim and active).
@@ -197,7 +269,27 @@ export async function reconcileUnlimitedChallenges(now: Date = new Date()): Prom
       .where(eq(unlimitedChallengesTable.status, "starting"));
     for (const c of stuckStarting) await startUnlimitedChallenge(c.id);
 
+    // Participants whose own local midnight has since arrived (a challenge started for an
+    // eastern participant hours before a western one).
+    await notifyDueParticipantStarts(now);
+
     await finalizeUnlimitedDays(now);
+
+    // Result lifecycle (in_progress → waiting_for_participants → steps_validation_in_progress).
+    // Driven every tick, not only at settlement time, so a participant who finishes days before
+    // the rest sees "waiting for the others" instead of a stuck in-progress board.
+    const liveResults = await db
+      .select({ id: unlimitedChallengesTable.id })
+      .from(unlimitedChallengesTable)
+      .where(and(
+        inArray(unlimitedChallengesTable.status, ["active", "settling"]),
+        ne(unlimitedChallengesTable.resultsStatus, "results_ready"),
+      ));
+    for (const c of liveResults) {
+      await refreshUnlimitedResultsStatus(c.id, now).catch((err) =>
+        logger.error({ err, challengeId: c.id }, "[Unlimited] results status refresh failed"),
+      );
+    }
 
     const dueSettle = await db
       .select({ id: unlimitedChallengesTable.id })

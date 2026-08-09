@@ -53,6 +53,29 @@ x-app-env: &app-env
   OBJECT_STORAGE_SECRET_ACCESS_KEY: ${OBJECT_STORAGE_SECRET_ACCESS_KEY:?OBJECT_STORAGE_SECRET_ACCESS_KEY is required}
   OBJECT_STORAGE_PUBLIC_BASE_URL: ${OBJECT_STORAGE_PUBLIC_BASE_URL:?OBJECT_STORAGE_PUBLIC_BASE_URL is required}
   APPLE_EXPECTED_AUDIENCES: ${APPLE_EXPECTED_AUDIENCES:-com.globalwalkerleague.app}
+  # ── In-app purchases (Mic Pass + coin packs) ────────────────────────────────
+  # POST /api/purchases/verify verifies receipts against the stores at call time. Compose only
+  # forwards the keys named here, so a credential set in the Coolify UI but missing from this
+  # list never reaches the container — the API answers IAP_VERIFICATION_NOT_CONFIGURED and
+  # nothing unlocks. Optional by design: a missing credential degrades to that error and a boot
+  # warning from logIapReadiness, rather than failing the deploy.
+  APPLE_IAP_ISSUER_ID: ${APPLE_IAP_ISSUER_ID:-}
+  APPLE_IAP_KEY_ID: ${APPLE_IAP_KEY_ID:-}
+  APPLE_IAP_PRIVATE_KEY: ${APPLE_IAP_PRIVATE_KEY:-}
+  APPLE_BUNDLE_ID: ${APPLE_BUNDLE_ID:-com.globalwalkerleague.app}
+  # Keep true: App Review buys in sandbox, and TestFlight receipts are sandbox receipts.
+  APPLE_IAP_ALLOW_SANDBOX: ${APPLE_IAP_ALLOW_SANDBOX:-true}
+  # Either the whole service-account JSON, or CLIENT_EMAIL + PRIVATE_KEY split out.
+  GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${GOOGLE_PLAY_SERVICE_ACCOUNT_JSON:-}
+  GOOGLE_PLAY_CLIENT_EMAIL: ${GOOGLE_PLAY_CLIENT_EMAIL:-}
+  GOOGLE_PLAY_PRIVATE_KEY: ${GOOGLE_PLAY_PRIVATE_KEY:-}
+  GOOGLE_PLAY_PACKAGE_NAME: ${GOOGLE_PLAY_PACKAGE_NAME:-com.globalwalkerleague.app}
+  # Keep true: internal-testing and license-tester purchases are test purchases.
+  GOOGLE_PLAY_ALLOW_TEST_PURCHASES: ${GOOGLE_PLAY_ALLOW_TEST_PURCHASES:-true}
+  # ENABLE_DEV_IAP_PURCHASES is deliberately NOT forwarded. This stack runs NODE_ENV=production,
+  # where platform:"dev" is refused with 403 DEV_PURCHASES_DISABLED — any authenticated client
+  # could otherwise grant itself Mic Pass with a fabricated dev_ token. Unlocking that on a real
+  # QA deployment means adding the key here on purpose, not flipping a variable in the UI.
   SENTRY_DSN: ${SENTRY_DSN:-}
   SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
   ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY is required}

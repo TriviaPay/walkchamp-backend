@@ -34,6 +34,10 @@ export type UnlimitedActiveDayProgress = {
   progressSource: "verified" | "provisional" | "mixed" | "unavailable";
   windowStartUtc: Date;
   windowEndUtc: Date;
+  /** Display-only baseline captured when this day's window opened. Never used for qualification. */
+  startBaselineSteps: number;
+  /** currentSteps - startBaselineSteps, floored at 0. Display only. */
+  challengeDaySteps: number;
 };
 
 export type UnlimitedPlayerLiveProgress = {
@@ -49,6 +53,13 @@ export type UnlimitedPlayerLiveProgress = {
   avatarUrl: string | null;
   avatarVersion: number;
   qualificationStatus: string;
+  /** pending | eligible | not_eligible — explicit prize-pool eligibility (§10). */
+  prizePoolEligibilityStatus: string;
+  /**
+   * Coarsened reason. Anti-cheat and verification detail is deliberately collapsed to
+   * "not_qualified" so the public board never leaks why a specific participant was excluded.
+   */
+  eligibilityReason: string | null;
   status: string;
   joinedAt: Date;
   rank: number;
@@ -69,6 +80,13 @@ export type UnlimitedPlayerLiveProgress = {
   timezone: string | null;
   dayNumber: number | null;
   dailyGoalSteps: number | null;
+  /**
+   * Display-only: the verified count already on record when this challenge day's window opened,
+   * and the steps since. Qualification and settlement continue to use currentSteps /
+   * totalChallengeSteps (the full daily total) — these two fields never feed money.
+   */
+  raceStartBaselineSteps: number;
+  challengeDaySteps: number;
 };
 
 /** Load active-day progress for every non-left participant in a challenge. */
@@ -86,6 +104,7 @@ export async function loadActiveDayProgressByChallenge(
       goalSteps: unlimitedChallengeDaysTable.goalSteps,
       windowStartUtc: unlimitedChallengeDaysTable.windowStartUtc,
       windowEndUtc: unlimitedChallengeDaysTable.windowEndUtc,
+      startBaselineSteps: unlimitedChallengeDaysTable.startBaselineSteps,
     })
     .from(unlimitedChallengeDaysTable)
     .where(
@@ -124,6 +143,7 @@ export async function loadActiveDayProgressByChallenge(
   }
 
   for (const d of currentDays) {
+    const dayVerified = liveByUserDate.get(`${d.userId}|${d.localDate}`) ?? 0;
     byParticipant.set(d.participantId, {
       participantId: d.participantId,
       userId: d.userId,
@@ -132,12 +152,14 @@ export async function loadActiveDayProgressByChallenge(
       localDate: d.localDate,
       timezone: d.timezone,
       goalSteps: d.goalSteps,
-      currentSteps: liveByUserDate.get(`${d.userId}|${d.localDate}`) ?? 0,
-      verifiedTodaySteps: liveByUserDate.get(`${d.userId}|${d.localDate}`) ?? 0,
+      currentSteps: dayVerified,
+      verifiedTodaySteps: dayVerified,
       provisionalTodaySteps: 0,
       progressSource: "unavailable",
       windowStartUtc: d.windowStartUtc,
       windowEndUtc: d.windowEndUtc,
+      startBaselineSteps: d.startBaselineSteps,
+      challengeDaySteps: Math.max(0, dayVerified - d.startBaselineSteps),
     });
   }
 
@@ -160,6 +182,8 @@ export async function loadActiveDayProgressByChallenge(
       p.provisionalTodaySteps = provisional;
       p.currentSteps = displayedFromLanes(verified, provisional);
       p.progressSource = progressSourceFromLanes(verified, provisional);
+      // Keep the display-only "since this window opened" figure in step with the displayed lane.
+      p.challengeDaySteps = Math.max(0, p.currentSteps - p.startBaselineSteps);
     }
   } catch {
     for (const p of byParticipant.values()) {
@@ -185,6 +209,10 @@ export async function findActiveUnlimitedDaysForUser(
     timezone: string;
     /** Nullable in the schema (challenge_timezone has no NOT NULL); callers fall back to `timezone`. */
     challengeTimezone: string | null;
+    dayStatus: string;
+    qualificationStatus: string;
+    /** Display-only baseline for "steps during this challenge day". Never qualification input. */
+    startBaselineSteps: number;
   }>
 > {
   return db
@@ -196,11 +224,18 @@ export async function findActiveUnlimitedDaysForUser(
       localDate: unlimitedChallengeDaysTable.localDate,
       timezone: unlimitedChallengeDaysTable.timezone,
       challengeTimezone: unlimitedChallengesTable.challengeTimezone,
+      dayStatus: unlimitedChallengeDaysTable.status,
+      qualificationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
+      startBaselineSteps: unlimitedChallengeDaysTable.startBaselineSteps,
     })
     .from(unlimitedChallengeDaysTable)
     .innerJoin(
       unlimitedChallengesTable,
       eq(unlimitedChallengesTable.id, unlimitedChallengeDaysTable.challengeId),
+    )
+    .innerJoin(
+      unlimitedChallengeParticipantsTable,
+      eq(unlimitedChallengeParticipantsTable.id, unlimitedChallengeDaysTable.participantId),
     )
     .where(
       and(
@@ -217,6 +252,20 @@ export async function findActiveUnlimitedDaysForUser(
     );
 }
 
+/**
+ * Coarsen an internal eligibility reason for public display.
+ *
+ * `daily_goal_missed` and `left_challenge` are things the participant already knows and other
+ * viewers can see anyway. Verification, manual-review and simulation outcomes are anti-cheat
+ * signals: surfacing them on a public board would tell a cheater exactly which check caught them,
+ * so they all collapse to "not_qualified".
+ */
+export function publicEligibilityReason(code: string | null): string | null {
+  if (!code) return null;
+  if (code === "all_days_passed" || code === "daily_goal_missed" || code === "left_challenge") return code;
+  return "not_qualified";
+}
+
 /** Detail / waiting-room roster with live daily currentSteps. */
 export async function loadChallengePlayers(
   challengeId: string,
@@ -229,6 +278,8 @@ export async function loadChallengePlayers(
       participantId: unlimitedChallengeParticipantsTable.id,
       userId: unlimitedChallengeParticipantsTable.userId,
       qualificationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
+      prizePoolEligibilityStatus: unlimitedChallengeParticipantsTable.prizePoolEligibilityStatus,
+      eligibilityReasonCode: unlimitedChallengeParticipantsTable.eligibilityReasonCode,
       joinedAt: unlimitedChallengeParticipantsTable.joinedAt,
       username: profilesTable.username,
       fullName: profilesTable.fullName,
@@ -292,6 +343,8 @@ export async function loadChallengePlayers(
       avatarUrl: p.avatarUrl ?? null,
       avatarVersion: p.updatedAt?.getTime() ?? 0,
       qualificationStatus: p.qualificationStatus,
+      prizePoolEligibilityStatus: p.prizePoolEligibilityStatus,
+      eligibilityReason: publicEligibilityReason(p.eligibilityReasonCode),
       status: p.qualificationStatus,
       joinedAt: p.joinedAt,
       rank: i + 1,
@@ -312,6 +365,8 @@ export async function loadChallengePlayers(
       timezone: cur?.timezone ?? null,
       dayNumber: cur?.dayNumber ?? null,
       dailyGoalSteps: cur?.goalSteps ?? null,
+      raceStartBaselineSteps: cur?.startBaselineSteps ?? 0,
+      challengeDaySteps: cur?.challengeDaySteps ?? displayToday,
     };
   });
 }

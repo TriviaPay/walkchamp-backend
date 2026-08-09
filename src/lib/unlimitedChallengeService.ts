@@ -13,7 +13,12 @@ import { creditEntryRefunds } from "./cashChallengePayments.js";
 import { computeIsAdult } from "./dateOfBirth.js";
 import { isCashChallengeUnsupportedForUser } from "./cashChallengeFees.js";
 import { allocateChallengeCode } from "./uniqueCodes.js";
-import { isValidTimezone, validateUnlimitedSchedule } from "./challengeDayWindow.js";
+import { validateUnlimitedSchedule } from "./challengeDayWindow.js";
+import {
+  materializeParticipantSchedule,
+  participantScheduleFor,
+  resolveLockableTimezone,
+} from "./unlimitedParticipantSchedule.js";
 import {
   UNLIMITED_PLATFORM_FEE_CENTS,
   computeTotalChargeCents,
@@ -66,14 +71,14 @@ async function checkPaidEligibility(userId: string, isCreate: boolean): Promise<
   return { ok: true, data: { countryCode: p.countryCode } };
 }
 
+/** The IANA timezone to lock onto a new membership, from the user's saved preference. */
 async function lockUserTimezone(userId: string): Promise<string> {
   const [pref] = await db
     .select({ timezone: userPreferencesTable.timezone })
     .from(userPreferencesTable)
     .where(eq(userPreferencesTable.userId, userId))
     .limit(1);
-  const tz = pref?.timezone ?? "UTC";
-  return isValidTimezone(tz) ? tz : "UTC";
+  return resolveLockableTimezone(pref?.timezone);
 }
 
 export interface CreateInput {
@@ -82,8 +87,16 @@ export interface CreateInput {
   entryFeeCents: number;
   dailyGoalSteps: number;
   durationDays: number;
-  startAtIso: string;
-  /** IANA timezone the schedule is anchored to. Optional — falls back to the host's saved timezone. */
+  /**
+   * PREFERRED: the calendar date every participant starts on, `YYYY-MM-DD`. Timezone-free by
+   * design — each participant resolves it against their own locked zone.
+   */
+  startLocalDate?: string;
+  /** LEGACY: an instant that must be local midnight in the challenge timezone. Reduced to its
+   *  calendar date on the way in; kept so existing clients keep working. */
+  startAtIso?: string;
+  /** IANA timezone the HOST picked the date in. Audit + host display only — never another
+   *  participant's day boundaries. Falls back to the host's saved timezone. */
   challengeTimezone?: string;
 }
 
@@ -109,19 +122,23 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
   // in the challenge timezone, tomorrow-or-later, with a supported duration; end is backend-computed
   // as start-local-date + duration at local midnight (DST-correct). Supersedes the old ≥1h lead check.
   const schedule = validateUnlimitedSchedule({
+    startLocalDate: input.startLocalDate,
     startAtIso: input.startAtIso,
     durationDays: input.durationDays,
     timezone,
     nowMs: Date.now(),
   });
   if (!schedule.ok) return { ok: false, httpStatus: 400, body: { error: schedule.error } };
-  const { startAtUtc, challengeEndAtUtc } = schedule;
+  const { startLocalDate, startAtUtc, challengeEndAtUtc } = schedule;
 
   const elig = await checkPaidEligibility(userId, true);
   if (!elig.ok) return elig;
 
-  // Settlement waits until all days are finalized; the timer just needs to be past the last window +
-  // grace. Add a timezone safety margin so far-east/west participants' last days are covered.
+  // First settlement ATTEMPT timer only — settleUnlimitedChallenge re-checks the authoritative
+  // gate (every eligible participant's own local end has passed AND every day is finalized).
+  // +26h is the exact worst-case spread between the earliest local midnight (UTC+14) and the
+  // latest (UTC-12) for the same calendar date, so the timer can never fire before the last
+  // participant on earth could still be walking.
   const settlementNotBeforeUtc = new Date(challengeEndAtUtc.getTime() + config.unlimitedGoal.graceMs + 26 * 60 * 60_000);
   // 6-char code, allocated against the unique index (see allocateChallengeCode).
   const inviteCode = input.visibility === "private" ? await allocateChallengeCode() : null;
@@ -143,6 +160,10 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
         platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS,
         dailyGoalSteps: input.dailyGoalSteps,
         durationDays: input.durationDays,
+        // The semantic schedule. Every participant's midnight is resolved from THIS, in their own
+        // zone — challengeTimezone/startAtUtc describe only the host's view of the same date.
+        startLocalDate,
+        startLocalTime: "00:00",
         challengeTimezone: timezone,
         startAtUtc,
         registrationClosesAtUtc: startAtUtc,
@@ -164,14 +185,26 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
     });
     if (!charge.ok) return { ok: false as const, kind: "charge" as const, error: charge.error };
 
-    await tx.insert(unlimitedChallengeParticipantsTable).values({
-      challengeId: challenge.id,
+    // The host is an ordinary participant for scheduling: their days come from THEIR locked
+    // timezone applied to the challenge date, exactly like everyone else. There is no separate
+    // host day model. (The Walk Champ Admin ghost host is not a participant and never lands here.)
+    const [hostParticipant] = await tx
+      .insert(unlimitedChallengeParticipantsTable)
+      .values({
+        challengeId: challenge.id,
+        userId,
+        participantTimezone: hostTz,
+        qualificationStatus: "active",
+        entryContributionCents: input.entryFeeCents,
+        platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS,
+        paymentReference: `unlimited_entry:${challenge.id}:${userId}`,
+      })
+      .returning({ id: unlimitedChallengeParticipantsTable.id });
+    await materializeParticipantSchedule(tx, {
+      challenge: { ...challenge, startLocalDate },
+      participantId: hostParticipant.id,
       userId,
-      participantTimezone: hostTz,
-      qualificationStatus: "active",
-      entryContributionCents: input.entryFeeCents,
-      platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS,
-      paymentReference: `unlimited_entry:${challenge.id}:${userId}`,
+      timezone: hostTz,
     });
     await tx
       .update(unlimitedChallengesTable)
@@ -230,7 +263,29 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
     }
 
     if (challenge.status !== "waiting") return { ok: false as const, httpStatus: 409, body: { error: "This challenge is no longer open to join." } };
-    if (Date.now() >= challenge.startAtUtc.getTime()) return { ok: false as const, httpStatus: 409, body: { error: "Registration has closed for this challenge." } };
+
+    // ── Join cutoff: THIS joiner's own local start, not the host's ────────────
+    // "No joining after the challenge starts" is a per-participant rule under per-participant
+    // starts. A Chicago user is still eligible until 00:00 Chicago on the challenge date, even
+    // though India already began ~10.5h earlier — they get the same full first day everyone else
+    // gets, which is what the rule protects. Registration never opens a shorter run: the cutoff
+    // IS their day-1 boundary, so nobody can buy in mid-run.
+    const joinerSchedule = participantScheduleFor(
+      { ...challenge, startLocalDate: challenge.startLocalDate ?? null },
+      tz,
+    );
+    if (Date.now() >= joinerSchedule.startAtUtc.getTime()) {
+      return {
+        ok: false as const,
+        httpStatus: 409,
+        body: {
+          error: "Registration has closed for this challenge.",
+          code: "registration_closed",
+          participantStartAtUtc: joinerSchedule.startAtUtc.toISOString(),
+          participantTimezone: tz,
+        },
+      };
+    }
     if (challenge.visibility === "private" && challenge.inviteCode && opts.inviteCode !== challenge.inviteCode) {
       return { ok: false as const, httpStatus: 403, body: { error: "A valid invite code is required to join this private challenge." } };
     }
@@ -249,14 +304,27 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
     });
     if (!charge.ok) return { ok: false as const, httpStatus: 402, body: { error: charge.error ?? "Entry fee could not be charged.", code: "entry_charge_failed" } };
 
-    await tx.insert(unlimitedChallengeParticipantsTable).values({
-      challengeId,
+    const [participant] = await tx
+      .insert(unlimitedChallengeParticipantsTable)
+      .values({
+        challengeId,
+        userId,
+        // Locked here and never recomputed: not on relogin, not on a device swap, not when the
+        // user travels. DST inside the zone is handled by IANA rules under the same identifier.
+        participantTimezone: tz,
+        qualificationStatus: "active",
+        entryContributionCents: challenge.entryFeeCents,
+        platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS,
+        paymentReference: `unlimited_entry:${challengeId}:${userId}`,
+      })
+      .returning({ id: unlimitedChallengeParticipantsTable.id });
+    // Windows exist from the moment they pay, so a waiting challenge can already show this
+    // viewer their own dates.
+    await materializeParticipantSchedule(tx, {
+      challenge,
+      participantId: participant.id,
       userId,
-      participantTimezone: tz,
-      qualificationStatus: "active",
-      entryContributionCents: challenge.entryFeeCents,
-      platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS,
-      paymentReference: `unlimited_entry:${challengeId}:${userId}`,
+      timezone: tz,
     });
     const nextCount = challenge.paidParticipantCount + 1;
     await tx

@@ -24,6 +24,7 @@ import { config } from "./config.js";
 import {
   lockRaceRoom,
   lockWalletByUserId,
+  releaseScheduledRegistration,
   type DbTx,
 } from "./raceIntegrity.js";
 import { logger } from "./logger.js";
@@ -674,6 +675,17 @@ export async function createRefundForRaceLeave(input: {
       throw new Error("RACE_ALREADY_STARTED");
     }
 
+    // A scheduled room counts seats in registeredCount, not currentPlayers. Release the
+    // registration in the SAME transaction as the refund, or the leaver keeps their seat: the next
+    // roster poll reads scheduled_room_registrations and puts them back in the Waiting Room while
+    // "Joined" still counts them. Locks stay in room → registration → participant order, matching
+    // /rooms/:roomId/register and /rooms/:roomId/cancel-registration.
+    // This runs before the participant lookup on purpose, so a retry after a half-applied leave
+    // (participant already "left", registration still live) heals the registration too.
+    const registrationRelease = room.status === "scheduled"
+      ? await releaseScheduledRegistration(tx, input.raceId, input.userId, room)
+      : { changed: false, registeredCount: room.registeredCount, hadRegistration: false };
+
     await tx.execute(sql`
       select id from race_participants
       where race_room_id = ${input.raceId} and user_id = ${input.userId}
@@ -698,7 +710,7 @@ export async function createRefundForRaceLeave(input: {
       if (existingRefund) {
         const withItems = await getRefundWithItemsTx(tx, existingRefund.id);
         if (!withItems) throw new Error("REFUND_NOT_FOUND");
-        return { refund: withItems, participantStatus: "left" };
+        return { refund: withItems, participantStatus: "left", registrationRelease };
       }
       throw new Error("PARTICIPANT_NOT_FOUND");
     }
@@ -729,10 +741,17 @@ export async function createRefundForRaceLeave(input: {
       })
       .where(eq(raceRoomsTable.id, input.raceId));
 
-    return { refund, participantStatus: "left" };
+    return { refund, participantStatus: "left", registrationRelease };
   });
 
-  return { ...result, refund: serializeRefund(result.refund) };
+  return {
+    ...result,
+    refund: serializeRefund(result.refund),
+    // Callers broadcast these so Trending "Joined" and the Waiting Room roster drop immediately
+    // instead of waiting for the next screen-focus refetch.
+    registrationCancelled: result.registrationRelease.changed,
+    registeredCount: result.registrationRelease.registeredCount,
+  };
 }
 
 export async function createRefundBatchForRaceCancellation(input: {

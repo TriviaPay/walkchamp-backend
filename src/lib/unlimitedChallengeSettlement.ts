@@ -8,6 +8,14 @@ import {
 } from "../../db/src/schema/unlimitedChallenge.js";
 import { creditCashChallengePrizes, creditEntryRefunds } from "./cashChallengePayments.js";
 import { computeEqualSplit } from "./unlimitedChallengeMoney.js";
+import {
+  areAllParticipantWindowsClosed,
+  areAllRequiredDaysTerminal,
+  evaluateParticipantEligibility,
+  markResultsReady,
+  persistEligibility,
+  refreshUnlimitedResultsStatus,
+} from "./unlimitedResults.js";
 import { emitUnlimitedRealtime } from "./unlimitedRealtime.js";
 import { sendNotification } from "../routes/notifications.js";
 import { writeAuditLog } from "./auditLog.js";
@@ -28,18 +36,37 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
   if (pre.status === "completed" || pre.status === "cancelled_by_platform") return;
   if (pre.status !== "active" && pre.status !== "settling") return;
 
-  // All required days for non-left participants must be finalized (passed/failed) before settling.
-  const [{ unfinalized }] = await db
-    .select({ unfinalized: sql<number>`count(*)::int` })
-    .from(unlimitedChallengeDaysTable)
-    .innerJoin(unlimitedChallengeParticipantsTable, eq(unlimitedChallengeDaysTable.participantId, unlimitedChallengeParticipantsTable.id))
-    .where(and(
-      eq(unlimitedChallengeDaysTable.challengeId, challengeId),
-      ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
-      inArray(unlimitedChallengeDaysTable.status, ["pending", "in_progress", "pending_verification"]),
-    ));
-  if ((unfinalized ?? 0) > 0) {
-    logger.info({ challengeId, unfinalized }, "[Unlimited] settlement deferred — days not finalized");
+  // ── Gate 1 (§1, §3, §4, §21): every settlement participant's OWN local run must be over ──
+  // Participants in later timezones finish later in UTC — a Chicago participant is still walking
+  // for ~10.5h after their India counterpart has finished the same calendar date. Neither the
+  // host finishing, nor the first participant finishing, nor the challenge's own host-derived end
+  // is sufficient; only the LAST local end is.
+  const closure = await areAllParticipantWindowsClosed(challengeId);
+  if (!closure.allClosed) {
+    logger.info(
+      {
+        challengeId,
+        registered: closure.registeredParticipantCount,
+        finished: closure.participantsFinishedCount,
+        pending: closure.participantsPendingCount,
+        latestParticipantEnd: closure.latestParticipantEndAtUtc,
+      },
+      "[Unlimited] settlement deferred — a participant's local challenge window is still open",
+    );
+    await refreshUnlimitedResultsStatus(challengeId);
+    return;
+  }
+
+  // ── Gate 2 (§8, §22): every required day must be terminal (passed/failed) ──
+  // Verification/reconciliation completeness on top of the clock check. Provisional sensor steps
+  // never satisfy this — only the Health Connect / HealthKit authoritative value finalizes a day.
+  const validation = await areAllRequiredDaysTerminal(challengeId);
+  if (!validation.allDaysTerminal) {
+    logger.info(
+      { challengeId, pendingDays: validation.pendingDayCount, participants: validation.participantsAwaitingValidation },
+      "[Unlimited] settlement deferred — days not finalized",
+    );
+    await refreshUnlimitedResultsStatus(challengeId);
     return;
   }
 
@@ -53,21 +80,16 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
     if (!claimed) return; // another worker claimed it
   }
 
-  // Qualified finishers: not left, and passed every required day.
-  const participants = await db
-    .select({ id: unlimitedChallengeParticipantsTable.id, userId: unlimitedChallengeParticipantsTable.userId, status: unlimitedChallengeParticipantsTable.qualificationStatus })
-    .from(unlimitedChallengeParticipantsTable)
-    .where(eq(unlimitedChallengeParticipantsTable.challengeId, challengeId));
-  const passedCounts = await db
-    .select({ participantId: unlimitedChallengeDaysTable.participantId, passed: sql<number>`count(*) filter (where ${unlimitedChallengeDaysTable.status} = 'passed')::int` })
-    .from(unlimitedChallengeDaysTable)
-    .where(eq(unlimitedChallengeDaysTable.challengeId, challengeId))
-    .groupBy(unlimitedChallengeDaysTable.participantId);
-  const passedByParticipant = new Map(passedCounts.map((r) => [r.participantId, r.passed ?? 0]));
+  // ── §10, §11, §18: explicit per-participant eligibility ───────────────────
+  // "Passed EVERY required day", never a step total: 100,000 steps across a 7-day challenge with
+  // one 8,000-step day is still not eligible, and a later 15,000-step day cannot repay the miss.
+  // Every membership gets a recorded status and reason code, so the outcome is auditable rather
+  // than inferred by the client.
+  const eligibility = await evaluateParticipantEligibility(challengeId, pre.durationDays);
+  await persistEligibility(eligibility);
 
-  const qualified = participants.filter(
-    (p) => p.status !== "left" && p.status !== "disqualified" && (passedByParticipant.get(p.id) ?? 0) === pre.durationDays,
-  );
+  const participants = eligibility.map((e) => ({ id: e.participantId, userId: e.userId }));
+  const qualified = eligibility.filter((e) => e.status === "eligible");
 
   // ── Zero-winner policy ────────────────────────────────────────────────────
   if (qualified.length === 0) {
@@ -76,7 +98,9 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
     if (policy === "refund_entry_contributions") {
       // Nobody completed → return each non-left participant's entry contribution (platform fee is
       // NOT refunded). Idempotent per (challenge, participant). Then complete as "refunded".
-      const refundables = participants.filter((p) => p.status !== "left");
+      // Everyone who did not leave — a failed run still gets its entry contribution back under
+      // this policy; only a voluntary leave forfeits the claim.
+      const refundables = eligibility.filter((e) => e.reasonCode !== "left_challenge");
       const contribByParticipant = await db
         .select({ userId: unlimitedChallengeParticipantsTable.userId, amount: unlimitedChallengeParticipantsTable.entryContributionCents })
         .from(unlimitedChallengeParticipantsTable)
@@ -105,6 +129,11 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
         metadata: { prizePoolCents: pre.prizePoolCents, policy, refundedUsers: refundUserIds.size },
       });
       logger.warn({ challengeId, policy, refundedUsers: refundUserIds.size, prizePoolCents: pre.prizePoolCents }, "[Unlimited] zero winners — entry contributions refunded");
+      await markResultsReady(challengeId, {
+        qualifiedParticipantCount: 0,
+        prizePoolCents: pre.prizePoolCents,
+        settlementStatus: "refunded",
+      });
       emitUnlimitedRealtime(
         challengeId,
         "challenge_completed",
@@ -135,6 +164,13 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
       metadata: { prizePoolCents: pre.prizePoolCents, policy },
     });
     logger.warn({ challengeId, policy, prizePoolCents: pre.prizePoolCents }, "[Unlimited] zero winners — held for manual handling (no auto-credit)");
+    // The RESULT is final (nobody qualified) even though the money is held for ops — clients must
+    // stop showing "validating" for a challenge whose outcome is decided.
+    await markResultsReady(challengeId, {
+      qualifiedParticipantCount: 0,
+      prizePoolCents: pre.prizePoolCents,
+      settlementStatus: policy === "manual_review" ? "manual_review" : policy,
+    });
     emitUnlimitedRealtime(
       challengeId,
       "challenge_completed",
@@ -147,8 +183,8 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
     return;
   }
 
-  const allocations = computeEqualSplit(pre.prizePoolCents, qualified.map((q) => q.id));
-  const userIdByParticipant = new Map(qualified.map((q) => [q.id, q.userId]));
+  const allocations = computeEqualSplit(pre.prizePoolCents, qualified.map((q) => q.participantId));
+  const userIdByParticipant = new Map(qualified.map((q) => [q.participantId, q.userId]));
 
   await db.transaction(async (tx) => {
     // Persist immutable payout rows (idempotent) and credit wallets (idempotent).
@@ -176,6 +212,13 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
   });
 
   logger.info({ challengeId, winners: qualified.length, prizePoolCents: pre.prizePoolCents }, "[Unlimited] settled — equal split credited");
+  // §9 — only now is the result publishable: every window closed, every day terminal, eligibility
+  // recorded for every membership, the split persisted and the wallets credited.
+  await markResultsReady(challengeId, {
+    qualifiedParticipantCount: qualified.length,
+    prizePoolCents: pre.prizePoolCents,
+    settlementStatus: "completed",
+  });
   emitUnlimitedRealtime(
     challengeId,
     "challenge_completed",
