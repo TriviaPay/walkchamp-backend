@@ -120,6 +120,7 @@ export interface PushSendOptions {
   url?: string;
   category?: PushCategory;
   dedupeKey?: string;
+  androidLargeIcon?: string;
 }
 
 export interface PushDeliveryBatchSummary {
@@ -212,6 +213,7 @@ export async function sendPushToUser(
         contents: { en: body },
         data: { ...(data ?? {}), dedupeKey: options?.dedupeKey },
         ...(options?.url ? { url: options.url } : {}),
+        ...(options?.androidLargeIcon ? { large_icon: options.androidLargeIcon } : {}),
       }),
     }) as {
       ok: boolean;
@@ -296,6 +298,7 @@ export async function sendPushToUsers(
           contents: { en: body },
           data: payloadData,
           ...(options?.url ? { url: options.url } : {}),
+          ...(options?.androidLargeIcon ? { large_icon: options.androidLargeIcon } : {}),
         }),
       }) as {
         ok: boolean;

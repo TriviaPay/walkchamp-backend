@@ -16,7 +16,7 @@ import {
   walkingGroupsTable,
   profilesTable,
 } from "../../db/src/schema/index.js";
-import { and, eq, gt, inArray, or, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, ne, or, sql } from "drizzle-orm";
 import { sendPushToUser, sendPushToUsers, type PushCategory } from "../routes/push.js";
 import { logger } from "./logger.js";
 
@@ -102,6 +102,18 @@ export function buildChatMessagePreview(text: string): string | null {
   if (!trimmed) return null;
   if (trimmed.length <= 120) return trimmed;
   return `${trimmed.slice(0, 117)}...`;
+}
+
+async function filterRecentlySentRecipients(
+  userIds: string[],
+  dedupeKey: string,
+  windowMs: number,
+): Promise<string[]> {
+  const out: string[] = [];
+  for (const uid of userIds) {
+    if (!(await wasRecentlySent(uid, dedupeKey, windowMs))) out.push(uid);
+  }
+  return out;
 }
 
 async function getPromotionalRecipientIds(excludeUserId?: string, cap = 500): Promise<string[]> {
@@ -524,6 +536,67 @@ export async function notifyChatMessageReceived(params: {
       url: deepLink,
       category: "chat",
       dedupeKey: `chat_message:${messageId}`,
+    },
+  );
+}
+
+export async function notifyGlobalChatMessageReceived(params: {
+  messageId: string;
+  senderUserId: string;
+  senderUsername: string;
+  messagePreview: string;
+}): Promise<void> {
+  const { messageId, senderUserId, senderUsername, messagePreview } = params;
+  const preview = buildChatMessagePreview(messagePreview);
+  if (!preview) return;
+
+  const deviceRows = await db
+    .selectDistinct({ userId: notificationDevicesTable.userId })
+    .from(notificationDevicesTable)
+    .where(and(eq(notificationDevicesTable.active, true), ne(notificationDevicesTable.userId, senderUserId)));
+
+  let recipientIds = deviceRows.map((r) => r.userId).filter(Boolean);
+  if (recipientIds.length === 0) return;
+
+  const prefs = await db
+    .select({
+      userId: userNotificationPreferencesTable.userId,
+      pushNotificationsEnabled: userNotificationPreferencesTable.pushNotificationsEnabled,
+      chatUpdatesEnabled: userNotificationPreferencesTable.chatUpdatesEnabled,
+    })
+    .from(userNotificationPreferencesTable)
+    .where(inArray(userNotificationPreferencesTable.userId, recipientIds));
+  const prefMap = new Map(prefs.map((p) => [p.userId, p]));
+
+  recipientIds = recipientIds.filter((uid) => {
+    const p = prefMap.get(uid);
+    if (!p) return true;
+    return p.pushNotificationsEnabled && p.chatUpdatesEnabled;
+  });
+  if (recipientIds.length === 0) return;
+
+  const rateLimitKey = "global_chat_message";
+  recipientIds = await filterRecentlySentRecipients(recipientIds, rateLimitKey, 180_000);
+  if (recipientIds.length === 0) return;
+
+  const deepLink = "walkchamp://chat/global";
+  const title = senderUsername ? `💬 @${senderUsername}` : "💬 Global chat";
+  await sendPushToUsers(
+    recipientIds,
+    title,
+    preview,
+    {
+      type: "global_chat_message",
+      messageId,
+      senderUserId,
+      deepLink,
+      category: "chat",
+    },
+    {
+      url: deepLink,
+      category: "chat",
+      dedupeKey: rateLimitKey,
+      androidLargeIcon: "notification_chat",
     },
   );
 }

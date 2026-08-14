@@ -16,7 +16,7 @@ import { triggerEvent } from "../lib/pusher.js";
 import { z } from "zod";
 import { sanitizePlainText } from "../lib/text.js";
 import { config } from "../lib/config.js";
-import { notifyChatMessageReceived } from "../lib/pushNotificationService.js";
+import { notifyChatMessageReceived, notifyGlobalChatMessageReceived } from "../lib/pushNotificationService.js";
 
 const router = Router();
 
@@ -157,6 +157,14 @@ router.post("/chat/global", requireAuth, async (req, res) => {
   };
 
   await triggerEvent("public-global-chat", "chat:new_message", payload);
+  void notifyGlobalChatMessageReceived({
+    messageId: msg.id,
+    senderUserId: userId,
+    senderUsername: profile.username,
+    messagePreview: text,
+  }).catch((err) => {
+    req.log.warn({ err, messageId: msg.id, senderUserId: userId }, "global chat push notification failed");
+  });
   return res.status(201).json({ message: payload });
 });
 
