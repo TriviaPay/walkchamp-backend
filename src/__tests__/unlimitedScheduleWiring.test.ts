@@ -168,7 +168,9 @@ describe("APIs return viewer-personalized state", () => {
   it("detail and my-active both carry the viewer block", () => {
     expect(route).toContain("async function buildViewerSchedule");
     expect(route).toContain("...viewer,");
-    expect(route).toContain("...(await buildViewerSchedule(r.challenge, userId))");
+    expect(route).toContain("const viewer = await buildViewerSchedule(r.challenge, userId)");
+    expect(route).toContain("viewer,");
+    expect(route).not.toContain("...(await buildViewerSchedule(r.challenge, userId))");
   });
 
   it("exposes the fields the Walk screen and the Android FGS need", () => {
@@ -190,7 +192,8 @@ describe("APIs return viewer-personalized state", () => {
   it("serializes the semantic date alongside the legacy instant", () => {
     expect(route).toContain("startLocalDate: c.startLocalDate");
     expect(route).toContain("hostTimezone: c.challengeTimezone");
-    expect(route).toContain("startAtUtc: c.startAtUtc");
+    expect(route).toContain("const startAtUtc = isoOrNull(c.startAtUtc)");
+    expect(route).toContain("startAtUtc,");
   });
 
   it("create accepts the semantic form and still accepts the legacy one", () => {

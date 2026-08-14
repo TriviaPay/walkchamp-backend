@@ -75,7 +75,33 @@ const createSchema = z.object({
   path: ["startLocalDate"],
 });
 
-function serializeChallenge(c: typeof unlimitedChallengesTable.$inferSelect) {
+function isoOrNull(value: Date | string | null | undefined): string | null {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString();
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function resolveChallengeEndAtIso(c: typeof unlimitedChallengesTable.$inferSelect): string | null {
+  const stored = isoOrNull(c.challengeEndAtUtc);
+  if (stored) return stored;
+  try {
+    return participantScheduleFor(c, c.challengeTimezone || "UTC").endAtUtc.toISOString();
+  } catch {
+    return null;
+  }
+}
+
+function serializeChallenge(
+  c: typeof unlimitedChallengesTable.$inferSelect,
+  opts: { participantCount?: number } = {},
+) {
+  const startAtUtc = isoOrNull(c.startAtUtc);
+  const registrationClosesAtUtc = isoOrNull(c.registrationClosesAtUtc);
+  const challengeEndAtUtc = resolveChallengeEndAtIso(c);
+  const resultsReadyAt = isoOrNull(c.resultsReadyAt);
+  const createdAt = isoOrNull(c.createdAt);
+
   return {
     id: c.id,
     challengeType: "unlimited_goal",
@@ -99,20 +125,23 @@ function serializeChallenge(c: typeof unlimitedChallengesTable.$inferSelect) {
     startLocalTime: c.startLocalTime,
     challengeTimezone: c.challengeTimezone,
     hostTimezone: c.challengeTimezone,
-    startAtUtc: c.startAtUtc,
-    registrationClosesAtUtc: c.registrationClosesAtUtc,
-    challengeEndAtUtc: c.challengeEndAtUtc,
+    startAtUtc,
+    registrationClosesAtUtc,
+    registration_closes_at_utc: registrationClosesAtUtc,
+    challengeEndAtUtc,
+    challenge_end_at: challengeEndAtUtc,
+    challenge_end_at_utc: challengeEndAtUtc,
     prizePoolCents: c.prizePoolCents,
-    participantCount: c.paidParticipantCount,
+    participantCount: opts.participantCount ?? c.paidParticipantCount,
     qualifiedParticipantCount: c.qualifiedParticipantCount,
     settlementStatus: c.settlementStatus,
     // Result lifecycle. Clients must branch on resultsStatus, NOT on `status` — a challenge whose
     // host has finished is still `active` for participants in later timezones, and its result is
     // not final until results_ready.
     resultsStatus: c.resultsStatus,
-    resultsReadyAt: c.resultsReadyAt,
+    resultsReadyAt,
     settlementPopulationSize: c.settlementPopulationSize,
-    createdAt: c.createdAt,
+    createdAt,
   };
 }
 
@@ -245,21 +274,21 @@ async function buildViewerSchedule(
     registeredParticipantCount: closure.registeredParticipantCount,
     participantsFinishedCount: closure.participantsFinishedCount,
     participantsPendingCount: closure.participantsPendingCount,
-    latestParticipantEndAtUtc: closure.latestParticipantEndAtUtc,
+    latestParticipantEndAtUtc: isoOrNull(closure.latestParticipantEndAtUtc),
     // §10 — the viewer's own eligibility, explicit rather than inferred from day rows.
     prizePoolEligibilityStatus: participant?.prizePoolEligibilityStatus ?? null,
     eligibilityReasonCode: participant?.eligibilityReasonCode ?? null,
     inSettlementPopulation: participant?.inSettlementPopulation ?? null,
     viewerStatus: state.viewerStatus,
     viewerTimezone: state.viewerTimezone,
-    viewerTimezoneLockedAt: participant?.timezoneLockedAt ?? null,
-    viewerStartAt: state.viewerStartAt,
-    viewerEndAt: state.viewerEndAt,
+    viewerTimezoneLockedAt: isoOrNull(participant?.timezoneLockedAt),
+    viewerStartAt: isoOrNull(state.viewerStartAt),
+    viewerEndAt: isoOrNull(state.viewerEndAt),
     verificationPending: state.verificationPending,
     currentDayIndex: state.currentDayIndex,
     currentDayLocalDate: state.currentDayLocalDate,
-    currentDayStartAt: state.currentDayStartAt,
-    currentDayEndAt: state.currentDayEndAt,
+    currentDayStartAt: isoOrNull(state.currentDayStartAt),
+    currentDayEndAt: isoOrNull(state.currentDayEndAt),
     currentDayStatus: state.currentDayStatus,
     remainingDaysAfterToday: state.remainingDaysAfterToday,
     completedDays: state.completedDays,
@@ -402,14 +431,18 @@ router.get("/unlimited-challenges/my-active", requireAuth, async (req, res) => {
   // from here rather than reconstructing host-timezone semantics natively.
   const participantCounts = await loadChallengeParticipantCounts(rows.map((r) => r.challenge.id));
   const challenges = await Promise.all(
-    rows.map(async (r) => ({
-      ...serializeChallenge(r.challenge),
-      participantCount: participantCounts.get(r.challenge.id) ?? 0,
-      participationStatus: r.participationStatus,
-      currentUserRegistered: true,
-      challengeStatus: r.challenge.status,
-      ...(await buildViewerSchedule(r.challenge, userId)),
-    })),
+    rows.map(async (r) => {
+      const participantCount = participantCounts.get(r.challenge.id) ?? 0;
+      const viewer = await buildViewerSchedule(r.challenge, userId);
+      return {
+        ...serializeChallenge(r.challenge, { participantCount }),
+        participationStatus: r.participationStatus,
+        currentUserRegistered: true,
+        current_user_registered: true,
+        challengeStatus: r.challenge.status,
+        viewer,
+      };
+    }),
   );
   return res.json({ challenge: challenges[0] ?? null, challenges, count: challenges.length });
 });
@@ -487,18 +520,14 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
       membership.status as typeof UNLIMITED_NON_ACTIVE_STATUSES[number],
     );
   return res.json({
-    challenge: {
-      ...serializeChallenge(challenge),
-      challengeDayKey,
-      participantCount: players.length,
-    },
+    challenge: serializeChallenge(challenge, { participantCount: players.length }),
     membership: membership ? { status: membership.status } : null,
     currentUserRegistered,
     current_user_registered: currentUserRegistered,
     canJoin,
     // What a non-member would get if they joined right now — lets the client show a real date
     // instead of the host's.
-    prospectiveStartAtUtc: membership ? null : wouldStartAt,
+    prospectiveStartAtUtc: membership ? null : wouldStartAt.toISOString(),
     prospectiveTimezone: membership ? null : viewerTimezone,
     ...viewer,
     challengeDayKey,

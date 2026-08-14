@@ -200,13 +200,22 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
       router.indexOf('router.get("/unlimited-challenges/:id"'),
       router.indexOf("// ── POST /unlimited-challenges/:id/live-progress"),
     );
-    for (const field of ["startAtUtc", "challengeEndAtUtc", "prizePoolCents"]) {
-      expect(router).toContain(`${field}: c.${field}`);
+    for (const field of ["startAtUtc", "registrationClosesAtUtc", "resultsReadyAt", "createdAt"]) {
+      expect(router).toContain(`${field} = isoOrNull(c.${field})`);
     }
-    expect(myActive).toContain("participantCount: participantCounts.get(r.challenge.id) ?? 0");
+    expect(router).toContain("function resolveChallengeEndAtIso");
+    expect(router).toContain("const challengeEndAtUtc = resolveChallengeEndAtIso(c)");
+    expect(router).toContain("challenge_end_at: challengeEndAtUtc");
+    expect(router).toContain("prizePoolCents: c.prizePoolCents");
+    expect(router).toContain("participantCount: opts.participantCount ?? c.paidParticipantCount");
+    expect(myActive).toContain("const participantCount = participantCounts.get(r.challenge.id) ?? 0");
+    expect(myActive).toContain("const viewer = await buildViewerSchedule(r.challenge, userId)");
+    expect(myActive).toContain("...serializeChallenge(r.challenge, { participantCount })");
+    expect(myActive).toContain("viewer,");
+    expect(myActive).not.toContain("...(await buildViewerSchedule(r.challenge, userId))");
     expect(myActive).toContain("return res.json({ challenge: challenges[0] ?? null, challenges, count: challenges.length })");
-    expect(detail).toContain("participantCount: players.length");
-    expect(detail).toContain("challenge: {");
+    expect(detail).toContain("challenge: serializeChallenge(challenge, { participantCount: players.length })");
+    expect(detail).not.toContain("challenge: {");
   });
 });
 

@@ -110,7 +110,9 @@ describe("§3 my-active restores the Unlimited tray after process death", () => 
   );
 
   it("my-active carries the full viewer block", () => {
-    expect(route).toContain("...(await buildViewerSchedule(r.challenge, userId))");
+    expect(route).toContain("const viewer = await buildViewerSchedule(r.challenge, userId)");
+    expect(route).toContain("viewer,");
+    expect(route).not.toContain("...(await buildViewerSchedule(r.challenge, userId))");
   });
 
   it("exposes every field the tray needs to rebuild itself", () => {
