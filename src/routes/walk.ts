@@ -14,7 +14,7 @@ import { notifyGroupsOnDailyGoalCompletion } from "../lib/pushNotificationServic
 import { getChallengeCardsForUser, getRoomCountsSummary } from "./races.js";
 import { getSponsoredEventsForUser } from "./sponsoredEvents.js";
 import { getTrackThemeSummaryForUser } from "./trackThemes.js";
-import { validateRecentLocalDate } from "../lib/localDate.js";
+import { localDateInTimeZone, validateRecentLocalDate } from "../lib/localDate.js";
 import {
   normalizeSource,
   isVerifiedDailySource,
@@ -27,6 +27,32 @@ import { triggerEvent } from "../lib/pusher.js";
 const router = Router();
 
 const DAILY_GOAL = 10000;
+const IANA_TZ_REGEX = /^(?:UTC|[A-Za-z]+(?:\/[A-Za-z0-9_+-]+)+)$/;
+const ROLLOVER_REPLACE_HOURS = 6;
+
+function isRecognizedTimeZone(timezone: string): boolean {
+  if (!IANA_TZ_REGEX.test(timezone)) return false;
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: timezone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function localHourInTimeZone(timezone: string, now: Date): number {
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      hour: "2-digit",
+      hour12: false,
+    }).formatToParts(now);
+    const hour = Number(parts.find((p) => p.type === "hour")?.value);
+    return Number.isFinite(hour) ? hour % 24 : now.getUTCHours();
+  } catch {
+    return now.getUTCHours();
+  }
+}
 
 async function getUserGoalAndUnit(userId: string): Promise<{ goal: number; unit: string; timezone: string; notifyFriendsOnGoal: boolean }> {
   const [prefs] = await db
@@ -204,6 +230,8 @@ const submitStepsSchema = z.object({
   source: z.string().max(50).optional(),
   /** Client's local calendar date (YYYY-M-D). Avoids UTC midnight boundary issues. */
   localDate: z.string().regex(/^\d{4}-\d{1,2}-\d{1,2}$/).optional(),
+  /** Device IANA timezone used to key Health Connect / HealthKit daily totals. */
+  timezone: z.string().trim().max(64).optional(),
   /** Opt-in cheaper response when absolute total has not increased. */
   shortUnchanged: z.boolean().optional(),
 });
@@ -230,6 +258,47 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   }
 
   const { steps, durationSeconds = 0, source: rawSource } = parsed.data;
+  const receivedAt = new Date();
+  const [existingPrefs] = await db
+    .select({ timezone: userPreferencesTable.timezone })
+    .from(userPreferencesTable)
+    .where(eq(userPreferencesTable.userId, userId))
+    .limit(1);
+
+  const submittedTimezone = parsed.data.timezone?.trim();
+  if (submittedTimezone && !isRecognizedTimeZone(submittedTimezone)) {
+    return res.status(400).json({ error: "Invalid timezone.", code: "invalid_timezone" });
+  }
+  // True only when the zone is the user's real one. When both are absent we fall back to UTC,
+  // which is a GUESS — and for any positive-offset user it is a whole day behind their local
+  // date during their evening/night.
+  const hasTrustedTimezone = !!(submittedTimezone || existingPrefs?.timezone);
+  const effectiveTimezone = submittedTimezone || existingPrefs?.timezone || "UTC";
+  if (submittedTimezone && submittedTimezone !== existingPrefs?.timezone) {
+    await db
+      .insert(userPreferencesTable)
+      .values({ userId, timezone: submittedTimezone, updatedAt: receivedAt })
+      .onConflictDoUpdate({
+        target: [userPreferencesTable.userId],
+        set: { timezone: submittedTimezone, updatedAt: receivedAt },
+      });
+  }
+
+  const localToday = localDateInTimeZone(effectiveTimezone, receivedAt);
+  const dv = validateRecentLocalDate(parsed.data.localDate ?? localToday, {
+    pastDays: 1,
+    // With the user's real zone, localToday IS their today, so a future date is impossible and
+    // futureDays: 0 is right. On the UTC guess it is not: a client in any positive offset sends
+    // a localDate one day AHEAD of the UTC date every evening/night, and futureDays: 0 would
+    // 400 it — silently stopping step sync for that user until their local morning. Keep the
+    // previous ±1 tolerance exactly where the timezone is unknown.
+    futureDays: hasTrustedTimezone ? 0 : 1,
+    today: localToday,
+  });
+  if (!dv.ok) {
+    return res.status(400).json({ error: "Step date is out of the allowed range.", code: dv.code });
+  }
+  const today = dv.normalized;
 
   // Normalize + classify the source. Clearly-fake sources are safely ignored (no write),
   // so a mock/random provider can never poison verified daily state, and the client's
@@ -239,7 +308,7 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
     const [existing] = await db
       .select({ steps: stepDailyTotalsTable.steps })
       .from(stepDailyTotalsTable)
-      .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, localDateStr(parsed.data.localDate))))
+      .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, today)))
       .limit(1);
     return res.json({
       submitted: 0,
@@ -250,21 +319,6 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   }
   const sessionVerified = isVerifiedDailySource(source);
   const incomingDayClass = classifyDailySource(source);
-
-  // Reject backdated / post-dated submissions. Milestone rewards are date-scoped
-  // (e.g. daily_walk_2020-01-01) and only dedupe within the SAME date, so an
-  // unbounded localDate lets a user farm milestone coins for hundreds of past
-  // dates. Allow ±1 day to tolerate client/server timezone skew.
-  let today: string;
-  if (parsed.data.localDate !== undefined) {
-    const dv = validateRecentLocalDate(parsed.data.localDate, { pastDays: 1, futureDays: 1 });
-    if (!dv.ok) {
-      return res.status(400).json({ error: "Step date is out of the allowed range.", code: dv.code });
-    }
-    today = dv.normalized;
-  } else {
-    today = localDateStr(undefined); // server UTC date
-  }
 
   // Read previous step total BEFORE the upsert — needed for goal-crossing detection.
   // If the row does not yet exist for today, previousSteps = 0.
@@ -282,11 +336,17 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   const previousSteps = prevStepRow?.steps ?? 0;
   const nextDaySourceClass = combineDaySourceClass(prevStepRow?.sourceClass, incomingDayClass);
 
-  // `totalSteps` is the absolute HealthKit/Health Connect total for today.
-  // When present we use GREATEST(existing, totalSteps) so app restarts never
-  // double-count already-synced steps. Fall back to additive delta when absent.
+  // `totalSteps` is the absolute HealthKit/Health Connect total for the submitted local day.
+  // Mid-day we keep the row monotonic with GREATEST; during the first hours after local midnight,
+  // a lower verified total is the new day's true value and can replace a stale leftover row.
   const usingAbsolute = typeof parsed.data.totalSteps === "number";
   const totalSteps = parsed.data.totalSteps ?? steps; // absolute total, or delta as fallback
+  const allowRolloverReplace =
+    usingAbsolute
+    && sessionVerified
+    && today === localToday
+    && totalSteps < previousSteps
+    && localHourInTimeZone(effectiveTimezone, receivedAt) < ROLLOVER_REPLACE_HOURS;
 
   // For distance/calories we derive from the absolute total when available so
   // these values also stay consistent with the authoritative step count.
@@ -328,13 +388,15 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
           ),
         )
         .limit(1);
-      absoluteMetricsUnchanged = !!prevDeviceRow
+      absoluteMetricsUnchanged = !allowRolloverReplace
+        && !!prevDeviceRow
         && totalSteps <= prevDeviceRow.steps
         && totalDistMeters <= prevDeviceRow.distanceMeters
         && totalCals <= prevDeviceRow.caloriesBurned
         && activeMinutes <= prevDeviceRow.activeMinutes;
     } else {
-      absoluteMetricsUnchanged = !!prevStepRow
+      absoluteMetricsUnchanged = !allowRolloverReplace
+        && !!prevStepRow
         && totalSteps <= previousSteps
         && totalDistMeters <= prevStepRow.distanceMeters
         && totalCals <= prevStepRow.caloriesBurned
@@ -375,19 +437,28 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
             stepDailyDeviceTotalsTable.deviceId,
           ],
           set: {
-            steps: sql`GREATEST(${stepDailyDeviceTotalsTable.steps}, ${totalSteps})`,
-            distanceMeters: sql`GREATEST(${stepDailyDeviceTotalsTable.distanceMeters}, ${totalDistMeters})`,
-            caloriesBurned: sql`GREATEST(${stepDailyDeviceTotalsTable.caloriesBurned}, ${totalCals})`,
-            activeMinutes: sql`GREATEST(${stepDailyDeviceTotalsTable.activeMinutes}, ${activeMinutes})`,
+            steps: allowRolloverReplace
+              ? totalSteps
+              : sql`GREATEST(${stepDailyDeviceTotalsTable.steps}, ${totalSteps})`,
+            distanceMeters: allowRolloverReplace
+              ? totalDistMeters
+              : sql`GREATEST(${stepDailyDeviceTotalsTable.distanceMeters}, ${totalDistMeters})`,
+            caloriesBurned: allowRolloverReplace
+              ? totalCals
+              : sql`GREATEST(${stepDailyDeviceTotalsTable.caloriesBurned}, ${totalCals})`,
+            activeMinutes: allowRolloverReplace
+              ? activeMinutes
+              : sql`GREATEST(${stepDailyDeviceTotalsTable.activeMinutes}, ${activeMinutes})`,
             sourceClass: incomingDayClass,
             updatedAt: new Date(),
           },
         });
     }
 
-    // Upsert daily total — always use GREATEST so the row is monotonically increasing.
-    // When the client sends an absolute total we set the row to max(existing, total).
-    // When only a delta is sent (legacy/fallback) we add it to the existing value.
+    // Upsert daily total. Absolute Health totals are monotonic during the day, but around a user's
+    // local midnight the new "today" total can legitimately be lower than a stale leftover value.
+    // In that first local rollover window we replace the row for localToday instead of preserving
+    // yesterday's higher value with GREATEST.
     await tx
       .insert(stepDailyTotalsTable)
       .values({
@@ -403,7 +474,25 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
       .onConflictDoUpdate({
         target: [stepDailyTotalsTable.userId, stepDailyTotalsTable.date],
         set: useDeviceMerge
-          ? {
+          ? allowRolloverReplace
+            ? {
+                steps: sql`(
+                  SELECT COALESCE(SUM(steps), 0) FROM step_daily_device_totals
+                  WHERE user_id = ${userId} AND date = ${today}
+                )`,
+                distanceMeters: sql`(
+                  SELECT COALESCE(SUM(distance_meters), 0) FROM step_daily_device_totals
+                  WHERE user_id = ${userId} AND date = ${today}
+                )`,
+                caloriesBurned: sql`(
+                  SELECT COALESCE(SUM(calories_burned), 0) FROM step_daily_device_totals
+                  WHERE user_id = ${userId} AND date = ${today}
+                )`,
+                activeMinutes,
+                sourceClass: incomingDayClass,
+                updatedAt: new Date(),
+              }
+            : {
               // Multi-device: the account total is the SUM of each device's own
               // (GREATEST-protected) reading — computed inside this transaction so
               // concurrent syncs from two devices can't clobber each other. Floored
@@ -425,7 +514,18 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
               updatedAt: new Date(),
             }
           : usingAbsolute
-          ? {
+          ? allowRolloverReplace
+            ? {
+                // Absolute rollover mode: lower verified Health total is the new local day, not a
+                // regression. Replace the row so yesterday's leftover does not become today's steps.
+                steps: totalSteps,
+                distanceMeters: totalDistMeters,
+                caloriesBurned: totalCals,
+                activeMinutes,
+                sourceClass: incomingDayClass,
+                updatedAt: new Date(),
+              }
+            : {
               // Absolute mode: GREATEST so daily steps are monotonically increasing.
               // If Android/iOS sends a stale lower total (e.g. subscription restart, race
               // flow resumption, or background sync race), the row is never downgraded.
@@ -551,8 +651,12 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
             .onConflictDoUpdate({
               target: [walkingGroupDailyStepsTable.groupId, walkingGroupDailyStepsTable.userId, walkingGroupDailyStepsTable.stepDate],
               set: {
-                dailySteps: sql`GREATEST(${walkingGroupDailyStepsTable.dailySteps}, ${committed.steps})`,
-                verifiedSteps: sql`GREATEST(${walkingGroupDailyStepsTable.verifiedSteps}, ${verifiedSteps})`,
+                dailySteps: allowRolloverReplace
+                  ? committed.steps
+                  : sql`GREATEST(${walkingGroupDailyStepsTable.dailySteps}, ${committed.steps})`,
+                verifiedSteps: allowRolloverReplace
+                  ? verifiedSteps
+                  : sql`GREATEST(${walkingGroupDailyStepsTable.verifiedSteps}, ${verifiedSteps})`,
                 calories: committed.caloriesBurned?.toString() ?? null,
                 distanceMeters: committed.distanceMeters?.toString() ?? null,
                 lastSyncedAt: syncNow, updatedAt: syncNow,

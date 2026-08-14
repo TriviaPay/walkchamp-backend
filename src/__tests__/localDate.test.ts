@@ -49,6 +49,17 @@ describe("validateRecentLocalDate (H-7 / M-6)", () => {
     expect(validateRecentLocalDate("2026-07-14", { now, pastDays: 7 }).ok).toBe(true);
     expect(validateRecentLocalDate("2026-07-10", { now, pastDays: 7 }).ok).toBe(false);
   });
+
+  it("can validate against a caller-supplied local today instead of UTC today", () => {
+    // 00:30 IST on Aug 8 is still Aug 7 in UTC. The write path must allow local Aug 8 and Aug 7,
+    // but reject Aug 9 unless the caller explicitly widens futureDays.
+    const now = new Date("2026-08-07T19:00:00Z");
+    const localToday = localDateInTimeZone("Asia/Kolkata", now);
+    expect(localToday).toBe("2026-08-08");
+    expect(validateRecentLocalDate("2026-08-08", { now, today: localToday, pastDays: 1 }).ok).toBe(true);
+    expect(validateRecentLocalDate("2026-08-07", { now, today: localToday, pastDays: 1 }).ok).toBe(true);
+    expect(validateRecentLocalDate("2026-08-09", { now, today: localToday, pastDays: 1 }).ok).toBe(false);
+  });
 });
 
 // The "daily steps show yesterday" bug: step_daily_totals rows are written keyed by the user's

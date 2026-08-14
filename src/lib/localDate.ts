@@ -86,7 +86,7 @@ export type LocalDateResult =
  */
 export function validateRecentLocalDate(
   input: unknown,
-  opts: { pastDays?: number; futureDays?: number; now?: Date } = {},
+  opts: { pastDays?: number; futureDays?: number; now?: Date; today?: string } = {},
 ): LocalDateResult {
   const pastDays = opts.pastDays ?? 1;
   const futureDays = opts.futureDays ?? 0;
@@ -110,7 +110,13 @@ export function validateRecentLocalDate(
   }
 
   const normalized = `${match[1]}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-  const todayNum = toDayNumber(now.getUTCFullYear(), now.getUTCMonth() + 1, now.getUTCDate());
+  const normalizedToday = normalizeLocalDate(opts.today);
+  const todayNum = normalizedToday
+    ? (() => {
+        const [todayYear, todayMonth, todayDay] = normalizedToday.split("-").map(Number);
+        return toDayNumber(todayYear, todayMonth, todayDay);
+      })()
+    : toDayNumber(now.getUTCFullYear(), now.getUTCMonth() + 1, now.getUTCDate());
   const dateNum = toDayNumber(year, month, day);
   if (dateNum < todayNum - pastDays || dateNum > todayNum + futureDays) {
     return {
