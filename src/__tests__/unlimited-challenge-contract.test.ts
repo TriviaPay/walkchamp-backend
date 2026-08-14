@@ -13,6 +13,7 @@ const router = readFileSync("src/routes/unlimitedChallenge.ts", "utf8");
 const worker = readFileSync("src/worker.ts", "utf8");
 const scheduler = readFileSync("src/lib/scheduler.ts", "utf8");
 const races = readFileSync("src/routes/races.ts", "utf8");
+const coinsBattle = readFileSync("src/routes/coinsBattle.ts", "utf8");
 const walk = readFileSync("src/routes/walk.ts", "utf8");
 const membership = readFileSync("src/lib/challengeMembership.ts", "utf8");
 const schema = readFileSync("db/src/schema/unlimitedChallenge.ts", "utf8");
@@ -71,6 +72,27 @@ describe("one-blocking-challenge spans both systems", () => {
     expect(membership).toContain("if (!config.features.unlimitedGoalEnabled) return null;");
     expect(membership).toContain("Fail-open");
     expect(membership).toMatch(/catch \(err\)[\s\S]*return null;/);
+  });
+
+  it("streak membership blocks non-sponsored classic registration and coins battle under the user lock", () => {
+    expect(membership).toContain("notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES])");
+    expect(membership).toContain("if (!failOpen) throw err;");
+
+    const scheduledRegister = races.slice(
+      races.indexOf('"/rooms/:roomId/register"'),
+      races.indexOf('"/rooms/:roomId/cancel-registration"'),
+    );
+    expect(scheduledRegister).toContain('if (room.type !== "sponsored")');
+    expect(scheduledRegister).toContain("getUnlimitedBlockingMembership(tx, userId, { failOpen: false })");
+    expect(scheduledRegister).toContain("oneChallengeAtATimeConflictBody(unlimitedBlock)");
+
+    expect(races).toContain("getActiveUnlimitedChallengeForUser");
+    expect(races).toContain('challenge_type: "unlimited_goal"');
+
+    expect(coinsBattle).toContain("acquireOneChallengeLock(tx, userId)");
+    expect(coinsBattle).toContain('ne(raceRoomsTable.type, "sponsored")');
+    expect(coinsBattle).toContain("getUnlimitedBlockingMembership(tx, userId, { failOpen: false })");
+    expect(coinsBattle).toContain("oneChallengeAtATimeConflictBody(txUnlimitedBlock)");
   });
 });
 
@@ -158,6 +180,13 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
     expect(router).toContain("players,");
     expect(router).toContain("participants: players");
     const liveProgress = readFileSync("src/lib/unlimitedLiveProgress.ts", "utf8");
+    const detail = router.slice(
+      router.indexOf('router.get("/unlimited-challenges/:id"'),
+      router.indexOf("// ── POST /unlimited-challenges/:id/live-progress"),
+    );
+    expect(detail).toContain("participantCount: players.length");
+    expect(liveProgress).toContain("gt(unlimitedChallengeParticipantsTable.entryContributionCents, 0)");
+    expect(liveProgress).toContain("notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES])");
     expect(liveProgress).toContain("isCurrentUser: p.userId === currentUserId");
   });
 });

@@ -469,6 +469,7 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
     challenge: {
       ...serializeChallenge(challenge),
       challengeDayKey,
+      participantCount: players.length,
     },
     membership: membership ? { status: membership.status } : null,
     currentUserRegistered,
@@ -480,6 +481,7 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
     prospectiveTimezone: membership ? null : viewerTimezone,
     ...viewer,
     challengeDayKey,
+    participantCount: players.length,
     players,
     participants: players,
   });

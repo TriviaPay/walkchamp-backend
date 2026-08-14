@@ -298,6 +298,7 @@ export async function loadChallengePlayers(
     .where(
       and(
         eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
+        gt(unlimitedChallengeParticipantsTable.entryContributionCents, 0),
         notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
       ),
     )

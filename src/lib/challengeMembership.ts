@@ -1,4 +1,4 @@
-import { and, eq, ne, inArray, sql } from "drizzle-orm";
+import { and, eq, ne, inArray, notInArray, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import {
   raceRoomsTable,
@@ -9,6 +9,7 @@ import {
   unlimitedChallengesTable,
   unlimitedChallengeParticipantsTable,
 } from "../../db/src/schema/unlimitedChallenge.js";
+import { UNLIMITED_NON_ACTIVE_STATUSES } from "./unlimitedChallengeStatuses.js";
 import type { DbTx } from "./raceIntegrity.js";
 import { config } from "./config.js";
 import { logger } from "./logger.js";
@@ -68,8 +69,10 @@ export async function getRaceBlockingMembership(dbOrTx: DbOrTx, userId: string):
 export async function getUnlimitedBlockingMembership(
   dbOrTx: DbOrTx,
   userId: string,
-  excludeChallengeId?: string,
+  opts?: string | { excludeChallengeId?: string; failOpen?: boolean },
 ): Promise<BlockingMembership | null> {
+  const excludeChallengeId = typeof opts === "string" ? opts : opts?.excludeChallengeId;
+  const failOpen = typeof opts === "string" ? true : opts?.failOpen ?? true;
   // Feature off ⇒ no unlimited challenges exist to block against. Returning early also guarantees
   // this helper is a no-op on the existing race create/join paths when the flag is disabled (and
   // before the migration has run), so it can NEVER change or break existing race functionality.
@@ -81,13 +84,14 @@ export async function getUnlimitedBlockingMembership(
       .innerJoin(unlimitedChallengesTable, eq(unlimitedChallengeParticipantsTable.challengeId, unlimitedChallengesTable.id))
       .where(and(
         eq(unlimitedChallengeParticipantsTable.userId, userId),
-        ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+        notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
         inArray(unlimitedChallengesTable.status, ["waiting", "starting", "active", "settling"]),
       ))
       .limit(2);
     const hit = rows.find((r) => r.id !== excludeChallengeId);
     return hit ? { kind: "unlimited", id: hit.id, status: hit.status } : null;
   } catch (err) {
+    if (!failOpen) throw err;
     // Fail-open: a query error must never break the caller's create/join flow.
     logger.warn({ err, userId }, "[challengeMembership] unlimited blocking check failed (fail-open)");
     return null;

@@ -16,6 +16,7 @@ import { getCoinBalance } from "../lib/coinsService.js";
 import { requireFeatureEnabled } from "../middleware/requireFeatureEnabled.js";
 import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "../lib/raceIntegrity.js";
 import { setUserDefaultTrackTheme, validateThemeOwnership } from "./trackThemes.js";
+import { acquireOneChallengeLock, getUnlimitedBlockingMembership } from "../lib/challengeMembership.js";
 
 const router = Router();
 
@@ -30,8 +31,18 @@ router.use(
 const VALID_COIN_ENTRIES = [500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000];
 
 // ── Helper: is user already in an active race? ───────────────────────────────
-async function getActiveRaceForUser(userId: string) {
-  const [row] = await db
+type CoinsBattleDb = typeof db | Parameters<typeof acquireOneChallengeLock>[0];
+
+function oneChallengeAtATimeConflictBody(blocking: { kind: string; id: string; status: string }) {
+  return {
+    error: "You already have an active challenge.",
+    code: "one_challenge_at_a_time",
+    blocking,
+  };
+}
+
+async function getActiveRaceForUser(dbOrTx: CoinsBattleDb, userId: string) {
+  const [row] = await dbOrTx
     .select({ roomId: raceRoomsTable.id, roomStatus: raceRoomsTable.status })
     .from(raceRoomsTable)
     .innerJoin(
@@ -42,7 +53,10 @@ async function getActiveRaceForUser(userId: string) {
         inArray(raceParticipantsTable.status, ["joined", "active"]),
       ),
     )
-    .where(inArray(raceRoomsTable.status, ["open", "full", "in_progress"]))
+    .where(and(
+      inArray(raceRoomsTable.status, ["open", "full", "in_progress"]),
+      ne(raceRoomsTable.type, "sponsored"),
+    ))
     .limit(1);
   return row ?? null;
 }
@@ -84,7 +98,12 @@ router.post("/coins-battle/host", requireAuth, async (req, res) => {
     return res.status(403).json({ error: "You must unlock this track before hosting a challenge with it." });
   }
 
-  const alreadyActive = await getActiveRaceForUser(userId);
+  const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
+  if (unlimitedBlock) {
+    return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
+  }
+
+  const alreadyActive = await getActiveRaceForUser(db, userId);
   if (alreadyActive) {
     return res.status(409).json({
       success: false,
@@ -105,30 +124,65 @@ router.post("/coins-battle/host", requireAuth, async (req, res) => {
     });
   }
 
-  const [room] = await db
-    .insert(raceRoomsTable)
-    .values({
-      creatorId: userId,
-      title: "Coins Battle",
-      type: "quick",
-      entryType: "coins_battle",
-      entryAmountCents: 0,
-      coinEntryAmount,
-      coinPrizePool: 0,       // pool grows when coins are charged at race start
-      targetSteps,
-      maxPlayers,
-      currentPlayers: 1,
-      trackLayout,
-      isPrivate,
-      status: "open",
-      scheduleType: "now",
-    })
-    .returning();
+  let hostErrorStatus: number | null = null;
+  let hostErrorBody: Record<string, unknown> | null = null;
+  const result = await db.transaction(async (tx) => {
+    await acquireOneChallengeLock(tx, userId);
 
-  const [participant] = await db
-    .insert(raceParticipantsTable)
-    .values({ raceRoomId: room.id, userId, status: "joined" })
-    .returning();
+    const txUnlimitedBlock = await getUnlimitedBlockingMembership(tx, userId, { failOpen: false });
+    if (txUnlimitedBlock) {
+      hostErrorStatus = 409;
+      hostErrorBody = oneChallengeAtATimeConflictBody(txUnlimitedBlock);
+      return null;
+    }
+
+    const txAlreadyActive = await getActiveRaceForUser(tx, userId);
+    if (txAlreadyActive) {
+      hostErrorStatus = 409;
+      hostErrorBody = {
+        success: false,
+        code: "ACTIVE_RACE_EXISTS",
+        message: "You are already in an active race.",
+        active_race_id: txAlreadyActive.roomId,
+      };
+      return null;
+    }
+
+    const [room] = await tx
+      .insert(raceRoomsTable)
+      .values({
+        creatorId: userId,
+        title: "Coins Battle",
+        type: "quick",
+        entryType: "coins_battle",
+        entryAmountCents: 0,
+        coinEntryAmount,
+        coinPrizePool: 0,       // pool grows when coins are charged at race start
+        targetSteps,
+        maxPlayers,
+        currentPlayers: 1,
+        trackLayout,
+        isPrivate,
+        status: "open",
+        scheduleType: "now",
+      })
+      .returning();
+
+    const [participant] = await tx
+      .insert(raceParticipantsTable)
+      .values({ raceRoomId: room.id, userId, status: "joined" })
+      .returning();
+
+    return { room, participant };
+  });
+
+  if (hostErrorStatus !== null && hostErrorBody) {
+    return res.status(hostErrorStatus).json(hostErrorBody);
+  }
+  if (!result) {
+    return res.status(409).json({ error: "Unable to create Coins Battle room." });
+  }
+  const { room, participant } = result;
 
   logger.info({ raceId: room.id, userId, coinEntryAmount, maxPlayers }, "[CoinsBattle] room created (coins held until start)");
 
@@ -180,7 +234,12 @@ router.post("/coins-battle/:id/join", requireAuth, async (req, res) => {
   if (room.status !== "open") return res.status(409).json({ error: "Room is not open for joining", code: "ROOM_NOT_OPEN" });
   if (room.currentPlayers >= room.maxPlayers) return res.status(409).json({ error: "Room is full", code: "ROOM_FULL" });
 
-  const alreadyActive = await getActiveRaceForUser(userId);
+  const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
+  if (unlimitedBlock) {
+    return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
+  }
+
+  const alreadyActive = await getActiveRaceForUser(db, userId);
   if (alreadyActive) {
     return res.status(409).json({
       success: false,
@@ -210,9 +269,11 @@ router.post("/coins-battle/:id/join", requireAuth, async (req, res) => {
   } | null = null;
   let newPlayerCount = room.currentPlayers;
   let joinErrorStatus: number | null = null;
-  let joinErrorBody: Record<string, string> | null = null;
+  let joinErrorBody: Record<string, unknown> | null = null;
 
   await db.transaction(async (tx) => {
+    await acquireOneChallengeLock(tx, userId);
+
     const lockedRoom = await lockRaceRoom(tx, raceId);
     if (!lockedRoom) {
       joinErrorStatus = 404;
@@ -232,6 +293,24 @@ router.post("/coins-battle/:id/join", requireAuth, async (req, res) => {
     if (lockedRoom.currentPlayers >= lockedRoom.maxPlayers) {
       joinErrorStatus = 409;
       joinErrorBody = { error: "Room is full", code: "ROOM_FULL" };
+      return;
+    }
+    const txUnlimitedBlock = await getUnlimitedBlockingMembership(tx, userId, { failOpen: false });
+    if (txUnlimitedBlock) {
+      joinErrorStatus = 409;
+      joinErrorBody = oneChallengeAtATimeConflictBody(txUnlimitedBlock);
+      return;
+    }
+
+    const txAlreadyActive = await getActiveRaceForUser(tx, userId);
+    if (txAlreadyActive) {
+      joinErrorStatus = 409;
+      joinErrorBody = {
+        success: false,
+        code: "ACTIVE_RACE_EXISTS",
+        message: "You are already in an active race.",
+        active_race_id: txAlreadyActive.roomId,
+      };
       return;
     }
 

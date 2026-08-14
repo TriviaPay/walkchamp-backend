@@ -2226,6 +2226,14 @@ function sponsoredEventRegistrationConflictBody(row: SponsoredEventRegistrationR
   };
 }
 
+function oneChallengeAtATimeConflictBody(blocking: { kind: string; id: string; status: string }) {
+  return {
+    error: "You already have an active challenge.",
+    code: "one_challenge_at_a_time",
+    blocking,
+  };
+}
+
 function activeRacePayload(
   row: RegularRaceRegistrationRow,
   userId: string,
@@ -2252,19 +2260,91 @@ function activeRacePayload(
   };
 }
 
+async function getActiveUnlimitedChallengeForUser(userId: string) {
+  const [row] = await db
+    .select({
+      id: unlimitedChallengesTable.id,
+      title: unlimitedChallengesTable.title,
+      entryFeeCents: unlimitedChallengesTable.entryFeeCents,
+      dailyGoalSteps: unlimitedChallengesTable.dailyGoalSteps,
+      status: unlimitedChallengesTable.status,
+      hostUserId: unlimitedChallengesTable.hostUserId,
+      paidParticipantCount: unlimitedChallengesTable.paidParticipantCount,
+      startAtUtc: unlimitedChallengesTable.startAtUtc,
+      startedAtUtc: unlimitedChallengesTable.startedAtUtc,
+      challengeEndAtUtc: unlimitedChallengesTable.challengeEndAtUtc,
+      participantCurrentSteps: sql<number | null>`0`,
+      participantBaselineSteps: sql<number | null>`0`,
+    })
+    .from(unlimitedChallengeParticipantsTable)
+    .innerJoin(unlimitedChallengesTable, eq(unlimitedChallengesTable.id, unlimitedChallengeParticipantsTable.challengeId))
+    .where(and(
+      eq(unlimitedChallengeParticipantsTable.userId, userId),
+      notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
+      inArray(unlimitedChallengesTable.status, ["waiting", "starting", "active", "settling"]),
+    ))
+    .orderBy(desc(unlimitedChallengesTable.startAtUtc))
+    .limit(1);
+
+  return row ?? null;
+}
+
+function activeUnlimitedPayload(
+  row: NonNullable<Awaited<ReturnType<typeof getActiveUnlimitedChallengeForUser>>>,
+  userId: string,
+  trackTheme: TrackThemeMedia = buildTrackThemeMedia("bg"),
+) {
+  const live = row.status === "active" || row.status === "starting" || row.status === "settling";
+  const startedAt = live ? (row.startedAtUtc ?? row.startAtUtc) : null;
+  return {
+    room_id: row.id,
+    room_status: live ? "in_progress" : "open",
+    room_type: "unlimited",
+    is_sponsored: false,
+    challenge_type: "unlimited_goal",
+    entry_fee: row.entryFeeCents / 100,
+    entry_fee_cents: row.entryFeeCents,
+    target_steps: row.dailyGoalSteps,
+    current_user_role: row.hostUserId === userId ? "host" : "participant",
+    can_leave: true,
+    next_screen: live ? "race_track" : "waiting_room",
+    track_layout: "bg",
+    trackLayout: "bg",
+    trackTheme,
+    capacity_mode: "unlimited",
+    max_players: null,
+    current_players: row.paidParticipantCount,
+    started_at: startedAt?.toISOString() ?? null,
+    scheduled_start_at: row.startAtUtc?.toISOString() ?? null,
+    challenge_end_at: row.challengeEndAtUtc?.toISOString() ?? null,
+    participant_current_steps: row.participantCurrentSteps ?? 0,
+    participant_baseline_steps: row.participantBaselineSteps ?? 0,
+  };
+}
+
 // ── GET /api/races/current-active ─────────────────────────────────────────────
 // Returns the caller's currently active race participation, if any.
 router.get("/races/current-active", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const active = await getActiveRaceForUser(userId);
-  if (!active) {
+  if (active) {
+    const mediaMap = await getTrackThemeMediaMap([active.trackLayout]);
+    return res.json({
+      success: true,
+      has_active_race: true,
+      active_race: activeRacePayload(active, userId, trackThemeForCode(active.trackLayout, mediaMap)),
+    });
+  }
+
+  const unlimited = await getActiveUnlimitedChallengeForUser(userId);
+  if (!unlimited) {
     return res.json({ success: true, has_active_race: false, active_race: null });
   }
-  const mediaMap = await getTrackThemeMediaMap([active.trackLayout]);
+  const mediaMap = await getTrackThemeMediaMap(["bg"]);
   return res.json({
     success: true,
     has_active_race: true,
-    active_race: activeRacePayload(active, userId, trackThemeForCode(active.trackLayout, mediaMap)),
+    active_race: activeUnlimitedPayload(unlimited, userId, trackThemeForCode("bg", mediaMap)),
   });
 });
 
@@ -2881,6 +2961,13 @@ router.post("/rooms/:roomId/register", requireAuth, async (req, res) => {
       return;
     }
     if (room.type !== "sponsored") {
+      const unlimitedBlock = await getUnlimitedBlockingMembership(tx, userId, { failOpen: false });
+      if (unlimitedBlock) {
+        errorStatus = 409;
+        errorBody = oneChallengeAtATimeConflictBody(unlimitedBlock);
+        return;
+      }
+
       const existingRegularRace = await getRegularRaceRegistrationForUser(tx, userId, roomId);
       if (existingRegularRace) {
         errorStatus = 409;
@@ -3369,12 +3456,7 @@ router.post("/races/host", requireAuth, async (req, res) => {
   {
     // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
     const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
-    if (unlimitedBlock) return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
-  }
-  // One-blocking-challenge also spans Unlimited Challenges.
-  const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
-  if (unlimitedBlock) {
-    return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
+    if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
   }
 
   // For paid races validate eligibility
@@ -3448,8 +3530,11 @@ router.post("/races/host", requireAuth, async (req, res) => {
 
   let scheduledCreateConflict: FutureScheduledRoomRow | null = null;
   let createConflict: RegularRaceRegistrationRow | null = null;
+  let unlimitedCreateBlock: Awaited<ReturnType<typeof getUnlimitedBlockingMembership>> = null;
   const result = await db.transaction(async (tx) => {
     await lockRegularRaceRegistrationForUser(tx, userId);
+    unlimitedCreateBlock = await getUnlimitedBlockingMembership(tx, userId, { failOpen: false });
+    if (unlimitedCreateBlock) return null;
     if (isScheduledFuture) {
       scheduledCreateConflict = await getActiveFutureScheduledRoomForUser(tx, userId);
       if (scheduledCreateConflict) return null;
@@ -3517,6 +3602,9 @@ router.post("/races/host", requireAuth, async (req, res) => {
 
   if (scheduledCreateConflict) {
     return res.status(409).json(futureRoomCreationConflictBody(scheduledCreateConflict, userId));
+  }
+  if (unlimitedCreateBlock) {
+    return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedCreateBlock));
   }
   if (createConflict) {
     return res.status(409).json(regularRaceRegistrationConflictBody(createConflict, userId));
@@ -4616,14 +4704,14 @@ router.post("/races", requireAuth, async (req, res) => {
     return res.status(403).json({ error: "You must unlock this track before hosting a challenge with it." });
   }
 
-  const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId);
-  if (existingRegularRace) {
-    return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
-  }
-  {
+  if (data.type !== "sponsored") {
+    const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId);
+    if (existingRegularRace) {
+      return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
+    }
     // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
     const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
-    if (unlimitedBlock) return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
+    if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
   }
 
   if (amountCents > 0) {
@@ -4644,10 +4732,15 @@ router.post("/races", requireAuth, async (req, res) => {
   const inviteCode = data.isPrivate ? await allocateRoomCode() : null;
 
   let createConflict: RegularRaceRegistrationRow | null = null;
+  let unlimitedCreateBlock: Awaited<ReturnType<typeof getUnlimitedBlockingMembership>> = null;
   const [room] = await db.transaction(async (tx) => {
     await lockRegularRaceRegistrationForUser(tx, userId);
-    createConflict = await getRegularRaceRegistrationForUser(tx, userId);
-    if (createConflict) return [];
+    if (data.type !== "sponsored") {
+      unlimitedCreateBlock = await getUnlimitedBlockingMembership(tx, userId, { failOpen: false });
+      if (unlimitedCreateBlock) return [];
+      createConflict = await getRegularRaceRegistrationForUser(tx, userId);
+      if (createConflict) return [];
+    }
 
     return tx
       .insert(raceRoomsTable)
@@ -4673,6 +4766,9 @@ router.post("/races", requireAuth, async (req, res) => {
   // New open-window room → its 30-minute expiry may be the earliest due work.
   void invalidateSchedulerGate();
 
+  if (unlimitedCreateBlock) {
+    return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedCreateBlock));
+  }
   if (createConflict) {
     return res.status(409).json(regularRaceRegistrationConflictBody(createConflict, userId));
   }
@@ -4713,7 +4809,7 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
   {
     // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
     const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
-    if (unlimitedBlock) return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
+    if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
   }
 
   const [profile] = await db
@@ -4743,12 +4839,15 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
   let targetRoomId: string | null = null;
   let participant: typeof raceParticipantsTable.$inferSelect | null = null;
   let joinedRoom: typeof raceRoomsTable.$inferSelect | null = null;
+  let unlimitedJoinBlock: Awaited<ReturnType<typeof getUnlimitedBlockingMembership>> = null;
 
   for (const room of openRooms) {
     let joined = false;
 
     await db.transaction(async (tx) => {
       await lockRegularRaceRegistrationForUser(tx, userId);
+      unlimitedJoinBlock = await getUnlimitedBlockingMembership(tx, userId, { failOpen: false });
+      if (unlimitedJoinBlock) return;
       const conflict = await getRegularRaceRegistrationForUser(tx, userId, room.id);
       if (conflict) return;
 
@@ -4779,13 +4878,20 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
       joined = true;
     });
 
-    if (joined) break;
+    if (unlimitedJoinBlock || joined) break;
+  }
+
+  if (unlimitedJoinBlock) {
+    return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedJoinBlock));
   }
 
   if (!targetRoomId || !participant || !joinedRoom) {
     let createConflict: RegularRaceRegistrationRow | null = null;
+    let unlimitedCreateBlock: Awaited<ReturnType<typeof getUnlimitedBlockingMembership>> = null;
     const created = await db.transaction(async (tx) => {
       await lockRegularRaceRegistrationForUser(tx, userId);
+      unlimitedCreateBlock = await getUnlimitedBlockingMembership(tx, userId, { failOpen: false });
+      if (unlimitedCreateBlock) return null;
       createConflict = await getRegularRaceRegistrationForUser(tx, userId);
       if (createConflict) return null;
 
@@ -4817,6 +4923,9 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
     // New open-window room → its 30-minute expiry may be the earliest due work.
     void invalidateSchedulerGate();
 
+    if (unlimitedCreateBlock) {
+      return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedCreateBlock));
+    }
     if (createConflict) {
       return res.status(409).json(regularRaceRegistrationConflictBody(createConflict, userId));
     }
@@ -4852,7 +4961,7 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
   {
     // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
     const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
-    if (unlimitedBlock) return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
+    if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
   }
 
   const [room] = await db
@@ -4935,6 +5044,13 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
         return;
       }
       if (lockedRoom.type !== "sponsored") {
+        const unlimitedBlock = await getUnlimitedBlockingMembership(tx, userId, { failOpen: false });
+        if (unlimitedBlock) {
+          joinErrorStatus = 409;
+          joinErrorBody = oneChallengeAtATimeConflictBody(unlimitedBlock);
+          return;
+        }
+
         const conflict = await getRegularRaceRegistrationForUser(tx, userId, raceId);
         if (conflict) {
           joinErrorStatus = 409;
@@ -5023,11 +5139,6 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
   if (existingRegularRace) {
     return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
-  {
-    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
-    const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
-    if (unlimitedBlock) return res.status(409).json({ error: "You already have an active challenge.", code: "one_challenge_at_a_time", blocking: unlimitedBlock });
-  }
 
   const [room] = await db
     .select()
@@ -5042,6 +5153,11 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
         ? "Use the payment API to join paid races."
         : "Cash races are disabled for this build.",
     });
+  }
+  if (room.type !== "sponsored") {
+    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
+    if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
   }
 
   if (room.type === "country_battle" && room.teamACountryCode && room.teamBCountryCode) {
@@ -5091,6 +5207,13 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
       return;
     }
     if (lockedRoom.type !== "sponsored") {
+      const unlimitedBlock = await getUnlimitedBlockingMembership(tx, userId, { failOpen: false });
+      if (unlimitedBlock) {
+        joinErrorStatus = 409;
+        joinErrorBody = oneChallengeAtATimeConflictBody(unlimitedBlock);
+        return;
+      }
+
       const conflict = await getRegularRaceRegistrationForUser(tx, userId, raceId);
       if (conflict) {
         joinErrorStatus = 409;
@@ -5222,9 +5345,14 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
     return res.status(409).json({ success: false, code: "ROOM_FULL", error: "This room is full." });
   }
 
-  const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId, room.id);
-  if (existingRegularRace) {
-    return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
+  if (room.type !== "sponsored") {
+    const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
+    if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
+
+    const existingRegularRace = await getRegularRaceRegistrationForUser(db, userId, room.id);
+    if (existingRegularRace) {
+      return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
+    }
   }
 
   // Check existing participation
@@ -5380,6 +5508,13 @@ router.post("/races/join-with-code", requireAuth, async (req, res) => {
         return;
       }
       if (lockedRoom.type !== "sponsored") {
+        const unlimitedBlock = await getUnlimitedBlockingMembership(tx, userId, { failOpen: false });
+        if (unlimitedBlock) {
+          joinErrorStatus = 409;
+          joinErrorBody = oneChallengeAtATimeConflictBody(unlimitedBlock);
+          return;
+        }
+
         const conflict = await getRegularRaceRegistrationForUser(tx, userId, lockedRoom.id);
         if (conflict) {
           joinErrorStatus = 409;
