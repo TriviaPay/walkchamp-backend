@@ -174,7 +174,7 @@ describe("guardrails that must not have moved", () => {
   });
 
   it("comments and reactions still check membership", () => {
-    expect(route).toContain('notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, ["left", "disqualified"])');
+    expect(route).toContain("notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES])");
     expect(route.split("isUnlimitedChatParticipant(userId, challengeId)").length - 1).toBe(2);
   });
 

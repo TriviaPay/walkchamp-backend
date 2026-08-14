@@ -1,6 +1,6 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
-import { and, asc, desc, eq, gt, inArray, lte, ne, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lte, notInArray, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { profilesTable } from "../../db/src/schema/profiles.js";
 import { liveRaceCommentsTable, liveRaceReactionsTable } from "../../db/src/schema/liveRace.js";
@@ -19,6 +19,7 @@ import {
   leaveUnlimitedChallenge,
   UNLIMITED_OPEN_STATUSES,
 } from "../lib/unlimitedChallengeService.js";
+import { UNLIMITED_NON_ACTIVE_STATUSES } from "../lib/unlimitedChallengeStatuses.js";
 import {
   loadActiveDayProgressByChallenge,
   loadChallengePlayers,
@@ -139,10 +140,16 @@ async function overlayMembership(
   const statusByChallenge = new Map(memberships.map((m) => [m.challengeId, m.status]));
   return rows.map((c) => {
     const status = statusByChallenge.get(c.id) ?? null;
+    const currentUserRegistered =
+      status != null
+      && !UNLIMITED_NON_ACTIVE_STATUSES.includes(
+        status as typeof UNLIMITED_NON_ACTIVE_STATUSES[number],
+      );
     return {
       ...serializeChallenge(c),
       participationStatus: status,
-      currentUserRegistered: status != null && status !== "left",
+      currentUserRegistered,
+      current_user_registered: currentUserRegistered,
     };
   });
 }
@@ -293,6 +300,7 @@ router.post("/unlimited-challenges/:id/leave", requireAuth, async (req, res) => 
     participationStatus: "left",
     participantStatus: "left",
     currentUserRegistered: false,
+    current_user_registered: false,
     prizeEligible: false,
     refundEligible: result.data.refundIssued,
     refundIssued: result.data.refundIssued,
@@ -363,7 +371,7 @@ router.get("/unlimited-challenges/my-active", requireAuth, async (req, res) => {
     .where(
       and(
         eq(unlimitedChallengeParticipantsTable.userId, userId),
-        ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+        notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
         inArray(unlimitedChallengesTable.status, [...UNLIMITED_OPEN_STATUSES]),
       ),
     )
@@ -452,13 +460,19 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
     players.find((p) => p.userId === userId)?.challengeDayKey ??
     players.find((p) => p.challengeDayKey)?.challengeDayKey ??
     null;
+  const currentUserRegistered =
+    !!membership
+    && !UNLIMITED_NON_ACTIVE_STATUSES.includes(
+      membership.status as typeof UNLIMITED_NON_ACTIVE_STATUSES[number],
+    );
   return res.json({
     challenge: {
       ...serializeChallenge(challenge),
       challengeDayKey,
     },
     membership: membership ? { status: membership.status } : null,
-    currentUserRegistered: !!membership && membership.status !== "left",
+    currentUserRegistered,
+    current_user_registered: currentUserRegistered,
     canJoin,
     // What a non-member would get if they joined right now — lets the client show a real date
     // instead of the host's.
@@ -790,7 +804,7 @@ async function isUnlimitedChatParticipant(userId: string, challengeId: string): 
     .where(and(
       eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
       eq(unlimitedChallengeParticipantsTable.userId, userId),
-      notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, ["left", "disqualified"]),
+      notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
     ))
     .limit(1);
   return Boolean(row);
@@ -952,7 +966,12 @@ router.get("/unlimited-challenges/:id/leaderboard", requireAuth, async (req, res
     .from(unlimitedChallengeParticipantsTable)
     .leftJoin(unlimitedChallengeDaysTable, eq(unlimitedChallengeDaysTable.participantId, unlimitedChallengeParticipantsTable.id))
     .leftJoin(profilesTable, eq(profilesTable.id, unlimitedChallengeParticipantsTable.userId))
-    .where(and(eq(unlimitedChallengeParticipantsTable.challengeId, challengeId), ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left")))
+    .where(
+      and(
+        eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
+        notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
+      ),
+    )
     .groupBy(
       unlimitedChallengeParticipantsTable.id,
       unlimitedChallengeParticipantsTable.userId,

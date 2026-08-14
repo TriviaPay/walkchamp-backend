@@ -14,6 +14,7 @@ import {
   type SessionErrorCode,
   type DeviceInfo,
 } from "../lib/sessionService.js";
+import { normalizeCountryCode } from "../lib/country.js";
 import { z } from "zod";
 
 const SESSION_STATUS_MESSAGES: Record<SessionErrorCode, string> = {
@@ -351,7 +352,7 @@ router.post("/auth/profile", requireJwtOnly, async (req, res) => {
         username: data.username.toLowerCase().trim(),
         dateOfBirth: dob.normalized,
         country: data.country,
-        countryCode: data.countryCode,
+        countryCode: normalizeCountryCode(data.countryCode),
         countryFlag: data.countryFlag,
         region: data.region,
         authProvider: data.authProvider,
@@ -532,7 +533,7 @@ router.post("/auth/complete-signup", requireJwtOnly, async (req, res) => {
           username: data.username.toLowerCase().trim(),
           dateOfBirth: dob.normalized,
           country: data.country,
-          countryCode: data.countryCode,
+          countryCode: normalizeCountryCode(data.countryCode),
           countryFlag: data.countryFlag,
           region: data.region,
           authProvider: "email_password",

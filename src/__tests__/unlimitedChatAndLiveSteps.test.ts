@@ -71,8 +71,8 @@ describe("chat membership is checked against unlimited participants", () => {
     expect(chatBlock).not.toContain("raceParticipantsTable");
   });
 
-  it("excludes left and disqualified participants", () => {
-    expect(chatBlock).toContain('notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, ["left", "disqualified"])');
+  it("excludes inactive participants", () => {
+    expect(chatBlock).toContain("notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES])");
   });
 
   it("refuses non-participants on both write endpoints", () => {

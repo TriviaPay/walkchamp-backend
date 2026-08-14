@@ -96,6 +96,12 @@ export function isRejectedDailySource(source: string | null): boolean {
   return !KNOWN_SOURCES.has(s);
 }
 
+/** Sources rejected specifically from canonical daily totals / leaderboards. */
+export function isRejectedForDailyTotals(source: string | null): boolean {
+  const s = normalizeSource(source);
+  return isRejectedDailySource(s) || isProvisionalLiveSource(s) || s === "simulation";
+}
+
 /** Per-session daily classification driving step_sessions.is_verified_source. */
 export function classifyDailySource(source: string | null): "verified" | "unverified" {
   return isVerifiedDailySource(source) ? "verified" : "unverified";

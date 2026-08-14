@@ -1100,13 +1100,26 @@ router.post("/groups/steps/sync", requireAuth, async (req, res) => {
   const parsed = stepSyncSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid payload" });
 
-  const { dailySteps, verifiedSteps, stepDate, calories, distanceMeters } = parsed.data;
+  const { stepDate } = parsed.data;
 
   // Reject backdated / future step dates (±1 day for timezone skew) to prevent
   // rewriting historical group stats.
   const dv = validateRecentLocalDate(stepDate, { pastDays: 1, futureDays: 1 });
   if (!dv.ok) return res.status(400).json({ error: "Step date is out of the allowed range.", code: dv.code });
-  req.log.info({ userId, dailySteps, stepDate }, "[Groups] step sync");
+  req.log.info({ userId, stepDate }, "[Groups] step sync");
+
+  const [canonicalDay] = await db
+    .select({
+      steps: stepDailyTotalsTable.steps,
+      distanceMeters: stepDailyTotalsTable.distanceMeters,
+      caloriesBurned: stepDailyTotalsTable.caloriesBurned,
+      sourceClass: stepDailyTotalsTable.sourceClass,
+    })
+    .from(stepDailyTotalsTable)
+    .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, dv.normalized)))
+    .limit(1);
+  const dailySteps = canonicalDay?.steps ?? 0;
+  const verifiedSteps = canonicalDay?.sourceClass === "verified" ? dailySteps : 0;
 
   // Find all active groups for this user
   const memberships = await db
@@ -1131,11 +1144,11 @@ router.post("/groups/steps/sync", requireAuth, async (req, res) => {
       .values({
         groupId: group.id,
         userId,
-        stepDate,
+        stepDate: dv.normalized,
         dailySteps,
-        verifiedSteps: verifiedSteps ?? dailySteps,
-        calories: calories?.toString() ?? null,
-        distanceMeters: distanceMeters?.toString() ?? null,
+        verifiedSteps,
+        calories: canonicalDay?.caloriesBurned?.toString() ?? null,
+        distanceMeters: canonicalDay?.distanceMeters?.toString() ?? null,
         lastSyncedAt: now,
       })
       .onConflictDoUpdate({
@@ -1145,17 +1158,17 @@ router.post("/groups/steps/sync", requireAuth, async (req, res) => {
           walkingGroupDailyStepsTable.stepDate,
         ],
         set: {
-          dailySteps,
-          verifiedSteps: verifiedSteps ?? dailySteps,
-          calories: calories?.toString() ?? null,
-          distanceMeters: distanceMeters?.toString() ?? null,
+          dailySteps: sql`GREATEST(${walkingGroupDailyStepsTable.dailySteps}, ${dailySteps})`,
+          verifiedSteps: sql`GREATEST(${walkingGroupDailyStepsTable.verifiedSteps}, ${verifiedSteps})`,
+          calories: canonicalDay?.caloriesBurned?.toString() ?? null,
+          distanceMeters: canonicalDay?.distanceMeters?.toString() ?? null,
           lastSyncedAt: now,
           updatedAt: now,
         },
       });
 
     // Broadcast update (fire-and-forget)
-    broadcastGroupSteps(group.id, stepDate).catch(() => {});
+    broadcastGroupSteps(group.id, dv.normalized).catch(() => {});
   }
 
   return res.json({ success: true, updatedGroups: activeGroups.length });

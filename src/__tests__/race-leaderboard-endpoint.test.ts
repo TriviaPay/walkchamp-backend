@@ -4,11 +4,13 @@ import leaderboardRouter from "../routes/leaderboard.js";
 
 const mocks = vi.hoisted(() => ({
   select: vi.fn(),
+  execute: vi.fn(),
 }));
 
 vi.mock("../../db/src/index.js", () => ({
   db: {
     select: mocks.select,
+    execute: mocks.execute,
   },
 }));
 
@@ -18,18 +20,6 @@ vi.mock("../middleware/requireAuth.js", () => ({
     next();
   },
 }));
-
-function queryReturning<T>(rows: T[]) {
-  const query = {
-    from: vi.fn(() => query),
-    innerJoin: vi.fn(() => query),
-    where: vi.fn(() => query),
-    groupBy: vi.fn(() => query),
-    orderBy: vi.fn(() => query),
-    limit: vi.fn(async () => rows),
-  };
-  return query;
-}
 
 async function getJson(path: string) {
   const app = express();
@@ -59,32 +49,36 @@ describe("GET /api/leaderboard/races", () => {
   });
 
   it("returns combined top-3 race wins from the endpoint response", async () => {
-    mocks.select.mockReturnValueOnce(queryReturning([
+    mocks.execute.mockResolvedValueOnce({ rows: [
       {
         id: "user-1",
         username: "runner_one",
-        fullName: "Runner One",
+        full_name: "Runner One",
         country: "US",
-        countryCode: "US",
-        countryFlag: "🇺🇸",
-        avatarColor: "#00E676",
-        avatarUrl: null,
-        updatedAt: new Date("2026-07-18T00:00:00Z"),
+        country_code: "US",
+        country_flag: "🇺🇸",
+        avatar_color: "#00E676",
+        avatar_url: null,
+        updated_at: new Date("2026-07-18T00:00:00Z"),
         wins: 3,
+        total_winning_cents: 2500,
+        rank: 1,
       },
       {
         id: "user-2",
         username: "runner_two",
-        fullName: "Runner Two",
+        full_name: "Runner Two",
         country: "US",
-        countryCode: "US",
-        countryFlag: "🇺🇸",
-        avatarColor: "#00B4FF",
-        avatarUrl: null,
-        updatedAt: new Date("2026-07-18T00:00:00Z"),
+        country_code: "US",
+        country_flag: "🇺🇸",
+        avatar_color: "#00B4FF",
+        avatar_url: null,
+        updated_at: new Date("2026-07-18T00:00:00Z"),
         wins: 2,
+        total_winning_cents: 0,
+        rank: 2,
       },
-    ]));
+    ] });
 
     const { status, json } = await getJson("/api/leaderboard/races");
 
@@ -97,6 +91,7 @@ describe("GET /api/leaderboard/races", () => {
           id: "user-1",
           username: "runner_one",
           wins: 3,
+          totalWinning: 25,
           rank: 1,
         },
         {

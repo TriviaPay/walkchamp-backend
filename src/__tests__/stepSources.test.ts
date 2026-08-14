@@ -5,6 +5,7 @@ import {
   isProvisionalLiveSource,
   isRaceVerificationSource,
   isRejectedDailySource,
+  isRejectedForDailyTotals,
   classifyDailySource,
   rollUpDailySourceClass,
   toLiveStepSource,
@@ -83,6 +84,18 @@ describe("rejected daily sources (safe ignore)", () => {
     expect(isRejectedDailySource("healthkit")).toBe(false);
     expect(isRejectedDailySource("android_step_counter")).toBe(false);
     expect(isRejectedDailySource("simulation")).toBe(false); // handled by race anti-cheat, not rejected here
+  });
+});
+
+describe("rejected canonical daily totals", () => {
+  it("keeps simulation out of daily totals while leaving the generic classifier unchanged", () => {
+    expect(isRejectedDailySource("simulation")).toBe(false);
+    expect(isRejectedForDailyTotals("simulation")).toBe(true);
+  });
+
+  it("also rejects provisional live sensors from daily totals", () => {
+    expect(isRejectedForDailyTotals("android_step_counter")).toBe(true);
+    expect(isRejectedForDailyTotals("ios_pedometer")).toBe(true);
   });
 });
 

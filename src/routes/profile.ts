@@ -24,6 +24,9 @@ import { buildGeneratedObjectKey, validateRasterUpload } from "../lib/uploadPoli
 import { sanitizePlainText } from "../lib/text.js";
 import { config } from "../lib/config.js";
 import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit.js";
+import { normalizeCountryCode } from "../lib/country.js";
+import { isRewardedRaceWinResult } from "../lib/leaderboardPredicates.js";
+import { fetchTotalRaceWinningsCents } from "../lib/raceWinnings.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -97,7 +100,7 @@ function computeXP(totalSteps: number, raceResults: { rank: number; prizeCents: 
 }
 
 function isRaceWinResult(r: { rank: number | null | undefined; eligibleForPrize?: boolean }): boolean {
-  return r.rank === 1 && r.eligibleForPrize !== false;
+  return isRewardedRaceWinResult(r);
 }
 
 function isRacePodiumRank(rank: number | null | undefined): boolean {
@@ -197,6 +200,7 @@ router.get("/profile/me", requireAuth, async (req, res) => {
     challengeHistResult,
     stepSourceResult,
     rankCountResult,
+    totalWinningResult,
   ] = await Promise.allSettled([
     db.select({ steps: stepDailyTotalsTable.steps })
       .from(stepDailyTotalsTable)
@@ -250,6 +254,7 @@ router.get("/profile/me", requireAuth, async (req, res) => {
         gt(profilesTable.totalSteps, p.totalSteps ?? 0),
         notInArray(profilesTable.accountStatus, ["banned", "deleted"]),
       )),
+    fetchTotalRaceWinningsCents(db, userId),
   ]);
 
   // Safely unwrap each settled result with a fallback
@@ -261,9 +266,10 @@ router.get("/profile/me", requireAuth, async (req, res) => {
   const challengeHistRows  = challengeHistResult.status === "fulfilled" ? challengeHistResult.value : [];
   const stepSourceRows     = stepSourceResult.status   === "fulfilled" ? stepSourceResult.value   : [];
   const rankCountRows      = rankCountResult.status    === "fulfilled" ? rankCountResult.value    : [];
+  const totalWinningCents  = totalWinningResult.status === "fulfilled" ? totalWinningResult.value : 0;
 
   // Log any query failures for debugging without crashing
-  [todayResult, allRaceResult, activeTitleResult, streakResult, coinBalResult, challengeHistResult, stepSourceResult, rankCountResult]
+  [todayResult, allRaceResult, activeTitleResult, streakResult, coinBalResult, challengeHistResult, stepSourceResult, rankCountResult, totalWinningResult]
     .forEach((r, i) => { if (r.status === "rejected") req.log.warn({ i, err: String(r.reason) }, "profile query partial failure"); });
 
   const w              = wallets[0];
@@ -334,6 +340,7 @@ router.get("/profile/me", requireAuth, async (req, res) => {
         winRate,
         coinsEarned:  coinBalRows[0]?.lifetimeEarned ?? 0,
         globalRank:   (rankCountRows[0]?.cnt ?? 0) + 1,
+        totalWinning:  totalWinningCents / 100,
       },
       wallet: {
         availableBalance:    (w?.availableBalanceCents    ?? 0) / 100,
@@ -419,7 +426,7 @@ router.put("/profile/me", requireAuth, async (req, res) => {
   if (updates.fullName    !== undefined) patch.fullName    = sanitizePlainText(updates.fullName);
   if (updates.username    !== undefined) patch.username    = updates.username;
   if (updates.country     !== undefined) patch.country     = sanitizePlainText(updates.country);
-  if (updates.countryCode !== undefined) patch.countryCode = sanitizePlainText(updates.countryCode);
+  if (updates.countryCode !== undefined) patch.countryCode = normalizeCountryCode(updates.countryCode);
   if (updates.countryFlag !== undefined) patch.countryFlag = sanitizePlainText(updates.countryFlag);
   if (updates.bio         !== undefined) patch.bio         = sanitizePlainText(updates.bio);
   if (updates.avatarColor !== undefined) patch.avatarColor = updates.avatarColor;
@@ -607,6 +614,7 @@ router.get("/profile/public/:username", async (req, res) => {
   ]);
 
   const pubAllTime = Number(pubAllTimeRow?.total ?? 0);
+  const pubTotalWinningCents = await fetchTotalRaceWinningsCents(db, p.id).catch(() => 0);
   const lifetimeXP = computeXP(pubAllTime, raceRows);
   const levelData  = computeLevelData(lifetimeXP);
   // No caller context on this unauthenticated route, so anchor the streak to the profile owner's
@@ -631,6 +639,7 @@ router.get("/profile/public/:username", async (req, res) => {
         totalRaces:      raceRows.length,
         racesWon:        raceRows.filter(isRaceWinResult).length,
         top3Finishes:    raceRows.filter((r) => isRacePodiumRank(r.rank)).length,
+        totalWinning:     pubTotalWinningCents / 100,
       },
     },
   });
@@ -660,7 +669,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
 
   if (!p) return res.status(404).json({ error: "User not found" });
 
-  const [raceRows, titleRow, friendRow, reqRow, coinRow, cashWonRow] = await Promise.all([
+  const [raceRows, titleRow, friendRow, reqRow, coinRow, totalWinningCents] = await Promise.all([
     db.select({ rank: raceResultsTable.rank, eligibleForPrize: raceResultsTable.eligibleForPrize })
       .from(raceResultsTable)
       .where(eq(raceResultsTable.userId, targetId)),
@@ -691,14 +700,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
       .where(eq(coinBalancesTable.userId, targetId))
       .limit(1)
       .then((r) => r[0] ?? null),
-    db.select({ totalCashWonCents: sql<number>`COALESCE(SUM(${raceResultsTable.prizeCents}), 0)::int` })
-      .from(raceResultsTable)
-      .innerJoin(raceRoomsTable, sql`${raceResultsTable.raceRoomId}::uuid = ${raceRoomsTable.id}`)
-      .where(and(
-        eq(raceResultsTable.userId, targetId),
-        gt(raceRoomsTable.entryAmountCents, 0),
-      ))
-      .then((r) => r[0] ?? null),
+    fetchTotalRaceWinningsCents(db, targetId).catch(() => 0),
   ]);
 
   let friendStatus: "none" | "pending_sent" | "pending_received" | "friends" = "none";
@@ -710,7 +712,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
     friendStatus = reqRow.senderId === myId ? "pending_sent" : "pending_received";
     friendRequestId = reqRow.id;
   }
-  const lifetimeCashWonCents = cashWonRow?.totalCashWonCents ?? 0;
+  const lifetimeCashWonCents = totalWinningCents ?? 0;
 
   return res.json({
     userId: p.id,
@@ -728,6 +730,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
       coinsBalance:      coinRow?.currentBalance ?? 0,
       lifetimeCashWonCents,
       lifetimeCashWonDollars: lifetimeCashWonCents / 100,
+      totalWinning: lifetimeCashWonCents / 100,
       racesPlayed:       raceRows.length,
       raceWins:          raceRows.filter(isRaceWinResult).length,
       currentStreakDays:  p.currentStreak ?? 0,

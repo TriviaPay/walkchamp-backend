@@ -2,19 +2,19 @@ import { Router } from "express";
 import { db } from "../../db/src/index.js";
 import {
   profilesTable,
-  stepDailyTotalsTable,
   friendsTable,
-  raceResultsTable,
-  raceRoomsTable,
   userTitlesTable,
   achievementDefinitionsTable,
-  coinTransactionsTable,
-  walkingGroupsTable,
-  walkingGroupMembersTable,
-  walkingGroupDailyStepsTable,
 } from "../../db/src/schema/index.js";
-import { desc, eq, and, gte, lte, gt, ne, sql, inArray, notInArray } from "drizzle-orm";
+import { eq, and, sql, inArray } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { normalizeCountryCode } from "../lib/country.js";
+import { getLeaderboardPeriodDates } from "../lib/leaderboardPeriods.js";
+import {
+  fetchStepLeaderboardRows,
+  type StepLeaderboardPeriod,
+} from "../lib/stepLeaderboardQuery.js";
+import { fetchTotalRaceWinningsCents } from "../lib/raceWinnings.js";
 
 const router = Router();
 
@@ -49,161 +49,64 @@ const AVATAR_COLORS = [
   "#00E676", "#00B4FF", "#06B6D4", "#FFD700", "#FF6B35",
   "#A855F7", "#F472B6", "#34D399", "#60A5FA", "#FBBF24",
 ];
-const RACE_WIN_RANK = 1;
-
-/** Validates a client-supplied YYYY-MM-DD date string. */
-function isValidDateStr(s: unknown): s is string {
-  if (typeof s !== "string") return false;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
-  const dt = new Date(s + "T00:00:00Z");
-  return !isNaN(dt.getTime());
-}
-
-/**
- * Compute the date range for a leaderboard period.
- *
- * Prefers client-supplied local date parameters (sent by every client since
- * the timezone fix) so the period boundaries match the user's calendar day
- * rather than the server's UTC date.
- *
- * Params (all optional, client-provided):
- *   localDate  — user's local today (YYYY-MM-DD)
- *   weekStart  — first day of the user's local calendar week (YYYY-MM-DD)
- *   monthStart — first day of the user's local calendar month (YYYY-MM-DD)
- *
- * Falls back to server UTC computation when params are absent/invalid.
- */
-function getPeriodDates(
-  period: string,
-  localDate?: unknown,
-  weekStart?: unknown,
-  monthStart?: unknown,
-): { startDate: string; endDate: string } {
-  // "today" as seen by the user — prefer client param, fall back to UTC
-  const todayStr = isValidDateStr(localDate)
-    ? localDate
-    : new Date().toISOString().split("T")[0];
-
-  if (period === "today") return { startDate: todayStr, endDate: todayStr };
-
-  if (period === "week") {
-    let start: string;
-    if (isValidDateStr(weekStart)) {
-      start = weekStart;
-    } else {
-      // UTC fallback: Monday of the server's current UTC week
-      const now = new Date();
-      const day = now.getUTCDay();
-      const monday = new Date(now);
-      monday.setUTCDate(now.getUTCDate() - ((day + 6) % 7));
-      start = monday.toISOString().split("T")[0];
-    }
-    return { startDate: start, endDate: todayStr };
-  }
-
-  if (period === "month") {
-    let start: string;
-    if (isValidDateStr(monthStart)) {
-      start = monthStart;
-    } else {
-      // UTC fallback: first of the server's current UTC month
-      const now = new Date();
-      start = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}-01`;
-    }
-    return { startDate: start, endDate: todayStr };
-  }
-
-  return { startDate: "", endDate: "" }; // all_time
+function rowsFromExecute<T>(result: unknown): T[] {
+  return ((result as { rows?: T[] }).rows ?? (result as T[])) as T[];
 }
 
 // ── GET /api/leaderboard ──────────────────────────────────────────────────────
 // query: period=today|week|month|all_time  scope=global|regional|friends  countryCode=XX
 router.get("/leaderboard", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
-  const period      = (req.query.period as string)      || "all_time";
+  const requestedPeriod = (req.query.period as string) || "all_time";
+  const period: StepLeaderboardPeriod =
+    requestedPeriod === "today" || requestedPeriod === "week" || requestedPeriod === "month" || requestedPeriod === "all_time"
+      ? requestedPeriod
+      : "all_time";
   const scope       = (req.query.scope as string)       || "global";
-  const countryCode = req.query.countryCode as string | undefined;
+  const friendsOnly = req.query.friendsOnly === "true";
 
-  // ── Profile-level filters ─────────────────────────────────────────────────
-  const profileFilters = [notInArray(profilesTable.accountStatus, ["banned", "deleted"])];
+  const [callerProfile] = await db
+    .select({ countryCode: profilesTable.countryCode })
+    .from(profilesTable)
+    .where(eq(profilesTable.id, userId))
+    .limit(1);
+  const regionalCountryCode = normalizeCountryCode(callerProfile?.countryCode);
 
-  if (scope === "regional" && countryCode) {
-    profileFilters.push(eq(profilesTable.countryCode, countryCode));
+  if (scope === "regional") {
+    if (!regionalCountryCode) {
+      return res.json({ leaderboard: [], userRank: null, reason: "NO_COUNTRY_SET" });
+    }
   }
 
-  if (scope === "friends") {
+  let friendIds: string[] | null = null;
+  if (scope === "friends" || friendsOnly) {
     // Friends stored bidirectionally; query where userId = me to get all friend IDs
     const friendRows = await db
       .select({ id: friendsTable.friendId })
       .from(friendsTable)
       .where(eq(friendsTable.userId, userId));
 
-    const friendIds = [...new Set([...friendRows.map((r) => r.id), userId])];
-    profileFilters.push(inArray(profilesTable.id, friendIds));
+    friendIds = [...new Set([...friendRows.map((r) => r.id), userId])];
   }
 
   // ── Step-based ranking ────────────────────────────────────────────────────
-  type Row = {
-    id: string; username: string; fullName: string;
-    country: string | null; countryCode: string | null; countryFlag: string | null;
-    steps: number; avatarColor: string | null; avatarUrl: string | null; updatedAt: Date | null;
-  };
-
-  let rows: Row[];
-
-  if (period === "all_time") {
-    rows = await db
-      .select({
-        id: profilesTable.id,
-        username: profilesTable.username,
-        fullName: profilesTable.fullName,
-        country: profilesTable.country,
-        countryCode: profilesTable.countryCode,
-        countryFlag: profilesTable.countryFlag,
-        steps: profilesTable.totalSteps,
-        avatarColor: profilesTable.avatarColor,
-        avatarUrl: profilesTable.avatarUrl,
-        updatedAt: profilesTable.updatedAt,
-      })
-      .from(profilesTable)
-      .where(and(...profileFilters, gt(profilesTable.totalSteps, 0)))
-      .orderBy(desc(profilesTable.totalSteps))
-      .limit(100);
-  } else {
-    const { startDate, endDate } = getPeriodDates(
+  const periodDates = period === "all_time"
+    ? { startDate: undefined, endDate: undefined }
+    : getLeaderboardPeriodDates(
       period,
       req.query.localDate,
       req.query.weekStart,
       req.query.monthStart,
     );
-    rows = await db
-      .select({
-        id: profilesTable.id,
-        username: profilesTable.username,
-        fullName: profilesTable.fullName,
-        country: profilesTable.country,
-        countryCode: profilesTable.countryCode,
-        countryFlag: profilesTable.countryFlag,
-        avatarColor: profilesTable.avatarColor,
-        avatarUrl: profilesTable.avatarUrl,
-        updatedAt: profilesTable.updatedAt,
-        steps: sql<number>`CAST(COALESCE(sum(${stepDailyTotalsTable.steps}), 0) AS INTEGER)`,
-      })
-      .from(stepDailyTotalsTable)
-      .innerJoin(profilesTable, eq(stepDailyTotalsTable.userId, profilesTable.id))
-      .where(and(
-        gte(stepDailyTotalsTable.date, startDate),
-        lte(stepDailyTotalsTable.date, endDate),
-        ...profileFilters,
-      ))
-      .groupBy(
-        profilesTable.id, profilesTable.username, profilesTable.fullName,
-        profilesTable.country, profilesTable.countryCode, profilesTable.countryFlag,
-        profilesTable.avatarColor, profilesTable.avatarUrl, profilesTable.updatedAt,
-      )
-      .orderBy(desc(sql`sum(${stepDailyTotalsTable.steps})`))
-      .limit(100);
-  }
+  const rankedRows = await fetchStepLeaderboardRows(db, {
+    userId,
+    period,
+    startDate: periodDates.startDate,
+    endDate: periodDates.endDate,
+    countryCode: scope === "regional" ? regionalCountryCode : null,
+    friendIds,
+  });
+  const rows = rankedRows.filter((r) => r.rank <= 100);
 
   // ── Batch-fetch active titles for all users in result ────────────────────
   const rowIds = rows.map((r) => r.id);
@@ -224,7 +127,7 @@ router.get("/leaderboard", requireAuth, async (req, res) => {
   }
 
   const leaderboard = rows.map((row, i) => {
-    const rank = i + 1;
+    const rank = row.rank;
     return {
       id: row.id,
       username: row.username,
@@ -242,40 +145,24 @@ router.get("/leaderboard", requireAuth, async (req, res) => {
       rewardAmount: 0,
       avatarColor: row.avatarColor ?? AVATAR_COLORS[i % AVATAR_COLORS.length],
       avatarUrl: row.avatarUrl ?? null,
-      avatarVersion: row.updatedAt?.getTime() ?? 0,
+      avatarVersion: row.updatedAt instanceof Date ? row.updatedAt.getTime() : 0,
     };
   });
 
   // ── Current user's rank ───────────────────────────────────────────────────
-  let userRank = 9999;
-  const myEntry = leaderboard.find((u) => u.id === userId);
-  if (myEntry) {
-    userRank = myEntry.rank;
-  } else if (period === "all_time") {
-    const [myProfile] = await db
-      .select({ totalSteps: profilesTable.totalSteps })
-      .from(profilesTable)
-      .where(eq(profilesTable.id, userId))
-      .limit(1);
-    if (myProfile) {
-      const countAbove = await db.$count(
-        profilesTable,
-        and(
-          ne(profilesTable.id, userId),
-          gte(profilesTable.totalSteps, (myProfile.totalSteps ?? 0) + 1),
-          notInArray(profilesTable.accountStatus, ["banned", "deleted"]),
-        ),
-      );
-      userRank = Number(countAbove) + 1;
-    }
-  }
+  // The ranked CTE already carries the viewer's own row even when it falls outside the
+  // top 100, so the personal card can show a real rank AND a real metric instead of
+  // falling back to 0 (the visible list is truncated; this row is not).
+  const myRankedRow = rankedRows.find((u) => u.id === userId);
+  const userRank = myRankedRow?.rank ?? 9999;
+  const userMetric = myRankedRow?.steps ?? 0;
 
-  return res.json({ leaderboard, userRank });
+  return res.json({ leaderboard, userRank, userMetric });
 });
 
 // ── GET /api/leaderboard/races ────────────────────────────────────────────────
 // query: entryType=free|paid_1|paid_3|paid_5
-// Returns users ranked by race wins. A win is an actual 1st-place finish.
+// Returns users ranked by race wins. A win is any rewarded placement.
 router.get("/leaderboard/races", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const entryType = req.query.entryType as string | undefined;
@@ -287,171 +174,252 @@ router.get("/leaderboard/races", requireAuth, async (req, res) => {
       ? (entryType as EntryType)
       : undefined;
 
-  // Build where conditions — only eligible 1st place counts toward win totals.
-  const whereConditions = [
-    eq(raceResultsTable.rank, RACE_WIN_RANK),
-    eq(raceResultsTable.eligibleForPrize, true),
-    notInArray(profilesTable.accountStatus, ["banned", "deleted"]),
-  ];
-  if (filteredEntryType) {
-    whereConditions.push(eq(raceRoomsTable.entryType, filteredEntryType));
-  }
+  type RaceRow = {
+    id: string;
+    username: string;
+    full_name: string;
+    country: string | null;
+    country_code: string | null;
+    country_flag: string | null;
+    avatar_color: string | null;
+    avatar_url: string | null;
+    updated_at: Date | null;
+    wins: number | string;
+    total_winning_cents: number | string | null;
+  };
 
-  // ── Win counts per user ───────────────────────────────────────────────────
-  const rows = await db
-    .select({
-      id: profilesTable.id,
-      username: profilesTable.username,
-      fullName: profilesTable.fullName,
-      country: profilesTable.country,
-      countryCode: profilesTable.countryCode,
-      countryFlag: profilesTable.countryFlag,
-      avatarColor: profilesTable.avatarColor,
-      avatarUrl: profilesTable.avatarUrl,
-      updatedAt: profilesTable.updatedAt,
-      wins: sql<number>`count(${raceResultsTable.id})::int`,
-    })
-    .from(raceResultsTable)
-    .innerJoin(raceRoomsTable, sql`${raceResultsTable.raceRoomId}::uuid = ${raceRoomsTable.id}`)
-    .innerJoin(profilesTable, eq(raceResultsTable.userId, profilesTable.id))
-    .where(and(...whereConditions))
-    .groupBy(
-      profilesTable.id,
-      profilesTable.username,
-      profilesTable.fullName,
-      profilesTable.country,
-      profilesTable.countryCode,
-      profilesTable.countryFlag,
-      profilesTable.avatarColor,
-      profilesTable.avatarUrl,
-      profilesTable.updatedAt,
+  const entryTypeFilter = filteredEntryType
+    ? sql`AND rm.entry_type = ${filteredEntryType}`
+    : sql``;
+  const unlimitedWinsSource = filteredEntryType
+    ? sql`SELECT NULL::text AS user_id, 0::int AS wins WHERE false`
+    : sql`
+      SELECT up.user_id, count(*)::int AS wins
+      FROM unlimited_challenge_payouts up
+      JOIN unlimited_challenges uc ON uc.id = up.challenge_id
+      JOIN profiles p ON p.id = up.user_id
+      WHERE up.status = 'credited'
+        AND up.payout_cents > 0
+        AND uc.settlement_status = 'completed'
+        AND p.account_status NOT IN ('banned', 'deleted')
+      GROUP BY up.user_id
+    `;
+
+  const raceRowsResult = await db.execute(sql`
+    WITH classic_wins AS (
+      SELECT rr.user_id, count(*)::int AS wins
+      FROM race_results rr
+      JOIN race_rooms rm ON rr.race_room_id::uuid = rm.id
+      JOIN profiles p ON p.id = rr.user_id
+      WHERE rr.eligible_for_prize = true
+        AND rm.status = 'completed'
+        -- A result under ops review or flagged as simulation is never a win. These normally
+        -- also carry eligible_for_prize = false, but POST /races/:id/reconcile can rewrite a
+        -- settled row's status without touching eligibility, so the status is checked too.
+        -- NOTE: 'pending_verification' is deliberately NOT excluded here — it is the column
+        -- default, so legacy rows written before the status column was populated carry it,
+        -- and excluding it would silently erase historical wins. See the open decision.
+        AND rr.status NOT IN ('review_required', 'disqualified_simulation')
+        AND p.account_status NOT IN ('banned', 'deleted')
+        ${entryTypeFilter}
+      GROUP BY rr.user_id
+    ),
+    unlimited_wins AS (${unlimitedWinsSource}),
+    wins_by_user AS (
+      SELECT user_id, sum(wins)::int AS wins
+      FROM (
+        SELECT * FROM classic_wins
+        UNION ALL
+        SELECT * FROM unlimited_wins
+      ) all_wins
+      GROUP BY user_id
+    ),
+    cash_winnings AS (
+      SELECT user_id, coalesce(sum(amount_cents), 0)::int AS cents
+      FROM wallet_transactions
+      WHERE transaction_type = 'race_prize_paid'
+        AND status = 'completed'
+      GROUP BY user_id
+    ),
+    unlimited_winnings AS (
+      SELECT up.user_id, coalesce(sum(up.payout_cents), 0)::int AS cents
+      FROM unlimited_challenge_payouts up
+      JOIN unlimited_challenges uc ON uc.id = up.challenge_id
+      WHERE up.status = 'credited'
+        AND up.payout_cents > 0
+        AND uc.settlement_status = 'completed'
+        AND NOT EXISTS (
+          SELECT 1 FROM wallet_transactions wt
+          WHERE wt.user_id = up.user_id
+            AND wt.race_room_id::text = up.challenge_id
+            AND wt.transaction_type = 'race_prize_paid'
+            AND wt.status = 'completed'
+        )
+      GROUP BY up.user_id
+    ),
+    total_winnings AS (
+      SELECT user_id, sum(cents)::int AS total_winning_cents
+      FROM (
+        SELECT * FROM cash_winnings
+        UNION ALL
+        SELECT * FROM unlimited_winnings
+      ) all_money
+      GROUP BY user_id
+    ),
+    ranked AS (
+      SELECT
+        p.id,
+        p.username,
+        p.full_name,
+        p.country,
+        p.country_code,
+        p.country_flag,
+        p.avatar_color,
+        p.avatar_url,
+        p.updated_at,
+        wb.wins,
+        coalesce(tw.total_winning_cents, 0)::int AS total_winning_cents,
+        row_number() OVER (ORDER BY wb.wins DESC, p.id ASC)::int AS rank
+      FROM wins_by_user wb
+      JOIN profiles p ON p.id = wb.user_id
+      LEFT JOIN total_winnings tw ON tw.user_id = wb.user_id
     )
-    .orderBy(desc(sql`count(${raceResultsTable.id})`))
-    .limit(100);
+    SELECT *
+    FROM ranked
+    WHERE rank <= 100 OR id = ${userId}
+    ORDER BY rank
+  `);
+  const rankedRows = rowsFromExecute<RaceRow & { rank: number | string }>(raceRowsResult);
+  const rows = rankedRows.filter((row) => Number(row.rank) <= 100);
 
   const leaderboard = rows.map((row, i) => {
-    const rank = i + 1;
+    const rank = Number(row.rank ?? 0);
     return {
       id: row.id,
       username: row.username,
-      fullName: row.fullName,
+      fullName: row.full_name,
       country: row.country ?? "",
-      countryCode: row.countryCode ?? "",
-      countryFlag: row.countryFlag ?? "🏳️",
-      wins: row.wins ?? 0,
+      countryCode: row.country_code ?? "",
+      countryFlag: row.country_flag ?? "🏳️",
+      wins: Number(row.wins ?? 0),
+      totalWinning: Number(row.total_winning_cents ?? 0) / 100,
       rank,
       badge: getRaceBadge(rank),
-      avatarColor: row.avatarColor ?? AVATAR_COLORS[i % AVATAR_COLORS.length],
-      avatarUrl: row.avatarUrl ?? null,
-      avatarVersion: row.updatedAt?.getTime() ?? 0,
+      avatarColor: row.avatar_color ?? AVATAR_COLORS[i % AVATAR_COLORS.length],
+      avatarUrl: row.avatar_url ?? null,
+      avatarVersion: row.updated_at instanceof Date ? row.updated_at.getTime() : 0,
     };
   });
 
   // ── Current user's race rank ──────────────────────────────────────────────
-  const myEntry = leaderboard.find((u) => u.id === userId);
+  const myRankedEntry = rankedRows.find((u) => u.id === userId);
   let userRank = 9999;
   let userWins = 0;
+  let userTotalWinning = 0;
 
-  if (myEntry) {
-    userRank = myEntry.rank;
-    userWins = myEntry.wins;
+  if (myRankedEntry) {
+    userRank = Number(myRankedEntry.rank ?? 9999);
+    userWins = Number(myRankedEntry.wins ?? 0);
+    userTotalWinning = Number(myRankedEntry.total_winning_cents ?? 0) / 100;
   } else {
-    // Count user's own wins to determine rank
-    const myWinConditions = [
-      eq(raceResultsTable.userId, userId),
-      eq(raceResultsTable.rank, RACE_WIN_RANK),
-      eq(raceResultsTable.eligibleForPrize, true),
-    ];
-    if (filteredEntryType) myWinConditions.push(eq(raceRoomsTable.entryType, filteredEntryType));
-
-    const [myWinRow] = await db
-      .select({ wins: sql<number>`count(*)::int` })
-      .from(raceResultsTable)
-      .innerJoin(raceRoomsTable, sql`${raceResultsTable.raceRoomId}::uuid = ${raceRoomsTable.id}`)
-      .where(and(...myWinConditions))
-      .limit(1);
-
-    userWins = myWinRow?.wins ?? 0;
-    if (userWins > 0) {
-      // Count users with more wins than the current user
-      const aboveConditions = [
-        eq(raceResultsTable.rank, RACE_WIN_RANK),
-        eq(raceResultsTable.eligibleForPrize, true),
-        notInArray(profilesTable.accountStatus, ["banned", "deleted"]),
-        ne(profilesTable.id, userId),
-      ];
-      if (filteredEntryType) aboveConditions.push(eq(raceRoomsTable.entryType, filteredEntryType));
-
-      const aboveRows = await db
-        .select({ uid: profilesTable.id, cnt: sql<number>`count(*)::int` })
-        .from(raceResultsTable)
-        .innerJoin(raceRoomsTable, sql`${raceResultsTable.raceRoomId}::uuid = ${raceRoomsTable.id}`)
-        .innerJoin(profilesTable, eq(raceResultsTable.userId, profilesTable.id))
-        .where(and(...aboveConditions))
-        .groupBy(profilesTable.id)
-        .having(sql`count(*) > ${userWins}`);
-
-      userRank = aboveRows.length + 1;
-    }
+    userTotalWinning = await fetchTotalRaceWinningsCents(db, userId) / 100;
   }
 
-  return res.json({ leaderboard, userRank, userWins });
+  return res.json({ leaderboard, userRank, userWins, userTotalWinning });
 });
 
 // ── GET /api/leaderboard/coins ─────────────────────────────────────────────────
 router.get("/leaderboard/coins", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
 
-  const rows = await db
-    .select({
-      uid: coinTransactionsTable.userId,
-      totalCoins: sql<number>`sum(${coinTransactionsTable.amount})::int`,
-      username: profilesTable.username,
-      fullName: profilesTable.fullName,
-      country: profilesTable.country,
-      countryCode: profilesTable.countryCode,
-      countryFlag: profilesTable.countryFlag,
-      avatarColor: profilesTable.avatarColor,
-      avatarUrl: profilesTable.avatarUrl,
-      updatedAt: profilesTable.updatedAt,
-    })
-    .from(coinTransactionsTable)
-    .innerJoin(profilesTable, eq(coinTransactionsTable.userId, profilesTable.id))
-    .where(
-      and(
-        eq(coinTransactionsTable.transactionType, "earn"),
-        notInArray(profilesTable.accountStatus, ["banned", "deleted"]),
-      ),
-    )
-    .groupBy(
-      coinTransactionsTable.userId,
-      profilesTable.username,
-      profilesTable.fullName,
-      profilesTable.country,
-      profilesTable.countryCode,
-      profilesTable.countryFlag,
-      profilesTable.avatarColor,
-      profilesTable.avatarUrl,
-      profilesTable.updatedAt,
-    )
-    .orderBy(desc(sql`sum(${coinTransactionsTable.amount})`))
-    .limit(50);
+  type CoinRow = {
+    uid: string;
+    total_coins: number | string;
+    username: string | null;
+    full_name: string | null;
+    country: string | null;
+    country_code: string | null;
+    country_flag: string | null;
+    avatar_color: string | null;
+    avatar_url: string | null;
+    updated_at: Date | null;
+  };
 
-  let userRank = 9999;
+  const coinsWonCondition = sql`
+    (
+      left(reward_code, 17) = 'COINS_BATTLE_WIN_'
+      OR position('_RACE_WIN_' in reward_code) > 0
+      OR reward_code IN ('PUBLIC_ROOM_WIN', 'PRIVATE_ROOM_WIN')
+    )
+  `;
+
+  // Sign handling for refund/adjustment is DELIBERATELY left as-is pending the production
+  // distribution audit (`pnpm audit:leaderboard`, section 2b).
+  //
+  // Verified 2026-08-14: this branch is currently unreachable in production. The only coin
+  // `refund` writer is sponsoredEvents.ts (leaving a sponsored event), and it writes a POSITIVE
+  // credit with rewardCode: null — so it cannot satisfy coinsWonCondition. There are no
+  // `adjustment` writers at all. Changing the expression today would alter nothing except the
+  // test fixture, so the existing semantics stay locked until the audit shows real rows.
+  const coinRowsResult = await db.execute(sql`
+    WITH totals AS (
+      SELECT
+        user_id,
+        sum(
+          CASE
+            WHEN transaction_type = 'earn' THEN amount
+            ELSE -abs(amount)
+          END
+        )::int AS total_coins
+      FROM coin_transactions
+      WHERE transaction_type IN ('earn', 'refund', 'adjustment')
+        AND ${coinsWonCondition}
+      GROUP BY user_id
+      HAVING sum(
+        CASE
+          WHEN transaction_type = 'earn' THEN amount
+          ELSE -abs(amount)
+        END
+      ) > 0
+    )
+    , ranked AS (
+      SELECT
+        totals.user_id AS uid,
+        totals.total_coins,
+        p.username,
+        p.full_name,
+        p.country,
+        p.country_code,
+        p.country_flag,
+        p.avatar_color,
+        p.avatar_url,
+        p.updated_at,
+        row_number() OVER (ORDER BY totals.total_coins DESC, totals.user_id ASC)::int AS rank
+      FROM totals
+      JOIN profiles p ON p.id = totals.user_id
+      WHERE p.account_status NOT IN ('banned', 'deleted')
+    )
+    SELECT *
+    FROM ranked
+    WHERE rank <= 50 OR uid = ${userId}
+    ORDER BY rank
+  `);
+  const rankedRows = rowsFromExecute<CoinRow & { rank: number | string }>(coinRowsResult);
+  const rows = rankedRows.filter((row) => Number(row.rank) <= 50);
+
   const leaderboard = rows.map((r, i) => {
-    const rank = i + 1;
-    if (r.uid === userId) userRank = rank;
+    const rank = Number(r.rank ?? 0);
     return {
       id: r.uid,
       username: r.username ?? "unknown",
-      fullName: r.fullName ?? "",
+      fullName: r.full_name ?? "",
       country: r.country ?? "",
-      countryCode: r.countryCode ?? "",
-      countryFlag: r.countryFlag ?? "🏳️",
-      avatarColor: r.avatarColor ?? AVATAR_COLORS[i % AVATAR_COLORS.length],
-      avatarUrl: r.avatarUrl ?? null,
-      avatarVersion: r.updatedAt?.getTime() ?? 0,
-      metric: r.totalCoins ?? 0,
+      countryCode: r.country_code ?? "",
+      countryFlag: r.country_flag ?? "🏳️",
+      avatarColor: r.avatar_color ?? AVATAR_COLORS[i % AVATAR_COLORS.length],
+      avatarUrl: r.avatar_url ?? null,
+      avatarVersion: r.updated_at instanceof Date ? r.updated_at.getTime() : 0,
+      metric: Number(r.total_coins ?? 0),
       metricLabel: "coins won",
       rank,
       badge: getRaceBadge(rank),
@@ -459,107 +427,101 @@ router.get("/leaderboard/coins", requireAuth, async (req, res) => {
     };
   });
 
-  return res.json({ leaderboard, userRank });
+  // Same as the step board: the viewer's row survives the top-50 cut in the CTE, so the
+  // personal card gets both a real rank and a real coins-won total.
+  const myRankedRow = rankedRows.find((row) => row.uid === userId);
+  const userRank = myRankedRow?.rank ?? 9999;
+  const userMetric = Number(myRankedRow?.total_coins ?? 0);
+
+  return res.json({ leaderboard, userRank: Number(userRank), userMetric });
 });
 
 // ── GET /api/leaderboard/groups ────────────────────────────────────────────────
 router.get("/leaderboard/groups", requireAuth, async (req, res) => {
   const period = (req.query.period as string) === "all_time" ? "all_time" : "today";
   const rawLocalDate = req.query.localDate as string | undefined;
-  const isValidDate = rawLocalDate && /^\d{4}-\d{2}-\d{2}$/.test(rawLocalDate);
-  const today = isValidDate ? rawLocalDate : (new Date().toISOString().split("T")[0] ?? "");
+  const today = getLeaderboardPeriodDates("today", rawLocalDate).startDate;
 
-  req.log.info({ period, today }, "[GroupLeaderboard] fetch started");
+  req.log?.info({ period, today }, "[GroupLeaderboard] fetch started");
 
-  let rows: { groupId: string; groupName: string; groupType: string | null; customGroupType: string | null; groupImageUrl: string | null; groupUpdatedAt: Date | null; totalSteps: number; memberCount: number }[];
-
-  if (period === "today") {
-    rows = await db
-      .select({
-        groupId: walkingGroupsTable.id,
-        groupName: walkingGroupsTable.groupName,
-        groupType: walkingGroupsTable.groupType,
-        customGroupType: walkingGroupsTable.customGroupType,
-        groupImageUrl: walkingGroupsTable.groupImageUrl,
-        groupUpdatedAt: walkingGroupsTable.updatedAt,
-        totalSteps: sql<number>`coalesce((
-          select sum(wgds.daily_steps)
-          from walking_group_daily_steps wgds
-          where wgds.group_id = ${walkingGroupsTable.id}
-          and wgds.step_date::date = ${today}::date
-        ), 0)::int`,
-        memberCount: sql<number>`count(distinct ${walkingGroupMembersTable.userId})::int`,
-      })
-      .from(walkingGroupsTable)
-      .innerJoin(
-        walkingGroupMembersTable,
-        and(
-          eq(walkingGroupMembersTable.groupId, walkingGroupsTable.id),
-          eq(walkingGroupMembersTable.status, "active"),
-        ),
-      )
-      .where(eq(walkingGroupsTable.status, "active"))
-      .groupBy(walkingGroupsTable.id, walkingGroupsTable.groupName, walkingGroupsTable.groupType, walkingGroupsTable.customGroupType, walkingGroupsTable.groupImageUrl, walkingGroupsTable.updatedAt)
-      .orderBy(desc(sql`coalesce((
-        select sum(wgds.daily_steps)
-        from walking_group_daily_steps wgds
-        where wgds.group_id = ${walkingGroupsTable.id}
-        and wgds.step_date::date = ${today}::date
-      ), 0)`))
-      .limit(50);
-  } else {
-    rows = await db
-      .select({
-        groupId: walkingGroupsTable.id,
-        groupName: walkingGroupsTable.groupName,
-        groupType: walkingGroupsTable.groupType,
-        customGroupType: walkingGroupsTable.customGroupType,
-        groupImageUrl: walkingGroupsTable.groupImageUrl,
-        groupUpdatedAt: walkingGroupsTable.updatedAt,
-        totalSteps: sql<number>`coalesce((
-          select sum(wgds.daily_steps)
-          from walking_group_daily_steps wgds
-          where wgds.group_id = ${walkingGroupsTable.id}
-        ), 0)::int`,
-        memberCount: sql<number>`count(distinct ${walkingGroupMembersTable.userId})::int`,
-      })
-      .from(walkingGroupsTable)
-      .innerJoin(
-        walkingGroupMembersTable,
-        and(
-          eq(walkingGroupMembersTable.groupId, walkingGroupsTable.id),
-          eq(walkingGroupMembersTable.status, "active"),
-        ),
-      )
-      .where(eq(walkingGroupsTable.status, "active"))
-      .groupBy(walkingGroupsTable.id, walkingGroupsTable.groupName, walkingGroupsTable.groupType, walkingGroupsTable.customGroupType, walkingGroupsTable.groupImageUrl, walkingGroupsTable.updatedAt)
-      .orderBy(desc(sql`coalesce((
-        select sum(wgds.daily_steps)
-        from walking_group_daily_steps wgds
-        where wgds.group_id = ${walkingGroupsTable.id}
-      ), 0)`))
-      .limit(50);
-  }
+  type GroupRow = {
+    group_id: string;
+    group_name: string;
+    group_type: string | null;
+    custom_group_type: string | null;
+    group_image_url: string | null;
+    group_updated_at: Date | null;
+    total_steps: number | string;
+    member_count: number | string;
+    rank: number | string;
+  };
+  const dateFilter = period === "today" ? sql`WHERE wgds.step_date::date = ${today}::date` : sql``;
+  const groupRowsResult = await db.execute(sql`
+    WITH active_members AS (
+      SELECT group_id, count(distinct user_id)::int AS member_count
+      FROM walking_group_members
+      WHERE status = 'active'
+      GROUP BY group_id
+    ),
+    step_totals AS (
+      SELECT
+        wgds.group_id,
+        coalesce(sum(wgds.daily_steps), 0)::int AS total_steps
+      FROM walking_group_daily_steps wgds
+      JOIN walking_group_members active_member
+        ON active_member.group_id = wgds.group_id
+       AND active_member.user_id = wgds.user_id
+       AND active_member.status = 'active'
+      ${dateFilter}
+      GROUP BY wgds.group_id
+    ),
+    base AS (
+      SELECT
+        wg.id AS group_id,
+        wg.group_name,
+        wg.group_type,
+        wg.custom_group_type,
+        wg.group_image_url,
+        wg.updated_at AS group_updated_at,
+        coalesce(st.total_steps, 0)::int AS total_steps,
+        am.member_count
+      FROM walking_groups wg
+      JOIN active_members am ON am.group_id = wg.id
+      LEFT JOIN step_totals st ON st.group_id = wg.id
+      WHERE wg.status = 'active'
+    ),
+    ranked AS (
+      SELECT
+        base.*,
+        row_number() OVER (ORDER BY base.total_steps DESC, base.group_id ASC)::int AS rank
+      FROM base
+    )
+    SELECT *
+    FROM ranked
+    WHERE rank <= 50
+    ORDER BY rank
+  `);
+  const rows = rowsFromExecute<GroupRow>(groupRowsResult);
 
   const label = period === "today"
     ? "Groups ranked by total steps today"
     : "Groups ranked by all-time total steps";
   const periodLabel = period === "today" ? "today steps" : "all-time steps";
 
-  const groups = rows.map((r, i) => ({
-    rank: i + 1,
-    id: r.groupId,
-    name: r.groupName,
-    type: r.groupType ?? "custom",
-    customGroupType: r.customGroupType ?? null,
-    groupImageUrl: r.groupImageUrl ?? null,
-    imageVersion: r.groupUpdatedAt?.getTime() ?? 0,
-    totalSteps: r.totalSteps ?? 0,
-    memberCount: r.memberCount ?? 0,
+  const groups = rows.map((r) => ({
+    rank: Number(r.rank ?? 0),
+    id: r.group_id,
+    name: r.group_name,
+    type: r.group_type ?? "custom",
+    customGroupType: r.custom_group_type ?? null,
+    groupImageUrl: r.group_image_url ?? null,
+    imageVersion: r.group_updated_at instanceof Date ? r.group_updated_at.getTime() : 0,
+    totalSteps: Number(r.total_steps ?? 0),
+    memberCount: Number(r.member_count ?? 0),
     periodLabel,
   }));
 
-  req.log.info({ period, count: groups.length, topGroup: groups[0]?.name, topSteps: groups[0]?.totalSteps }, "[GroupLeaderboard] returned");
+  req.log?.info({ period, count: groups.length, topGroup: groups[0]?.name, topSteps: groups[0]?.totalSteps }, "[GroupLeaderboard] returned");
   return res.json({ success: true, period, label, groups, leaderboard: groups });
 });
 

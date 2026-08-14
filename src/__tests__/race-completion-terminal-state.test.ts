@@ -96,18 +96,28 @@ describe("the payout can still run after the race went terminal", () => {
     expect(cas).toContain("coalesce(${raceRoomsTable.completedAt}");
   });
 
-  it("sweeps deferred payouts ahead of the idle fast-path gate", () => {
-    // A completed-pending room is not an "active race", so running the sweep after the
-    // activeRaceCount() gate would never pay it out on an otherwise idle server.
+  it("never runs the deferred-payout sweep behind the idle fast-path gate", () => {
+    // A completed-pending room is not an "active race", so running the sweep anywhere after
+    // the activeRaceCount() gate would never pay it out on an otherwise idle server. It lives
+    // in the unconditional maintenance pass instead — see the next test.
     const cleanup = races.slice(
       races.indexOf("export async function cleanupOverdueRaces"),
       races.indexOf("// ── Feature flags"),
     );
-    const sweepAt = cleanup.indexOf("await resettlePendingRaces()");
-    const gateAt = cleanup.indexOf("activeRaceCount()");
-    expect(sweepAt).toBeGreaterThan(-1);
-    expect(gateAt).toBeGreaterThan(-1);
-    expect(sweepAt).toBeLessThan(gateAt);
+    expect(cleanup).not.toContain("resettlePendingRaces()");
+  });
+
+  it("sweeps deferred payouts from the unconditional frequent maintenance pass", () => {
+    // The sweep's query cannot be gated (a pending payout leaves no trace in the active-race
+    // registry), so it must sit on a coalesced timer rather than the 15s tick, which would
+    // keep Neon compute awake permanently.
+    const jobs = readFileSync("src/lib/backgroundJobs.ts", "utf8");
+    const pass = jobs.slice(
+      jobs.indexOf("async function runFrequentMaintenancePass"),
+      jobs.indexOf("async function runCoalescedMaintenancePass"),
+    );
+    expect(pass).toContain("resettlePendingRaces()");
+    expect(jobs).toContain("FREQUENT_MAINTENANCE_INTERVAL_MS");
   });
 
   it("only auto-retries awaiting_verification, leaving ops holds to /verification-resolve", () => {

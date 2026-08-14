@@ -211,6 +211,13 @@
       "when": 1786177085897,
       "tag": "0029_unlimited_delayed_global_settlement",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1786180685897,
+      "tag": "0030_leaderboard_remaining_fixes",
+      "breakpoints": true
     }
   ]
 }

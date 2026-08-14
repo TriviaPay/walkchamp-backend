@@ -18,8 +18,8 @@ import { validateRecentLocalDate } from "../lib/localDate.js";
 import {
   normalizeSource,
   isVerifiedDailySource,
-  isRejectedDailySource,
   isProvisionalLiveSource,
+  isRejectedForDailyTotals,
   classifyDailySource,
 } from "../lib/stepSources.js";
 import { triggerEvent } from "../lib/pusher.js";
@@ -235,7 +235,7 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   // so a mock/random provider can never poison verified daily state, and the client's
   // periodic sync loop is not broken by a 4xx.
   const source = normalizeSource(rawSource);
-  if (isRejectedDailySource(source) || isProvisionalLiveSource(source)) {
+  if (isRejectedForDailyTotals(source)) {
     const [existing] = await db
       .select({ steps: stepDailyTotalsTable.steps })
       .from(stepDailyTotalsTable)
@@ -527,17 +527,23 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
           .where(and(inArray(walkingGroupsTable.id, gIds), eq(walkingGroupsTable.status, "active")));
         if (!activeGroups.length) return;
         const [committed] = await db
-          .select({ steps: stepDailyTotalsTable.steps, distanceMeters: stepDailyTotalsTable.distanceMeters, caloriesBurned: stepDailyTotalsTable.caloriesBurned })
+          .select({
+            steps: stepDailyTotalsTable.steps,
+            distanceMeters: stepDailyTotalsTable.distanceMeters,
+            caloriesBurned: stepDailyTotalsTable.caloriesBurned,
+            sourceClass: stepDailyTotalsTable.sourceClass,
+          })
           .from(stepDailyTotalsTable)
           .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, today)))
           .limit(1);
         if (!committed) return;
+        const verifiedSteps = committed.sourceClass === "verified" ? committed.steps : 0;
         const syncNow = new Date();
         for (const g of activeGroups) {
           await db.insert(walkingGroupDailyStepsTable)
             .values({
               groupId: g.id, userId, stepDate: today,
-              dailySteps: committed.steps, verifiedSteps: committed.steps,
+              dailySteps: committed.steps, verifiedSteps,
               calories: committed.caloriesBurned?.toString() ?? null,
               distanceMeters: committed.distanceMeters?.toString() ?? null,
               lastSyncedAt: syncNow,
@@ -546,7 +552,7 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
               target: [walkingGroupDailyStepsTable.groupId, walkingGroupDailyStepsTable.userId, walkingGroupDailyStepsTable.stepDate],
               set: {
                 dailySteps: sql`GREATEST(${walkingGroupDailyStepsTable.dailySteps}, ${committed.steps})`,
-                verifiedSteps: sql`GREATEST(${walkingGroupDailyStepsTable.verifiedSteps}, ${committed.steps})`,
+                verifiedSteps: sql`GREATEST(${walkingGroupDailyStepsTable.verifiedSteps}, ${verifiedSteps})`,
                 calories: committed.caloriesBurned?.toString() ?? null,
                 distanceMeters: committed.distanceMeters?.toString() ?? null,
                 lastSyncedAt: syncNow, updatedAt: syncNow,

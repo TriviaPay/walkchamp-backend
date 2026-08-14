@@ -8,7 +8,7 @@
  * not via a client-supplied localDate alone.
  */
 
-import { and, asc, eq, gt, inArray, lte, ne, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, lte, notInArray, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { profilesTable } from "../../db/src/schema/profiles.js";
 import { stepDailyTotalsTable } from "../../db/src/schema/steps.js";
@@ -17,6 +17,7 @@ import {
   unlimitedChallengeParticipantsTable,
   unlimitedChallengesTable,
 } from "../../db/src/schema/unlimitedChallenge.js";
+import { UNLIMITED_NON_ACTIVE_STATUSES } from "./unlimitedChallengeStatuses.js";
 
 export type UnlimitedActiveDayProgress = {
   participantId: string;
@@ -297,7 +298,7 @@ export async function loadChallengePlayers(
     .where(
       and(
         eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
-        ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+        notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
       ),
     )
     .orderBy(

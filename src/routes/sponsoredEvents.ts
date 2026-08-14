@@ -95,7 +95,7 @@ function getUpcomingWeekends(count = 2): Array<{ sat: Date; sun: Date }> {
 // Idempotent — skips events that already exist (keyed by inviteCode).
 // Reuses the creatorId of the most recent sponsored event to avoid needing a
 // system account. If no sponsored events exist yet the fill is a no-op.
-async function autoFillSchedule(): Promise<void> {
+export async function autoFillSchedule(): Promise<void> {
   // Find a creator ID to attribute new rooms to
   const [recent] = await db
     .select({ creatorId: raceRoomsTable.creatorId })
@@ -177,8 +177,37 @@ async function autoFillSchedule(): Promise<void> {
   }
 }
 
+/**
+ * Instant the next scheduled sponsored event becomes due, or null if none are pending.
+ *
+ * Lets the worker arm a precise one-shot wake instead of discovering the event on its next
+ * poll. That matters more than it looks: between scheduledStartAt passing and this job
+ * flipping the room to in_progress, the room matches no branch of the discovery filter in
+ * getSponsoredEventsForUser (status is still 'scheduled' but scheduledStartAt is no longer in
+ * the future), so it vanishes from GET /api/sponsored-events. The app's waiting room loads
+ * and polls that same endpoint, so during that gap a registered user sees a frozen countdown
+ * — or "Event not found." on a cold open. Keep the gap at seconds, not minutes.
+ */
+export async function nextSponsoredStartAt(): Promise<Date | null> {
+  const [next] = await db
+    .select({ at: raceRoomsTable.scheduledStartAt })
+    .from(raceRoomsTable)
+    .where(
+      and(
+        eq(raceRoomsTable.type, "sponsored"),
+        eq(raceRoomsTable.scheduleType, "scheduled"),
+        eq(raceRoomsTable.status, "scheduled"),
+        gt(raceRoomsTable.scheduledStartAt, new Date()),
+      ),
+    )
+    .orderBy(asc(raceRoomsTable.scheduledStartAt))
+    .limit(1);
+
+  return next?.at ?? null;
+}
+
 // ── Background job: auto-start/cancel due events ───────────────────────────────
-async function processSponsuredEvents() {
+export async function processSponsuredEvents() {
   try {
     const now = new Date();
     const dueRooms = await db
@@ -316,8 +345,10 @@ async function processSponsuredEvents() {
     // ── Phase 2: Finalize in_progress events whose 3-hour window has elapsed ──
     await finalizeSponsoredEvents(now);
 
-    // Always keep 8 weekends ahead populated after processing
-    await autoFillSchedule();
+    // autoFillSchedule() deliberately does NOT run here. It issues one SELECT per weekend
+    // slot (16 queries) and only ever creates rooms 8 weekends out, so running it on this
+    // cadence bought nothing and was the single largest source of idle Neon traffic. It now
+    // runs from the hourly maintenance pass in backgroundJobs.ts.
   } catch (err) {
     logger.error({ err }, "[SponsoredEventsJob] processSponsuredEvents failed");
   }
@@ -449,15 +480,11 @@ async function finalizeSponsoredEvents(now: Date) {
   }
 }
 
-let sponsoredEventsJobStarted = false;
-
-export function startSponsoredEventsJob(): void {
-  if (sponsoredEventsJobStarted) return;
-  sponsoredEventsJobStarted = true;
-
-  setInterval(() => { processSponsuredEvents().catch(() => {}); }, 60_000);
-  setTimeout(() => { processSponsuredEvents().catch(() => {}); }, 5_000);
-}
+// This job owns no timer of its own. processSponsuredEvents() opens with an unconditional
+// race_rooms scan, so a 60s interval here touched Postgres every minute forever and — on its
+// own — kept Neon compute from ever reaching the 5-minute inactivity window it needs to
+// suspend. Both entry points are now driven from the coalesced passes in backgroundJobs.ts so
+// every idle wake is shared instead of paying a separate autosuspend tail.
 
 type SponsoredEventsMode = "full" | "card";
 type SponsoredEventsOptions = { includeCoinBalance?: boolean };

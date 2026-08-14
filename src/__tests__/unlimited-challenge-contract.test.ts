@@ -180,8 +180,8 @@ describe("USD Unlimited strict midnight scheduling", () => {
 });
 
 describe("viewer membership on read paths (Next Race must not infer 'mine' from host id)", () => {
-  it("list overlays the viewer's own membership per challenge (batched, left excluded)", () => {
-    expect(router).toContain("currentUserRegistered: status != null && status !== \"left\"");
+  it("list overlays the viewer's own membership per challenge (batched, terminal statuses excluded)", () => {
+    expect(router).toContain("!UNLIMITED_NON_ACTIVE_STATUSES.includes");
     expect(router).toContain("participationStatus: status");
     // batched lookup via overlayMembership helper, not N+1
     expect(router).toContain("async function overlayMembership");
@@ -189,7 +189,7 @@ describe("viewer membership on read paths (Next Race must not infer 'mine' from 
     expect(router).toContain("rows.map((r) => r.id)");
   });
   it("detail exposes an explicit currentUserRegistered boolean alongside membership.status", () => {
-    expect(router).toContain('currentUserRegistered: !!membership && membership.status !== "left"');
+    expect(router).toContain("membership.status as typeof UNLIMITED_NON_ACTIVE_STATUSES[number]");
   });
   it("leave response self-describes released membership + refundAmountCents alias", () => {
     expect(router).toContain("currentUserRegistered: false");
@@ -232,7 +232,7 @@ describe("unified GET /races/my-upcoming ('mine' = active participation)", () =>
   it("merges scheduled fixed races (registered) + unlimited challenges (active participant)", () => {
     expect(races).toContain('router.get("/races/my-upcoming"');
     expect(races).toContain('eq(scheduledRoomRegistrationsTable.status, "registered")');
-    expect(races).toContain('ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left")');
+    expect(races).toContain("notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES])");
     expect(races).toContain('inArray(unlimitedChallengesTable.status, ["waiting", "starting", "active", "settling"])');
   });
   it("tags each item by kind and never treats host id alone as membership", () => {

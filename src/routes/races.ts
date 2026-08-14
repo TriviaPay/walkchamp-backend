@@ -120,8 +120,12 @@ import { writeAuditLog } from "../lib/auditLog.js";
 import { sendNotification } from "./notifications.js";
 import { computeCanStart, terminateWaitingRoom, enqueueWaitingRoomLifecycleJobs } from "../lib/waitingRoom.js";
 import { getUnlimitedBlockingMembership } from "../lib/challengeMembership.js";
+import { UNLIMITED_NON_ACTIVE_STATUSES } from "../lib/unlimitedChallengeStatuses.js";
+import { leaveUnlimitedChallenge } from "../lib/unlimitedChallengeService.js";
 
 const router = Router();
+const RACE_ROSTER_EXCLUDED_STATUSES = ["left", "forfeited", "disqualified"] as const;
+const RACE_NON_PARTICIPATING_STATUSES = ["left", "forfeited", "disqualified", "completed"] as const;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 /**
  * Fixed-player classic races (free / coins / cash, challengeDurationDays = 0):
@@ -291,8 +295,15 @@ export async function recoverStaleRaces(): Promise<void> {
  * (status=completed, settlementStatus=awaiting_verification).
  *
  * These are invisible to every other sweep, which all filter on status=in_progress, and they
- * are not "active races" either — so this must run ahead of the activeRaceCount() fast path
- * below or a deferred cash race would never be paid on an otherwise idle server.
+ * are not "active races" either — so this must never sit behind the activeRaceCount() fast
+ * path in cleanupOverdueRaces() or a deferred cash race would never be paid on an otherwise
+ * idle server. It therefore runs from the coalesced maintenance passes in backgroundJobs.ts,
+ * which are unconditional. Do NOT call it from the 15s tick: its query is ungatable (a
+ * pending payout leaves no trace in the active-race registry), so on that cadence it touched
+ * Postgres 4×/min forever and by itself prevented Neon from ever suspending.
+ *
+ * A pass every 15 minutes is well inside tolerance: what these rooms are waiting on is the
+ * verification grace window (config.hybridReconciliation.graceMs), which is measured in hours.
  *
  * Only awaiting_verification is retried automatically: the grace window expiring is what
  * resolves it (strict → hold for review, non-strict → settle on the capped live total).
@@ -322,9 +333,6 @@ export async function resettlePendingRaces(): Promise<void> {
 
 export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<void> {
   try {
-    // Deferred payouts first — see resettlePendingRaces for why this precedes the idle gate.
-    await resettlePendingRaces();
-
     // Fast-path gate: when the durable registry confidently reports zero active races,
     // skip the Postgres scan entirely so Neon compute can suspend while idle. `null`
     // means the registry is unavailable → fail open and scan. `force` bypasses the gate
@@ -2990,7 +2998,7 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
         and(
           eq(raceParticipantsTable.raceRoomId, raceRoomsTable.id),
           eq(raceParticipantsTable.userId, userId),
-          and(ne(raceParticipantsTable.status, "left"), ne(raceParticipantsTable.status, "forfeited")),
+          notInArray(raceParticipantsTable.status, [...RACE_ROSTER_EXCLUDED_STATUSES]),
         ),
       )
       .where(inArray(raceRoomsTable.status, ["open", "in_progress"]))
@@ -3017,7 +3025,7 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
       .where(
         and(
           eq(unlimitedChallengeParticipantsTable.userId, userId),
-          ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+          notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
           inArray(unlimitedChallengesTable.status, ["waiting", "starting", "active", "settling"]),
         ),
       )
@@ -3140,7 +3148,7 @@ router.get("/races/my-upcoming", requireAuth, async (req, res) => {
       .where(
         and(
           eq(unlimitedChallengeParticipantsTable.userId, userId),
-          ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+          notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
           inArray(unlimitedChallengesTable.status, ["waiting", "starting", "active", "settling"]),
         ),
       ),
@@ -4038,7 +4046,40 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
     .where(eq(raceRoomsTable.id, raceId))
     .limit(1);
 
-  if (!room) return res.status(404).json({ error: "Race not found" });
+  if (!room) {
+    const [unlimitedChallenge] = await db
+      .select({ id: unlimitedChallengesTable.id })
+      .from(unlimitedChallengesTable)
+      .where(eq(unlimitedChallengesTable.id, raceId))
+      .limit(1);
+
+    if (unlimitedChallenge) {
+      const result = await leaveUnlimitedChallenge(userId, raceId);
+      if (!result.ok) return res.status(result.httpStatus).json(result.body);
+      return res.json({
+        success: true,
+        challengeId: result.data.challengeId,
+        raceId: result.data.challengeId,
+        room_id: result.data.challengeId,
+        raceContinues: true,
+        challengeContinues: true,
+        participationStatus: "left",
+        participantStatus: "left",
+        participant_status: "left",
+        currentUserRegistered: false,
+        current_user_registered: false,
+        prizeEligible: false,
+        refundEligible: result.data.refundIssued,
+        refundIssued: result.data.refundIssued,
+        refundAmount: result.data.refundAmountCents / 100,
+        refundAmountCents: result.data.refundAmountCents,
+        activeChallengeReleased: true,
+        can_rejoin: false,
+      });
+    }
+
+    return res.status(404).json({ error: "Race not found" });
+  }
   if (room.status === "completed" || room.status === "cancelled") {
     return res.status(409).json({ error: "Race is already finished." });
   }
@@ -4322,11 +4363,37 @@ router.get("/races", requireAuth, async (req, res) => {
     .orderBy(orderByClause)
     .limit(limitNum)
     .offset(offsetNum);
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const viewerMemberships = rows.length
+    ? await db
+        .select({
+          raceRoomId: raceParticipantsTable.raceRoomId,
+          status: raceParticipantsTable.status,
+        })
+        .from(raceParticipantsTable)
+        .where(
+          and(
+            eq(raceParticipantsTable.userId, userId),
+            inArray(
+              raceParticipantsTable.raceRoomId,
+              rows.map((room) => room.id),
+            ),
+          ),
+        )
+    : [];
+  const viewerStatusByRace = new Map(viewerMemberships.map((p) => [p.raceRoomId, p.status]));
   const trackThemeMediaMap = await getTrackThemeMediaMap(rows.map((room) => room.trackLayout));
 
   // Attach top-3 participants for each race
   const racesWithPlayers = await Promise.all(
     rows.map(async (room) => {
+      const currentUserParticipantStatus = viewerStatusByRace.get(room.id) ?? null;
+      const currentUserParticipating =
+        currentUserParticipantStatus !== null
+        && !RACE_NON_PARTICIPATING_STATUSES.includes(
+          currentUserParticipantStatus as typeof RACE_NON_PARTICIPATING_STATUSES[number],
+        );
+
       // For completed races, read authoritative steps from race_results (ordered by rank).
       // For active races, read live progress from race_participants.
       let players: Array<{ id: string; userId: string; username: string; countryFlag: string; avatarColor: string; avatarUrl: string | null; avatarVersion: number; currentSteps: number; rank: number; isHost: boolean; prizeAmount?: number; isTied?: boolean; tieGroupSize?: number }>;
@@ -4382,7 +4449,12 @@ router.get("/races", requireAuth, async (req, res) => {
           })
           .from(raceParticipantsTable)
           .innerJoin(profilesTable, eq(raceParticipantsTable.userId, profilesTable.id))
-          .where(and(eq(raceParticipantsTable.raceRoomId, room.id), ne(raceParticipantsTable.status, "left")))
+          .where(
+            and(
+              eq(raceParticipantsTable.raceRoomId, room.id),
+              notInArray(raceParticipantsTable.status, [...RACE_ROSTER_EXCLUDED_STATUSES]),
+            ),
+          )
           .orderBy(desc(raceParticipantsTable.currentSteps))
           .limit(3);
 
@@ -4442,6 +4514,8 @@ router.get("/races", requireAuth, async (req, res) => {
         completedAt: room.completedAt,
         createdAt: room.createdAt,
         creatorId: room.creatorId,
+        currentUserParticipantStatus,
+        currentUserParticipating,
         trackLayout: room.trackLayout ?? "bg",
         trackTheme,
         imageSet: trackTheme.imageSet,
@@ -6965,7 +7039,11 @@ router.post("/races/:id/reconcile-steps", requireAuth, async (req, res) => {
       .update(raceResultsTable)
       .set({
         steps: resultSteps,
-        status: resultStatus,
+        // Never DOWNGRADE an already-verified settled row. This endpoint only runs after the
+        // room is completed, so the row it rewrites has already been settled; letting it drop
+        // back to "pending_verification" left a settled winner carrying eligible_for_prize=true
+        // with a non-terminal status. Upgrades to "verified" still apply.
+        status: sql`CASE WHEN ${raceResultsTable.status} = 'verified' THEN 'verified' ELSE ${resultStatus} END`,
         reconciliationStatus: result.status,
         authoritativeStepSource: verifiedOutcome ? "reconciled" : "live",
       })
@@ -7014,7 +7092,8 @@ router.post("/races/:id/reconcile-steps", requireAuth, async (req, res) => {
 
   await db
     .update(raceResultsTable)
-    .set({ steps, status })
+    // Same no-downgrade rule as the hybrid path above: a settled "verified" row is terminal.
+    .set({ steps, status: sql`CASE WHEN ${raceResultsTable.status} = 'verified' THEN 'verified' ELSE ${status} END` })
     .where(and(eq(raceResultsTable.raceRoomId, raceId), eq(raceResultsTable.userId, userId)));
 
   req.log.info({ raceId, userId, steps, source, serverSteps, status, prev: existingResult.steps }, "race steps reconciled");
