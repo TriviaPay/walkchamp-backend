@@ -189,6 +189,25 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
     expect(liveProgress).toContain("notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES])");
     expect(liveProgress).toContain("isCurrentUser: p.userId === currentUserId");
   });
+
+  it("my-active and detail expose the same challenge summary fields clients render from", () => {
+    expect(router).toContain("async function loadChallengeParticipantCounts");
+    const myActive = router.slice(
+      router.indexOf('router.get("/unlimited-challenges/my-active"'),
+      router.indexOf("// ── GET /unlimited-challenges (paginated public listing)"),
+    );
+    const detail = router.slice(
+      router.indexOf('router.get("/unlimited-challenges/:id"'),
+      router.indexOf("// ── POST /unlimited-challenges/:id/live-progress"),
+    );
+    for (const field of ["startAtUtc", "challengeEndAtUtc", "prizePoolCents"]) {
+      expect(router).toContain(`${field}: c.${field}`);
+    }
+    expect(myActive).toContain("participantCount: participantCounts.get(r.challenge.id) ?? 0");
+    expect(myActive).toContain("return res.json({ challenge: challenges[0] ?? null, challenges, count: challenges.length })");
+    expect(detail).toContain("participantCount: players.length");
+    expect(detail).toContain("challenge: {");
+  });
 });
 
 describe("USD Unlimited strict midnight scheduling", () => {

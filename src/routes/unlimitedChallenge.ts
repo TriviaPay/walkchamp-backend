@@ -154,6 +154,25 @@ async function overlayMembership(
   });
 }
 
+async function loadChallengeParticipantCounts(challengeIds: string[]): Promise<Map<string, number>> {
+  if (challengeIds.length === 0) return new Map();
+  const rows = await db
+    .select({
+      challengeId: unlimitedChallengeParticipantsTable.challengeId,
+      participantCount: sql<number>`count(*)::int`,
+    })
+    .from(unlimitedChallengeParticipantsTable)
+    .where(
+      and(
+        inArray(unlimitedChallengeParticipantsTable.challengeId, challengeIds),
+        sql`${unlimitedChallengeParticipantsTable.entryContributionCents} > 0`,
+        notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
+      ),
+    )
+    .groupBy(unlimitedChallengeParticipantsTable.challengeId);
+  return new Map(rows.map((r) => [r.challengeId, Number(r.participantCount)]));
+}
+
 /** The timezone a not-yet-joined viewer would lock if they joined now. */
 async function resolveViewerTimezone(userId: string): Promise<string> {
   const [pref] = await db
@@ -381,16 +400,18 @@ router.get("/unlimited-challenges/my-active", requireAuth, async (req, res) => {
   // globally `active` while this viewer is still `scheduled` until their own local midnight.
   // The Android daily foreground service reads viewerTimezone / currentDayEndAt / viewerEndAt
   // from here rather than reconstructing host-timezone semantics natively.
+  const participantCounts = await loadChallengeParticipantCounts(rows.map((r) => r.challenge.id));
   const challenges = await Promise.all(
     rows.map(async (r) => ({
       ...serializeChallenge(r.challenge),
+      participantCount: participantCounts.get(r.challenge.id) ?? 0,
       participationStatus: r.participationStatus,
       currentUserRegistered: true,
       challengeStatus: r.challenge.status,
       ...(await buildViewerSchedule(r.challenge, userId)),
     })),
   );
-  return res.json({ challenges, count: challenges.length });
+  return res.json({ challenge: challenges[0] ?? null, challenges, count: challenges.length });
 });
 
 // ── GET /unlimited-challenges (paginated public listing) ──────────────────────
