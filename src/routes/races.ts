@@ -133,6 +133,8 @@ const MS_PER_DAY = 24 * 60 * 60 * 1000;
  * Not used for Unlimited, multi-day duration challenges, or sponsored (3h).
  */
 const FIXED_RACE_MAX_DURATION_MS = MS_PER_DAY;
+/** Sponsored events run a fixed 3h window; the timeout jobs and the displayed clock share it. */
+const SPONSORED_EVENT_DURATION_MS = 3 * 60 * 60_000;
 
 class PaidJoinRollback extends Error {
   constructor(
@@ -363,7 +365,7 @@ export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<v
       const isSponsored = r.type === "sponsored";
       const isDuration = isDurationChallengeRoom(r);
       const timeoutAtMs = isSponsored
-        ? (r.startedAt?.getTime() ?? Date.now()) + 3 * 60 * 60_000
+        ? (r.startedAt?.getTime() ?? Date.now()) + SPONSORED_EVENT_DURATION_MS
         : isDuration
           ? (r.challengeEndAt?.getTime()
               ?? (r.startedAt?.getTime() ?? Date.now()) + FIXED_RACE_MAX_DURATION_MS)
@@ -379,7 +381,7 @@ export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<v
       if (race.startedAt) {
         const elapsed = Date.now() - race.startedAt.getTime();
         const timeoutMs = isSponsored
-          ? 3 * 60 * 60_000
+          ? SPONSORED_EVENT_DURATION_MS
           : isDurationChallenge
             ? null
             : FIXED_RACE_MAX_DURATION_MS;
@@ -504,8 +506,31 @@ function deriveChallengeEndAt(room: Pick<typeof raceRoomsTable.$inferSelect, "ch
   return new Date(start.getTime() + room.challengeDurationDays * MS_PER_DAY);
 }
 
-function buildChallengeTimeFields(room: Pick<typeof raceRoomsTable.$inferSelect, "challengeEndAt" | "challengeDurationDays" | "startedAt" | "scheduledStartAt">) {
-  const challengeEndAt = deriveChallengeEndAt(room);
+/**
+ * End instant for DISPLAY only — never for settlement.
+ *
+ * deriveChallengeEndAt() returns null for a started classic race whose challengeEndAt column is
+ * empty and whose challengeDurationDays is 0. That is every classic race started before the
+ * start hook began writing startedAt + 24h, so their list/detail payloads shipped a null
+ * challengeEndAt and timeLeftSeconds and the client had to invent the clock locally.
+ *
+ * The fallback mirrors the timeout jobs exactly (sponsored 3h, classic FIXED_RACE_MAX_DURATION_MS),
+ * so the countdown a client renders matches the deadline the server will actually enforce.
+ * Deliberately NOT folded into deriveChallengeEndAt: that feeds the settlement completer filter
+ * (raceEndAtForSettlement), where turning a null into a real instant would retroactively exclude
+ * finishers on legacy in-progress races.
+ */
+export function displayChallengeEndAt(room: RoomTimeSource): Date | null {
+  const explicit = deriveChallengeEndAt(room);
+  if (explicit) return explicit;
+  if (!room.startedAt) return null;
+  if (room.challengeDurationDays > 0) return null;
+  const windowMs = room.type === "sponsored" ? SPONSORED_EVENT_DURATION_MS : FIXED_RACE_MAX_DURATION_MS;
+  return new Date(room.startedAt.getTime() + windowMs);
+}
+
+function buildChallengeTimeFields(room: RoomTimeSource) {
+  const challengeEndAt = displayChallengeEndAt(room);
   const timeLeftSeconds = challengeEndAt
     ? Math.max(0, Math.floor((challengeEndAt.getTime() - Date.now()) / 1000))
     : null;
@@ -527,7 +552,7 @@ function buildChallengeTimeFields(room: Pick<typeof raceRoomsTable.$inferSelect,
 
 type RoomTimeSource = Pick<
   typeof raceRoomsTable.$inferSelect,
-  "challengeEndAt" | "challengeDurationDays" | "startedAt" | "scheduledStartAt"
+  "challengeEndAt" | "challengeDurationDays" | "startedAt" | "scheduledStartAt" | "type"
 >;
 
 /**
@@ -550,6 +575,7 @@ const EMPTY_CARD_TIME_FIELDS = buildCardTimeFields({
   challengeDurationDays: 0,
   startedAt: null,
   scheduledStartAt: null,
+  type: "quick",
 });
 
 const MANUAL_COMPLETION_REASONS = new Set(["admin_force_complete", "manual_force_complete"]);
@@ -2395,6 +2421,7 @@ export async function getChallengeCardsForUser(userId: string) {
           scheduledStartAt: raceRoomsTable.scheduledStartAt,
           challengeDurationDays: raceRoomsTable.challengeDurationDays,
           challengeEndAt: raceRoomsTable.challengeEndAt,
+          type: raceRoomsTable.type,
         })
         .from(raceRoomsTable)
         .where(
@@ -2438,6 +2465,7 @@ export async function getChallengeCardsForUser(userId: string) {
           scheduledStartAt: raceRoomsTable.scheduledStartAt,
           challengeDurationDays: raceRoomsTable.challengeDurationDays,
           challengeEndAt: raceRoomsTable.challengeEndAt,
+          type: raceRoomsTable.type,
         })
         .from(raceRoomsTable)
         .where(
@@ -2572,6 +2600,7 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
         scheduledStartAt: raceRoomsTable.scheduledStartAt,
         challengeDurationDays: raceRoomsTable.challengeDurationDays,
         challengeEndAt: raceRoomsTable.challengeEndAt,
+        type: raceRoomsTable.type,
         creatorId: raceRoomsTable.creatorId,
         createdAt: raceRoomsTable.createdAt,
         hostUsername: profilesTable.username,
@@ -2990,6 +3019,7 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
         scheduledStartAt: raceRoomsTable.scheduledStartAt,
         challengeDurationDays: raceRoomsTable.challengeDurationDays,
         challengeEndAt: raceRoomsTable.challengeEndAt,
+        type: raceRoomsTable.type,
         createdAt: raceRoomsTable.createdAt,
       })
       .from(raceRoomsTable)
@@ -3841,7 +3871,7 @@ export async function activateRoomAndStart(
   // (durationDays 0 or legacy daily=1): startedAt + 24h unless winners finish sooner.
   const challengeEndAt =
     room.type === "sponsored"
-      ? new Date(startedAt.getTime() + 3 * 60 * 60_000)
+      ? new Date(startedAt.getTime() + SPONSORED_EVENT_DURATION_MS)
       : isDurationChallengeRoom(room)
         ? deriveChallengeEndAt({ ...room, startedAt })
         : new Date(startedAt.getTime() + FIXED_RACE_MAX_DURATION_MS);

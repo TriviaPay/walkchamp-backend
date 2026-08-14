@@ -53,12 +53,40 @@ async function wasRecentlySent(userId: string, dedupeKey: string, windowMs = 120
   return !!row;
 }
 
+/**
+ * Drop recipients who already received a push under `dedupeKey` inside the window.
+ *
+ * ONE query for the whole batch. This used to await wasRecentlySent() per recipient in a
+ * sequential loop — fine for a room chat, but notifyGlobalChatMessageReceived() passes every
+ * user with an active device and applies no cap, so a single global-chat message issued one
+ * round-trip per user, serially, against Neon. That both scaled linearly with signups and
+ * worked directly against keeping compute idle enough to autosuspend.
+ */
+async function filterRecentlySentRecipients(
+  userIds: string[],
+  dedupeKey: string,
+  windowMs = 120_000,
+): Promise<string[]> {
+  if (userIds.length === 0) return [];
+  const since = new Date(Date.now() - windowMs);
+  const rows = await db
+    .selectDistinct({ userId: pushNotificationLogsTable.userId })
+    .from(pushNotificationLogsTable)
+    .where(
+      and(
+        inArray(pushNotificationLogsTable.userId, userIds),
+        eq(pushNotificationLogsTable.status, "sent"),
+        gt(pushNotificationLogsTable.createdAt, since),
+        sql`${pushNotificationLogsTable.data}->>'dedupeKey' = ${dedupeKey}`,
+      ),
+    );
+  const recentlySent = new Set(rows.map((r) => r.userId));
+  // Preserves input order, and returns a fresh array like the previous implementation.
+  return userIds.filter((uid) => !recentlySent.has(uid));
+}
+
 async function filterDedupedRecipients(userIds: string[], dedupeKey: string): Promise<string[]> {
-  const out: string[] = [];
-  for (const uid of userIds) {
-    if (!(await wasRecentlySent(uid, dedupeKey))) out.push(uid);
-  }
-  return out;
+  return filterRecentlySentRecipients(userIds, dedupeKey);
 }
 
 async function safeSend(
@@ -104,17 +132,6 @@ export function buildChatMessagePreview(text: string): string | null {
   return `${trimmed.slice(0, 117)}...`;
 }
 
-async function filterRecentlySentRecipients(
-  userIds: string[],
-  dedupeKey: string,
-  windowMs: number,
-): Promise<string[]> {
-  const out: string[] = [];
-  for (const uid of userIds) {
-    if (!(await wasRecentlySent(uid, dedupeKey, windowMs))) out.push(uid);
-  }
-  return out;
-}
 
 async function getPromotionalRecipientIds(excludeUserId?: string, cap = 500): Promise<string[]> {
   const deviceRows = await db

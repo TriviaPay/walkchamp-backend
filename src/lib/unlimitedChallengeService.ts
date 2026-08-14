@@ -14,6 +14,7 @@ import { computeIsAdult } from "./dateOfBirth.js";
 import { isCashChallengeUnsupportedForUser } from "./cashChallengeFees.js";
 import { allocateChallengeCode } from "./uniqueCodes.js";
 import { validateUnlimitedSchedule } from "./challengeDayWindow.js";
+import { UNLIMITED_LEFT_STATUSES } from "./unlimitedChallengeStatuses.js";
 import {
   materializeParticipantSchedule,
   participantScheduleFor,
@@ -392,7 +393,13 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
       .limit(1)
       .for("update");
     if (!participant) return { ok: false as const, httpStatus: 404, body: { error: "You are not a participant in this challenge." } };
-    if (participant.qualificationStatus === "left") return { ok: true as const, refundIssued: false, refundAmountCents: 0 }; // idempotent
+    // Idempotent for every already-gone status, not just "left". A participant who forfeited (or
+    // withdrew/quit) is out of the challenge by the same rules; treating only "left" as terminal
+    // meant a retry on a forfeited row fell through and re-ran the leave path — rewriting
+    // qualificationStatus and, pre-start, attempting a second refund.
+    if ((UNLIMITED_LEFT_STATUSES as readonly string[]).includes(participant.qualificationStatus)) {
+      return { ok: true as const, refundIssued: false, refundAmountCents: 0 }; // idempotent
+    }
 
     // Pre-start iff still waiting AND server time is before the authoritative start instant.
     const preStart = challenge.status === "waiting" && Date.now() < challenge.startAtUtc.getTime();
