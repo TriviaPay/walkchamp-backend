@@ -15,4 +15,23 @@ describe("GET /api/races viewer membership", () => {
     expect(races).toContain("currentUserParticipantStatus,");
     expect(races).toContain("currentUserParticipating,");
   });
+
+  it("uses participant rows as completed-card roster source while result rows supply prizes", () => {
+    const completedBranch = races.slice(
+      races.indexOf('if (room.status === "completed")'),
+      races.indexOf("} else {", races.indexOf('if (room.status === "completed")')),
+    );
+
+    expect(completedBranch).toContain(".from(raceResultsTable)");
+    expect(completedBranch).toContain("prizeCents: raceResultsTable.prizeCents");
+    expect(completedBranch).toContain("eligibleForPrize: raceResultsTable.eligibleForPrize");
+    expect(completedBranch).toContain(".from(raceParticipantsTable)");
+    expect(completedBranch).toContain("where(eq(raceParticipantsTable.raceRoomId, room.id))");
+    expect(completedBranch).toContain("const resultByUserId = new Map");
+    expect(completedBranch).toContain(".filter((p) => !resultByUserId.has(p.userId))");
+    expect(completedBranch).toContain("currentSteps: p.finalSteps ?? p.currentSteps");
+    expect(completedBranch).toContain("eligibleForPrize: false");
+    expect(completedBranch).toContain("rank: room.currentPlayers + i + 1");
+    expect(completedBranch).toContain("players = [...players, ...terminalPlayers]");
+  });
 });

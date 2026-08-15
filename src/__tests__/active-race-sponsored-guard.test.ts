@@ -19,8 +19,28 @@ describe("active race sponsored guard", () => {
     const cardsStart = racesRoute.indexOf("export async function getChallengeCardsForUser");
     const cardsEnd = racesRoute.indexOf("router.get(\"/challenges/available\"");
     const cardsHelper = racesRoute.slice(cardsStart, cardsEnd);
+    const activeOtherBlock = cardsHelper.slice(
+      cardsHelper.indexOf("const activeOther = await db"),
+      cardsHelper.indexOf("if (activeOther.length > 0)"),
+    );
 
     expect(cardsHelper.match(/ne\(raceRoomsTable\.type, "sponsored"\)/g)?.length).toBeGreaterThanOrEqual(3);
+    expect(activeOtherBlock).toContain('ne(raceRoomsTable.type, "sponsored")');
+  });
+
+  it("includes future scheduled registrations in regular challenge cards", () => {
+    const racesRoute = readFileSync("src/routes/races.ts", "utf8");
+    const cardsStart = racesRoute.indexOf("export async function getChallengeCardsForUser");
+    const cardsEnd = racesRoute.indexOf("router.get(\"/challenges/available\"");
+    const cardsHelper = racesRoute.slice(cardsStart, cardsEnd);
+
+    expect(cardsHelper).toContain("const scheduledRows = userRows.length === 0");
+    expect(cardsHelper).toContain(".from(scheduledRoomRegistrationsTable)");
+    expect(cardsHelper).toContain('eq(scheduledRoomRegistrationsTable.status, "registered")');
+    expect(cardsHelper).toContain("eq(raceRoomsTable.entryType, et)");
+    expect(cardsHelper).toContain('eq(raceRoomsTable.status, "scheduled")');
+    expect(cardsHelper).toContain('ne(raceRoomsTable.type, "sponsored")');
+    expect(cardsHelper).toContain("const room = userRows[0] ?? scheduledRows[0]");
   });
 
   it("adds modal copy and room details to regular-race conflict payloads", () => {

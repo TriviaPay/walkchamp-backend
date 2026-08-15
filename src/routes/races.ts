@@ -2447,8 +2447,39 @@ export async function getChallengeCardsForUser(userId: string) {
         .orderBy(desc(raceRoomsTable.createdAt))
         .limit(1);
 
-      if (userRows.length > 0) {
-        const room = userRows[0];
+      const scheduledRows = userRows.length === 0
+        ? await db
+          .select({
+            id: raceRoomsTable.id,
+            status: raceRoomsTable.status,
+            type: raceRoomsTable.type,
+            creatorId: raceRoomsTable.creatorId,
+            currentPlayers: raceRoomsTable.currentPlayers,
+            maxPlayers: raceRoomsTable.maxPlayers,
+            targetSteps: raceRoomsTable.targetSteps,
+            entryAmountCents: raceRoomsTable.entryAmountCents,
+            startedAt: raceRoomsTable.startedAt,
+            scheduledStartAt: raceRoomsTable.scheduledStartAt,
+            challengeDurationDays: raceRoomsTable.challengeDurationDays,
+            challengeEndAt: raceRoomsTable.challengeEndAt,
+          })
+          .from(scheduledRoomRegistrationsTable)
+          .innerJoin(raceRoomsTable, eq(raceRoomsTable.id, scheduledRoomRegistrationsTable.raceRoomId))
+          .where(
+            and(
+              eq(scheduledRoomRegistrationsTable.userId, userId),
+              eq(scheduledRoomRegistrationsTable.status, "registered"),
+              eq(raceRoomsTable.entryType, et),
+              eq(raceRoomsTable.status, "scheduled"),
+              ne(raceRoomsTable.type, "sponsored"),
+            ),
+          )
+          .orderBy(asc(raceRoomsTable.scheduledStartAt))
+          .limit(1)
+        : [];
+
+      const room = userRows[0] ?? scheduledRows[0];
+      if (room) {
         const isHost = room.creatorId === userId;
 
         // Active race the user is in
@@ -2552,6 +2583,7 @@ export async function getChallengeCardsForUser(userId: string) {
           and(
             eq(raceRoomsTable.entryType, et),
             eq(raceRoomsTable.status, "in_progress"),
+            ne(raceRoomsTable.type, "sponsored"),
             eq(raceRoomsTable.isPrivate, false),
           ),
         )
@@ -4514,7 +4546,30 @@ router.get("/races", requireAuth, async (req, res) => {
 
       // For completed races, read authoritative steps from race_results (ordered by rank).
       // For active races, read live progress from race_participants.
-      let players: Array<{ id: string; userId: string; username: string; countryFlag: string; avatarColor: string; avatarUrl: string | null; avatarVersion: number; currentSteps: number; rank: number; isHost: boolean; prizeAmount?: number; isTied?: boolean; tieGroupSize?: number }>;
+      let players: Array<{
+        id: string;
+        userId: string;
+        username: string;
+        countryFlag: string;
+        avatarColor: string;
+        avatarUrl: string | null;
+        avatarVersion: number;
+        currentSteps: number;
+        targetSteps: number;
+        rank: number;
+        isHost: boolean;
+        status?: string;
+        participantStatus?: string;
+        statusLabel?: string;
+        resultRank?: number | null;
+        displayRank?: number | null;
+        eligibleForPrize?: boolean;
+        prizeAmount?: number;
+        prizeCents?: number;
+        prizeCoins?: number;
+        isTied?: boolean;
+        tieGroupSize?: number;
+      }>;
 
       if (room.status === "completed") {
         const results = await db
@@ -4522,9 +4577,13 @@ router.get("/races", requireAuth, async (req, res) => {
             userId: raceResultsTable.userId,
             steps: raceResultsTable.steps,
             rank: raceResultsTable.rank,
+            displayRank: raceResultsTable.displayRank,
             prizeCents: raceResultsTable.prizeCents,
+            prizeCoins: raceResultsTable.prizeCoins,
             isTied: raceResultsTable.isTied,
             tieGroupSize: raceResultsTable.tieGroupSize,
+            eligibleForPrize: raceResultsTable.eligibleForPrize,
+            resultStatus: raceResultsTable.status,
             username: profilesTable.username,
             countryFlag: profilesTable.countryFlag,
             avatarColor: profilesTable.avatarColor,
@@ -4535,24 +4594,88 @@ router.get("/races", requireAuth, async (req, res) => {
           .innerJoin(profilesTable, eq(raceResultsTable.userId, profilesTable.id))
           .where(eq(raceResultsTable.raceRoomId, room.id))
           .orderBy(asc(raceResultsTable.rank))
-          .limit(3);
+          .limit(room.maxPlayers);
+
+        const participants = await db
+          .select({
+            id: raceParticipantsTable.id,
+            userId: raceParticipantsTable.userId,
+            status: raceParticipantsTable.status,
+            currentSteps: raceParticipantsTable.currentSteps,
+            finalSteps: raceParticipantsTable.finalSteps,
+            username: profilesTable.username,
+            countryFlag: profilesTable.countryFlag,
+            avatarColor: profilesTable.avatarColor,
+            avatarUrl: profilesTable.avatarUrl,
+            updatedAt: profilesTable.updatedAt,
+          })
+          .from(raceParticipantsTable)
+          .innerJoin(profilesTable, eq(raceParticipantsTable.userId, profilesTable.id))
+          .where(eq(raceParticipantsTable.raceRoomId, room.id))
+          .orderBy(desc(raceParticipantsTable.currentSteps));
+
+        const participantByUserId = new Map(participants.map((p) => [p.userId, p] as const));
+        const resultByUserId = new Map(results.map((r) => [r.userId, r] as const));
+        const statusLabel = (status: string) =>
+          status === "disqualified" ? "DQ" :
+          status === "forfeited" || status === "left" ? "Lost" :
+          undefined;
 
         players = results.map((r) => ({
           id: r.userId,
           userId: r.userId,
-          username: r.username,
-          countryFlag: r.countryFlag ?? "🏳️",
-          avatarColor: r.avatarColor ?? "#00E676",
-          avatarUrl: r.avatarUrl ?? null,
-          avatarVersion: r.updatedAt?.getTime() ?? 0,
+          username: participantByUserId.get(r.userId)?.username?.trim() || r.username?.trim() || "Walker",
+          countryFlag: participantByUserId.get(r.userId)?.countryFlag ?? r.countryFlag ?? "🏳️",
+          avatarColor: participantByUserId.get(r.userId)?.avatarColor ?? r.avatarColor ?? "#00E676",
+          avatarUrl: participantByUserId.get(r.userId)?.avatarUrl ?? r.avatarUrl ?? null,
+          avatarVersion: participantByUserId.get(r.userId)?.updatedAt?.getTime() ?? r.updatedAt?.getTime() ?? 0,
           currentSteps: r.steps,
           targetSteps: targetStepsForRoom(room),
           rank: r.rank,
+          resultRank: r.rank,
+          displayRank: r.displayRank ?? r.rank,
           isHost: r.userId === room.creatorId,
+          status: r.resultStatus?.startsWith("disqualified") ? "disqualified" : "finished",
+          participantStatus: participantByUserId.get(r.userId)?.status ?? "completed",
+          statusLabel: r.resultStatus?.startsWith("disqualified") ? "DQ" : undefined,
+          eligibleForPrize: r.eligibleForPrize,
           prizeAmount: (r.prizeCents ?? 0) > 0 ? r.prizeCents! / 100 : undefined,
+          prizeCents: r.prizeCents ?? 0,
+          prizeCoins: r.prizeCoins ?? 0,
           isTied: r.isTied ?? false,
           tieGroupSize: r.tieGroupSize ?? 1,
         }));
+
+        const terminalPlayers = participants
+          .filter((p) => !resultByUserId.has(p.userId))
+          .map((p, i) => ({
+            id: p.userId,
+            userId: p.userId,
+            username: p.username?.trim() || "Walker",
+            countryFlag: p.countryFlag ?? "🏳️",
+            avatarColor: p.avatarColor ?? "#00E676",
+            avatarUrl: p.avatarUrl ?? null,
+            avatarVersion: p.updatedAt?.getTime() ?? 0,
+            currentSteps: p.finalSteps ?? p.currentSteps,
+            targetSteps: targetStepsForRoom(room),
+            // This is not a payout rank. Keep it out of winner ranges for older clients
+            // that still key prize UI from `rank` instead of `eligibleForPrize`.
+            rank: room.currentPlayers + i + 1,
+            resultRank: null,
+            displayRank: results.length + i + 1,
+            isHost: p.userId === room.creatorId,
+            status: p.status,
+            participantStatus: p.status,
+            statusLabel: statusLabel(p.status),
+            eligibleForPrize: false,
+            prizeAmount: undefined,
+            prizeCents: 0,
+            prizeCoins: 0,
+            isTied: false,
+            tieGroupSize: 1,
+          }));
+
+        players = [...players, ...terminalPlayers];
       } else {
         const participants = await db
           .select({
