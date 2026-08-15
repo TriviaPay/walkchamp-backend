@@ -205,21 +205,27 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
       .where(and(eq(unlimitedChallengeDaysTable.id, d.id), inArray(unlimitedChallengeDaysTable.status, ["pending", "in_progress", "pending_verification"])))
       .returning({ id: unlimitedChallengeDaysTable.id });
     if (updated && !passed) {
-      // First failed day permanently disqualifies the participant (if still eligible).
+      // First failed day permanently removes prize eligibility, but the participant stays in the
+      // challenge until they manually leave/forfeit so their remaining step results keep showing.
       await db
         .update(unlimitedChallengeParticipantsTable)
-        .set({ qualificationStatus: "disqualified", disqualifiedAt: now, disqualificationReason: "missed_daily_goal", updatedAt: now })
+        .set({
+          prizePoolEligibilityStatus: "not_eligible",
+          eligibilityReasonCode: "daily_goal_missed",
+          eligibilityFinalizedAt: now,
+          updatedAt: now,
+        })
         .where(and(
           eq(unlimitedChallengeParticipantsTable.id, d.participantId),
           inArray(unlimitedChallengeParticipantsTable.qualificationStatus, ["active", "goal_completed_today", "pending_verification"]),
         ));
       void emitUnlimitedRealtime(
         d.challengeId,
-        "participant_disqualified",
-        { challengeId: d.challengeId, userId: d.userId },
+        "participant_eligibility_updated",
+        { challengeId: d.challengeId, userId: d.userId, prizePoolEligibilityStatus: "not_eligible", eligibilityReason: "daily_goal_missed" },
         {
-          event: "race:participant-forfeited",
-          payload: { raceId: d.challengeId, userId: d.userId, reason: "missed_daily_goal" },
+          event: "race:participant-eligibility-updated",
+          payload: { raceId: d.challengeId, userId: d.userId, prizePoolEligibilityStatus: "not_eligible", eligibilityReason: "daily_goal_missed" },
         },
       );
     }

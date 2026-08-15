@@ -373,8 +373,15 @@ describe("§12/§15 daily history API", () => {
 
   it("reports passed/failed/pending counts so a lost run still shows its history", () => {
     expect(history).toContain("passedDays: days.filter");
-    expect(history).toContain("failedDays: days.filter");
+    expect(history).toContain("const failedDays = days.filter");
+    expect(history).toContain("failedDays,");
     expect(history).toContain("prizePoolEligibilityStatus: participant.prizePoolEligibilityStatus");
+  });
+  it("marks the viewer's broken streak result ready without changing global resultsStatus", () => {
+    expect(history).toContain("resultsStatus: challenge.resultsStatus");
+    expect(history).toContain('viewerResultsStatus = viewerStreakBroken ? "results_ready" : challenge.resultsStatus');
+    expect(history).toContain("viewerResultsReady");
+    expect(history).toContain('viewerResultReasonCode: viewerStreakBroken ? "daily_goal_missed" : null');
   });
 });
 

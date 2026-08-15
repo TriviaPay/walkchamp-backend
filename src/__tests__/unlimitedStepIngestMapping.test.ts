@@ -310,8 +310,10 @@ describe("finalization prefers the window-accurate total", () => {
     expect(jobs).toContain("GREATEST(${unlimitedChallengeDaysTable.verifiedSteps}");
   });
 
-  it("still disqualifies permanently on the first failed day", () => {
-    expect(jobs).toContain('qualificationStatus: "disqualified"');
-    expect(jobs).toContain('disqualificationReason: "missed_daily_goal"');
+  it("marks prize eligibility failed on the first missed day but keeps the participant active", () => {
+    expect(jobs).toContain('prizePoolEligibilityStatus: "not_eligible"');
+    expect(jobs).toContain('eligibilityReasonCode: "daily_goal_missed"');
+    expect(jobs).toContain("the participant stays in the");
+    expect(jobs).not.toContain('disqualificationReason: "missed_daily_goal"');
   });
 });

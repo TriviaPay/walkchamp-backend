@@ -540,6 +540,12 @@ async function buildViewerSchedule(
   // §7 — counters behind "waiting for all registered participants to finish in their local
   // timezones". Derived from the frozen settlement population, never from a live row count.
   const closure = await areAllParticipantWindowsClosed(challenge.id);
+  const viewerStreakBroken =
+    state.failedDays > 0 ||
+    participant?.eligibilityReasonCode === "daily_goal_missed";
+  const viewerResultsReady =
+    viewerStreakBroken || challenge.resultsStatus === "results_ready";
+  const viewerResultsStatus = viewerStreakBroken ? "results_ready" : challenge.resultsStatus;
 
   return {
     startLocalDate: resolveChallengeStartLocalDate(challenge),
@@ -553,6 +559,12 @@ async function buildViewerSchedule(
     prizePoolEligibilityStatus: participant?.prizePoolEligibilityStatus ?? null,
     eligibilityReasonCode: participant?.eligibilityReasonCode ?? null,
     inSettlementPopulation: participant?.inSettlementPopulation ?? null,
+    // The challenge-level resultsStatus still waits for settlement, but a viewer's own failed
+    // streak is final as soon as a day fails. Clients can show that result immediately.
+    viewerResultsStatus,
+    viewerResultsReady,
+    viewerResultFinal: viewerResultsReady,
+    viewerResultReasonCode: viewerStreakBroken ? "daily_goal_missed" : null,
     viewerStatus: state.viewerStatus,
     viewerTimezone: state.viewerTimezone,
     viewerTimezoneLockedAt: isoOrNull(participant?.timezoneLockedAt),
@@ -1075,6 +1087,14 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     createdAt: d.createdAt,
     updatedAt: d.updatedAt,
   }));
+  const failedDays = days.filter((d) => d.dayStatus === "failed").length;
+  const pendingDays = days.filter((d) => d.dayStatus === "validation_pending" || d.dayStatus === "in_progress").length;
+  const viewerStreakBroken =
+    failedDays > 0 ||
+    participant.eligibilityReasonCode === "daily_goal_missed";
+  const viewerResultsReady =
+    viewerStreakBroken || challenge.resultsStatus === "results_ready";
+  const viewerResultsStatus = viewerStreakBroken ? "results_ready" : challenge.resultsStatus;
 
   return res.json({
     challengeId,
@@ -1087,14 +1107,18 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     participantStartAtUtc: participant.participantStartAtUtc,
     participantEndAtUtc: participant.participantEndAtUtc,
     resultsStatus: challenge.resultsStatus,
+    viewerResultsStatus,
+    viewerResultsReady,
+    viewerResultFinal: viewerResultsReady,
+    viewerResultReasonCode: viewerStreakBroken ? "daily_goal_missed" : null,
     prizePoolEligibilityStatus: participant.prizePoolEligibilityStatus,
     eligibilityReasonCode: participant.eligibilityReasonCode,
     inSettlementPopulation: participant.inSettlementPopulation,
     // §20 — history is never erased when eligibility is lost: a participant who failed day 4 still
     // accumulates days 5..N, so the record can show "passed 6, failed 1, not eligible".
     passedDays: days.filter((d) => d.dayStatus === "passed").length,
-    failedDays: days.filter((d) => d.dayStatus === "failed").length,
-    pendingDays: days.filter((d) => d.dayStatus === "validation_pending" || d.dayStatus === "in_progress").length,
+    failedDays,
+    pendingDays,
     days,
   });
 });

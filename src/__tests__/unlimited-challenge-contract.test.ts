@@ -17,6 +17,7 @@ const coinsBattle = readFileSync("src/routes/coinsBattle.ts", "utf8");
 const walk = readFileSync("src/routes/walk.ts", "utf8");
 const membership = readFileSync("src/lib/challengeMembership.ts", "utf8");
 const schema = readFileSync("db/src/schema/unlimitedChallenge.ts", "utf8");
+const missedDayStaysActiveMigration = readFileSync("db/migrations/0031_unlimited_missed_day_stays_active.sql", "utf8");
 
 describe("rollback flag", () => {
   it("is env-driven (FEATURE_UNLIMITED_GOAL) and gates the router", () => {
@@ -141,11 +142,22 @@ describe("settlement: equal split, idempotent, zero-winner policy", () => {
   });
 });
 
-describe("daily qualification: one failed day permanently disqualifies", () => {
-  it("finalize marks passed/failed from verified daily totals and DQs on a miss", () => {
+describe("daily qualification: one failed day removes prize eligibility, not participation", () => {
+  it("finalize marks passed/failed from verified daily totals and keeps missed-day users in the challenge", () => {
     expect(jobs).toContain("stepDailyTotalsTable");
-    expect(jobs).toContain('disqualificationReason: "missed_daily_goal"');
+    expect(jobs).toContain('prizePoolEligibilityStatus: "not_eligible"');
+    expect(jobs).toContain('eligibilityReasonCode: "daily_goal_missed"');
+    expect(jobs).toContain("the participant stays in the");
+    expect(jobs).not.toContain('disqualificationReason: "missed_daily_goal"');
     expect(jobs).toContain("passed ? now : null"); // passedAt only when passed
+  });
+  it("repairs existing active missed-day disqualifications into prize-ineligible participants", () => {
+    expect(missedDayStaysActiveMigration).toContain(`"qualification_status" = 'active'`);
+    expect(missedDayStaysActiveMigration).toContain(`"prize_pool_eligibility_status" = 'not_eligible'`);
+    expect(missedDayStaysActiveMigration).toContain(`"eligibility_reason_code" = 'daily_goal_missed'`);
+    expect(missedDayStaysActiveMigration).toContain(`c."status" IN ('waiting', 'starting', 'active', 'settling')`);
+    expect(missedDayStaysActiveMigration).toContain(`p."disqualification_reason" = 'missed_daily_goal'`);
+    expect(readFileSync("db/migrations/meta/_journal.json", "utf8")).toContain("0031_unlimited_missed_day_stays_active");
   });
   it("uses locked-tz per-day windows anchored to the challenge DATE (unique per participant/day)", () => {
     // Superseded assertion: this used to require buildDayWindows(pre.startAtUtc, p.tz), i.e.
@@ -216,6 +228,18 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
     expect(myActive).toContain("return res.json({ challenge: challenges[0] ?? null, challenges, count: challenges.length })");
     expect(detail).toContain("challenge: serializeChallenge(challenge, { participantCount: players.length })");
     expect(detail).not.toContain("challenge: {");
+  });
+
+  it("viewer schedule exposes immediate result readiness when this viewer's streak breaks", () => {
+    const viewerFn = router.slice(
+      router.indexOf("async function buildViewerSchedule"),
+      router.indexOf("// ── POST /unlimited-challenges/host"),
+    );
+    expect(viewerFn).toContain("const viewerStreakBroken");
+    expect(viewerFn).toContain('viewerResultsStatus = viewerStreakBroken ? "results_ready" : challenge.resultsStatus');
+    expect(viewerFn).toContain("viewerResultsReady");
+    expect(viewerFn).toContain("viewerResultFinal: viewerResultsReady");
+    expect(viewerFn).toContain('viewerResultReasonCode: viewerStreakBroken ? "daily_goal_missed" : null');
   });
 });
 

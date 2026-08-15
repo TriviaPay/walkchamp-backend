@@ -218,6 +218,13 @@
       "when": 1786180685897,
       "tag": "0030_leaderboard_remaining_fixes",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1786768000000,
+      "tag": "0031_unlimited_missed_day_stays_active",
+      "breakpoints": true
     }
   ]
 }
