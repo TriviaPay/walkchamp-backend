@@ -879,7 +879,12 @@ router.post("/unlimited-challenges/:id/live-progress", requireAuth, async (req, 
       ),
     )
     .limit(1);
-  if (!membership || membership.status === "left" || membership.status === "disqualified") {
+  if (
+    !membership ||
+    UNLIMITED_NON_ACTIVE_STATUSES.includes(
+      membership.status as typeof UNLIMITED_NON_ACTIVE_STATUSES[number],
+    )
+  ) {
     return res.status(403).json({ error: "Not an active participant.", accepted: false });
   }
 
@@ -1142,10 +1147,8 @@ const VALID_REACTION_EMOJI = ["🔥", "👏", "👑", "🏃", "🏆", "😮", "�
 /**
  * True if the user may post to this challenge's chat.
  *
- * Excludes `left` and `disqualified`, matching the classic rule that only live participants can
- * broadcast on a public channel. Note this also silences someone who missed a day but is still
- * watching the challenge run — that is the requested behavior, and it is a one-line change here
- * if you would rather keep disqualified participants in the conversation.
+ * Excludes only manual exit statuses. A broken streak removes prize eligibility, not membership,
+ * so those participants can keep seeing/posting while their remaining days finish.
  */
 async function isUnlimitedChatParticipant(userId: string, challengeId: string): Promise<boolean> {
   const [row] = await db

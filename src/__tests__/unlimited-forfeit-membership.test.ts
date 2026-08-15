@@ -27,7 +27,8 @@ describe("Unlimited leave membership", () => {
 
   it("treats leave/forfeit aliases as inactive membership statuses", () => {
     expect(statuses).toContain('["left", "forfeited", "withdrawn", "quit"] as const');
-    expect(statuses).toContain('export const UNLIMITED_NON_ACTIVE_STATUSES = [...UNLIMITED_LEFT_STATUSES, "disqualified"] as const');
+    expect(statuses).toContain("export const UNLIMITED_NON_ACTIVE_STATUSES = [...UNLIMITED_LEFT_STATUSES] as const");
+    expect(statuses).not.toContain('UNLIMITED_NON_ACTIVE_STATUSES = [...UNLIMITED_LEFT_STATUSES, "disqualified"]');
   });
 
   it("classic /races/:id/leave falls through to Unlimited leave when the id is not a race room", () => {
@@ -43,8 +44,9 @@ describe("Unlimited leave membership", () => {
     expect(router).toContain("current_user_registered: currentUserRegistered");
   });
 
-  it("detail roster and leaderboard exclude inactive racers", () => {
+  it("detail roster and leaderboard exclude manual exits, not prize-ineligible racers", () => {
     expect(liveProgress).toContain("notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES])");
     expect(router).toContain("notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES])");
+    expect(router).toContain("Excludes only manual exit statuses");
   });
 });
