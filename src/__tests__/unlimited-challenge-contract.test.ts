@@ -245,6 +245,25 @@ describe("viewer membership on read paths (Next Race must not infer 'mine' from 
     expect(router).toContain("unlimitedChallengeParticipantsTable.challengeId");
     expect(router).toContain("rows.map((r) => r.id)");
   });
+  it("list cards expose a trimmed roster and live paid count after membership overlay", () => {
+    expect(router).toContain("async function overlayChallengeListCards");
+    expect(router).toContain("loadChallengeParticipantCounts(challengeIds)");
+    expect(router).toContain("participantCount: participantCounts.get(challenge.id) ?? 0");
+    expect(router).toContain("players,");
+    expect(router).toContain("participants: players");
+    expect(router).toContain("async function loadActiveChallengeCardPlayers");
+    expect(router).toContain("async function loadCompletedChallengeCardPlayers");
+    expect(router).toContain("p.entry_contribution_cents > 0");
+    expect(router).toContain("p.qualification_status NOT IN");
+    expect(router).toContain("INNER JOIN unlimited_challenge_days d ON d.participant_id = p.id");
+
+    const detail = router.slice(
+      router.indexOf('router.get("/unlimited-challenges/:id"'),
+      router.indexOf("// ── POST /unlimited-challenges/:id/live-progress"),
+    );
+    expect(detail).toContain("loadChallengePlayers(challengeId, userId, challenge.hostUserId)");
+    expect(detail).not.toContain("overlayChallengeListCards");
+  });
   it("detail exposes an explicit currentUserRegistered boolean alongside membership.status", () => {
     expect(router).toContain("membership.status as typeof UNLIMITED_NON_ACTIVE_STATUSES[number]");
   });

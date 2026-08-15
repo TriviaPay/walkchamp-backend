@@ -1,6 +1,6 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { z } from "zod";
-import { and, asc, desc, eq, gt, inArray, lte, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, lte, notInArray, sql, type SQL } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { profilesTable } from "../../db/src/schema/profiles.js";
 import { liveRaceCommentsTable, liveRaceReactionsTable } from "../../db/src/schema/liveRace.js";
@@ -36,6 +36,7 @@ import { areAllParticipantWindowsClosed, toDayStatus } from "../lib/unlimitedRes
 import {
   applyUnlimitedProvisionalLive,
   displayedFromLanes,
+  loadUnlimitedProvisionalMap,
   progressSourceFromLanes,
 } from "../lib/unlimitedProvisionalLive.js";
 import { emitUnlimitedRealtime } from "../lib/unlimitedRealtime.js";
@@ -43,6 +44,44 @@ import { isProvisionalLiveSource, normalizeSource } from "../lib/stepSources.js"
 import { stepDailyTotalsTable } from "../../db/src/schema/steps.js";
 
 const router: Router = Router();
+
+type ChallengeCardPlayer = {
+  id: string;
+  participantId: string;
+  userId: string;
+  username: string;
+  avatarUrl: string | null;
+  avatarColor: string | null;
+  countryFlag: string | null;
+  currentSteps: number;
+  rank: number;
+  isHost: boolean;
+  status: string;
+  qualificationStatus: string;
+};
+
+type RawChallengeCardPlayerRow = {
+  challenge_id: string;
+  participant_id: string;
+  user_id: string;
+  username: string | null;
+  avatar_url: string | null;
+  avatar_color: string | null;
+  country_flag: string | null;
+  current_steps: number | string;
+  roster_rank: number | string;
+  is_host: boolean;
+  qualification_status: string;
+  challenge_day_key?: string | null;
+};
+
+function rowsFromExecute<T>(result: unknown): T[] {
+  return ((result as { rows?: T[] }).rows ?? (result as T[])) as T[];
+}
+
+function sqlValues(values: readonly string[]): SQL {
+  return sql.join(values.map((v) => sql`${v}`), sql`, `);
+}
 
 // ── Env rollback gate: FEATURE_UNLIMITED_GOAL=false → all routes 404 ──────────
 // The worker start/finalize/settle paths are intentionally NOT gated, so any in-flight
@@ -200,6 +239,241 @@ async function loadChallengeParticipantCounts(challengeIds: string[]): Promise<M
     )
     .groupBy(unlimitedChallengeParticipantsTable.challengeId);
   return new Map(rows.map((r) => [r.challengeId, Number(r.participantCount)]));
+}
+
+async function loadActiveChallengeCardPlayers(
+  challenges: Array<typeof unlimitedChallengesTable.$inferSelect>,
+  now: Date = new Date(),
+): Promise<Map<string, ChallengeCardPlayer[]>> {
+  const challengeIds = challenges.map((c) => c.id);
+  if (challengeIds.length === 0) return new Map();
+
+  const idList = sqlValues(challengeIds);
+  const nonActiveList = sqlValues([...UNLIMITED_NON_ACTIVE_STATUSES]);
+  const result = await db.execute(sql`
+    WITH current_days AS (
+      SELECT
+        d.challenge_id,
+        d.participant_id,
+        d.user_id,
+        d.local_date
+      FROM unlimited_challenge_days d
+      WHERE d.challenge_id IN (${idList})
+        AND d.window_start_utc <= ${now}
+        AND d.window_end_utc > ${now}
+    ),
+    ranked AS (
+      SELECT
+        p.challenge_id,
+        p.id AS participant_id,
+        p.user_id,
+        pr.username,
+        pr.avatar_url,
+        pr.avatar_color,
+        pr.country_flag,
+        COALESCE(s.steps, 0)::int AS current_steps,
+        row_number() OVER (
+          PARTITION BY p.challenge_id
+          ORDER BY COALESCE(s.steps, 0) DESC, p.joined_at ASC, p.id ASC
+        )::int AS roster_rank,
+        (p.user_id = c.host_user_id) AS is_host,
+        p.qualification_status,
+        current_days.local_date AS challenge_day_key
+      FROM unlimited_challenge_participants p
+      INNER JOIN unlimited_challenges c ON c.id = p.challenge_id
+      LEFT JOIN current_days ON current_days.participant_id = p.id
+      LEFT JOIN step_daily_totals s
+        ON s.user_id = p.user_id
+       AND s.date = current_days.local_date
+      LEFT JOIN profiles pr ON pr.id = p.user_id
+      WHERE p.challenge_id IN (${idList})
+        AND p.entry_contribution_cents > 0
+        AND p.qualification_status NOT IN (${nonActiveList})
+    )
+    SELECT
+      challenge_id,
+      participant_id,
+      user_id,
+      username,
+      avatar_url,
+      avatar_color,
+      country_flag,
+      current_steps,
+      roster_rank,
+      is_host,
+      qualification_status,
+      challenge_day_key
+    FROM ranked
+    WHERE roster_rank <= 3
+    ORDER BY challenge_id, roster_rank
+  `);
+
+  const rawRows = rowsFromExecute<RawChallengeCardPlayerRow>(result);
+  const provisionalByChallenge = new Map<string, Map<string, { provisionalSteps: number }>>();
+  await Promise.all(
+    challengeIds.map(async (challengeId) => {
+      const entries = rawRows
+        .filter((r) => r.challenge_id === challengeId && r.challenge_day_key)
+        .map((r) => ({ userId: r.user_id, challengeDayKey: r.challenge_day_key! }));
+      if (entries.length === 0) return;
+      provisionalByChallenge.set(challengeId, await loadUnlimitedProvisionalMap(challengeId, entries));
+    }),
+  );
+
+  const out = new Map<string, ChallengeCardPlayer[]>();
+  for (const row of rawRows) {
+    const verifiedSteps = Number(row.current_steps ?? 0);
+    const provisional = row.challenge_day_key
+      ? provisionalByChallenge.get(row.challenge_id)?.get(`${row.user_id}|${row.challenge_day_key}`)?.provisionalSteps
+      : null;
+    const player: ChallengeCardPlayer = {
+      id: row.participant_id,
+      participantId: row.participant_id,
+      userId: row.user_id,
+      username: row.username ?? `Player ${Number(row.roster_rank) || 1}`,
+      avatarUrl: row.avatar_url ?? null,
+      avatarColor: row.avatar_color ?? null,
+      countryFlag: row.country_flag ?? null,
+      currentSteps: displayedFromLanes(verifiedSteps, provisional),
+      rank: Number(row.roster_rank) || 1,
+      isHost: row.is_host,
+      status: row.qualification_status,
+      qualificationStatus: row.qualification_status,
+    };
+    const list = out.get(row.challenge_id) ?? [];
+    list.push(player);
+    out.set(row.challenge_id, list);
+  }
+
+  for (const players of out.values()) {
+    players.sort((a, b) => b.currentSteps - a.currentSteps || a.rank - b.rank);
+    players.forEach((p, i) => {
+      p.rank = i + 1;
+    });
+  }
+  return out;
+}
+
+async function loadCompletedChallengeCardPlayers(
+  challenges: Array<typeof unlimitedChallengesTable.$inferSelect>,
+): Promise<Map<string, ChallengeCardPlayer[]>> {
+  const challengeIds = challenges.map((c) => c.id);
+  if (challengeIds.length === 0) return new Map();
+
+  const idList = sqlValues(challengeIds);
+  const result = await db.execute(sql`
+    WITH scored AS (
+      SELECT
+        p.challenge_id,
+        p.id AS participant_id,
+        p.user_id,
+        pr.username,
+        pr.avatar_url,
+        pr.avatar_color,
+        pr.country_flag,
+        COALESCE(sum(d.verified_steps), 0)::int AS current_steps,
+        count(*) FILTER (WHERE d.status = 'passed')::int AS passed_days,
+        (p.user_id = c.host_user_id) AS is_host,
+        p.qualification_status
+      FROM unlimited_challenge_participants p
+      INNER JOIN unlimited_challenges c ON c.id = p.challenge_id
+      INNER JOIN unlimited_challenge_days d ON d.participant_id = p.id
+      LEFT JOIN profiles pr ON pr.id = p.user_id
+      WHERE p.challenge_id IN (${idList})
+        AND p.entry_contribution_cents > 0
+      GROUP BY
+        p.challenge_id,
+        p.id,
+        p.user_id,
+        pr.username,
+        pr.avatar_url,
+        pr.avatar_color,
+        pr.country_flag,
+        c.host_user_id,
+        p.qualification_status
+    ),
+    ranked AS (
+      SELECT
+        scored.*,
+        row_number() OVER (
+          PARTITION BY scored.challenge_id
+          ORDER BY scored.passed_days DESC, scored.current_steps DESC, scored.participant_id ASC
+        )::int AS roster_rank
+      FROM scored
+    )
+    SELECT
+      challenge_id,
+      participant_id,
+      user_id,
+      username,
+      avatar_url,
+      avatar_color,
+      country_flag,
+      current_steps,
+      roster_rank,
+      is_host,
+      qualification_status
+    FROM ranked
+    WHERE roster_rank <= 3
+    ORDER BY challenge_id, roster_rank
+  `);
+
+  const out = new Map<string, ChallengeCardPlayer[]>();
+  for (const row of rowsFromExecute<RawChallengeCardPlayerRow>(result)) {
+    const list = out.get(row.challenge_id) ?? [];
+    list.push({
+      id: row.participant_id,
+      participantId: row.participant_id,
+      userId: row.user_id,
+      username: row.username ?? `Player ${Number(row.roster_rank) || 1}`,
+      avatarUrl: row.avatar_url ?? null,
+      avatarColor: row.avatar_color ?? null,
+      countryFlag: row.country_flag ?? null,
+      currentSteps: Number(row.current_steps ?? 0),
+      rank: Number(row.roster_rank) || 1,
+      isHost: row.is_host,
+      status: row.qualification_status,
+      qualificationStatus: row.qualification_status,
+    });
+    out.set(row.challenge_id, list);
+  }
+  return out;
+}
+
+async function loadChallengeCardPlayers(
+  rows: Array<typeof unlimitedChallengesTable.$inferSelect>,
+): Promise<Map<string, ChallengeCardPlayer[]>> {
+  const completedRows = rows.filter(
+    (c) => c.status === "completed" || c.status === "cancelled_by_platform" || c.resultsStatus === "results_ready",
+  );
+  const liveRows = rows.filter((c) => !completedRows.some((completed) => completed.id === c.id));
+  const [livePlayers, completedPlayers] = await Promise.all([
+    loadActiveChallengeCardPlayers(liveRows),
+    loadCompletedChallengeCardPlayers(completedRows),
+  ]);
+  return new Map([...livePlayers, ...completedPlayers]);
+}
+
+async function overlayChallengeListCards(
+  rows: Array<typeof unlimitedChallengesTable.$inferSelect>,
+  userId: string,
+) {
+  const challengeIds = rows.map((r) => r.id);
+  const [challenges, participantCounts, playersByChallenge] = await Promise.all([
+    overlayMembership(rows, userId),
+    loadChallengeParticipantCounts(challengeIds),
+    loadChallengeCardPlayers(rows),
+  ]);
+
+  return challenges.map((challenge) => {
+    const players = playersByChallenge.get(challenge.id) ?? [];
+    return {
+      ...challenge,
+      participantCount: participantCounts.get(challenge.id) ?? 0,
+      players,
+      participants: players,
+    };
+  });
 }
 
 /** The timezone a not-yet-joined viewer would lock if they joined now. */
@@ -377,7 +651,7 @@ router.get("/unlimited-challenges/live", requireAuth, async (req, res) => {
     .limit(limit)
     .offset(offset);
 
-  const challenges = await overlayMembership(rows, userId);
+  const challenges = await overlayChallengeListCards(rows, userId);
   return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
 });
 
@@ -399,7 +673,7 @@ router.get("/unlimited-challenges/recently-finished", requireAuth, async (req, r
     .limit(limit)
     .offset(offset);
 
-  const challenges = await overlayMembership(rows, userId);
+  const challenges = await overlayChallengeListCards(rows, userId);
   return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
 });
 
@@ -477,9 +751,9 @@ router.get("/unlimited-challenges", requireAuth, async (req, res) => {
     .limit(limit)
     .offset(offset);
 
-  // Overlay the viewer's own membership so clients can tell "is this mine?" by
-  // participation rather than falling back to hostUserId. One batched lookup for all listed rows.
-  const challenges = await overlayMembership(rows, userId);
+  // Overlay the viewer's own membership and a trimmed roster so clients can render cards without
+  // opening detail. Counts come from the live paid participant rows, never paidParticipantCount.
+  const challenges = await overlayChallengeListCards(rows, userId);
   return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
 });
 
