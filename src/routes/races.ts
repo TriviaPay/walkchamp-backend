@@ -2705,7 +2705,6 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
         coinEntryAmount: raceRoomsTable.coinEntryAmount,
         targetSteps: raceRoomsTable.targetSteps,
         maxPlayers: raceRoomsTable.maxPlayers,
-        registeredCount: raceRoomsTable.registeredCount,
         isPrivate: raceRoomsTable.isPrivate,
         trackLayout: raceRoomsTable.trackLayout,
         startedAt: raceRoomsTable.startedAt,
@@ -2732,20 +2731,37 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
       .orderBy(asc(raceRoomsTable.scheduledStartAt))
       .limit(50);
 
-    const registrations = upcoming.length > 0
+    const upcomingRoomIds = upcoming.map((r) => r.id);
+    const registrations = upcomingRoomIds.length > 0
       ? await db
           .select({ raceRoomId: scheduledRoomRegistrationsTable.raceRoomId })
           .from(scheduledRoomRegistrationsTable)
           .where(
             and(
               eq(scheduledRoomRegistrationsTable.userId, userId),
-              eq(scheduledRoomRegistrationsTable.status, "registered"),
-              inArray(scheduledRoomRegistrationsTable.raceRoomId, upcoming.map((r) => r.id))
+              inArray(scheduledRoomRegistrationsTable.status, ["registered", "active"]),
+              inArray(scheduledRoomRegistrationsTable.raceRoomId, upcomingRoomIds)
             )
           )
       : [];
+    const registrationCounts = upcomingRoomIds.length > 0
+      ? await db
+          .select({
+            raceRoomId: scheduledRoomRegistrationsTable.raceRoomId,
+            count: sql<number>`count(*)::int`,
+          })
+          .from(scheduledRoomRegistrationsTable)
+          .where(
+            and(
+              inArray(scheduledRoomRegistrationsTable.raceRoomId, upcomingRoomIds),
+              inArray(scheduledRoomRegistrationsTable.status, ["registered", "active"]),
+            )
+          )
+          .groupBy(scheduledRoomRegistrationsTable.raceRoomId)
+      : [];
 
     const registeredSet = new Set(registrations.map((r) => r.raceRoomId));
+    const registrationCountMap = new Map(registrationCounts.map((r) => [r.raceRoomId, r.count]));
     const trackThemeMediaMap = await getTrackThemeMediaMap(upcoming.map((r) => r.trackLayout));
 
     const TRACK_NAMES2: Record<string, string> = {
@@ -2758,6 +2774,7 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
       // Same clock as race detail: a scheduled room derives its end from scheduledStartAt +
       // duration, so challenge_end_at is real whenever the duration is known.
       const cardTime = buildCardTimeFields(r);
+      const registeredCount = registrationCountMap.get(r.id) ?? 0;
       return {
         room_id: r.id,
         ...cardTime,
@@ -2768,7 +2785,7 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
         title: r.title,
         target_steps: r.targetSteps,
         max_players: r.maxPlayers,
-        registered_count: r.registeredCount,
+        registered_count: registeredCount,
         selected_track_theme_id: r.trackLayout,
         theme_name: TRACK_NAMES2[r.trackLayout] ?? r.trackLayout,
         trackTheme,
@@ -2782,7 +2799,7 @@ router.get("/rooms/available", requireAuth, async (req, res) => {
         host_avatar_url: r.hostAvatarUrl ?? null,
         host_country_flag: r.hostCountryFlag ?? null,
         current_user_registered: registeredSet.has(r.id),
-        eligible_to_register: !registeredSet.has(r.id) && r.registeredCount < r.maxPlayers,
+        eligible_to_register: !registeredSet.has(r.id) && registeredCount < r.maxPlayers,
       };
     });
 
