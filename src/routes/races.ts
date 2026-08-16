@@ -196,7 +196,7 @@ export async function recoverStaleRaces(): Promise<void> {
       // Sponsored events: complete immediately if all participants have forfeited (no active racers).
       if (race.type === "sponsored") {
         const sponsoredActive = await db
-          .select({ userId: raceParticipantsTable.userId })
+          .select({ userId: raceParticipantsTable.userId, finishedGoal: raceParticipantsTable.finishedGoal })
           .from(raceParticipantsTable)
           .where(and(
             eq(raceParticipantsTable.raceRoomId, race.id),
@@ -206,6 +206,20 @@ export async function recoverStaleRaces(): Promise<void> {
         if (sponsoredActive.length === 0) {
           logger.info({ raceId: race.id }, "[recoverStaleRaces] sponsored — all forfeited, completing");
           autoCompleteRace(race.id, "all_forfeited").catch(() => {});
+          continue;
+        }
+        const sponsoredDone = new Map<string, boolean>();
+        for (const p of sponsoredActive) {
+          sponsoredDone.set(p.userId, (sponsoredDone.get(p.userId) ?? false) || p.finishedGoal);
+        }
+        const finishedCount = [...sponsoredDone.values()].filter(Boolean).length;
+        const winnersNeeded =
+          typeof race.winnerSlotCount === "number" && race.winnerSlotCount > 0
+            ? race.winnerSlotCount
+            : getSponsoredWinnerCount(race.startingParticipantCount ?? race.currentPlayers ?? sponsoredDone.size);
+        if (winnersNeeded > 0 && finishedCount >= winnersNeeded) {
+          logger.info({ raceId: race.id, finishedCount, winnersNeeded }, "[recoverStaleRaces] sponsored winner slots filled — completing");
+          autoCompleteRace(race.id, "winners_decided_recovery").catch(() => {});
         }
         // If some participants are still active, leave the race to the 3-hour timer.
         continue;
@@ -396,7 +410,7 @@ export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<v
       // Sponsored events: also complete early if all participants have forfeited.
       if (isSponsored) {
         const sponsoredActive = await db
-          .select({ userId: raceParticipantsTable.userId })
+          .select({ userId: raceParticipantsTable.userId, finishedGoal: raceParticipantsTable.finishedGoal })
           .from(raceParticipantsTable)
           .where(and(
             eq(raceParticipantsTable.raceRoomId, race.id),
@@ -407,6 +421,22 @@ export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<v
           logger.info({ raceId: race.id }, "[cleanupOverdueRaces] sponsored — all forfeited, completing");
           autoCompleteRace(race.id, "all_forfeited").catch((err) => {
             logger.error({ raceId: race.id, err }, "cleanupOverdueRaces: sponsored all_forfeited autoCompleteRace failed");
+          });
+          continue;
+        }
+        const sponsoredDone = new Map<string, boolean>();
+        for (const p of sponsoredActive) {
+          sponsoredDone.set(p.userId, (sponsoredDone.get(p.userId) ?? false) || p.finishedGoal);
+        }
+        const finishedCount = [...sponsoredDone.values()].filter(Boolean).length;
+        const winnersNeeded =
+          typeof race.winnerSlotCount === "number" && race.winnerSlotCount > 0
+            ? race.winnerSlotCount
+            : getSponsoredWinnerCount(race.startingParticipantCount ?? race.currentPlayers ?? sponsoredDone.size);
+        if (winnersNeeded > 0 && finishedCount >= winnersNeeded) {
+          logger.info({ raceId: race.id, finishedCount, winnersNeeded }, "[cleanupOverdueRaces] sponsored winner slots filled — completing");
+          autoCompleteRace(race.id, "winners_decided_recovery").catch((err) => {
+            logger.error({ raceId: race.id, err }, "cleanupOverdueRaces: sponsored winner-slots autoCompleteRace failed");
           });
         }
         continue;
@@ -442,7 +472,7 @@ export async function cleanupOverdueRaces(opts?: { force?: boolean }): Promise<v
       const totalCount = userDone.size;
       const finishedCount = [...userDone.values()].filter(Boolean).length;
       const allDone = totalCount > 0 && finishedCount === totalCount;
-      // Prefer frozen start-time winner slots (2→1, 3→2, 4–10→3).
+      // Prefer frozen start-time winner slots.
       const winnersNeeded =
         typeof race.winnerSlotCount === "number" && race.winnerSlotCount > 0
           ? race.winnerSlotCount
@@ -580,7 +610,7 @@ const EMPTY_CARD_TIME_FIELDS = buildCardTimeFields({
 
 const MANUAL_COMPLETION_REASONS = new Set(["admin_force_complete", "manual_force_complete"]);
 // Reasons that bypass the duration-challenge end-date wait. In addition to explicit admin/manual
-// force-completes: all_forfeited (nobody left racing) and winner-slot fills (2→1, 3→2, 4–10→3)
+// force-completes: all_forfeited (nobody left racing) and winner-slot fills.
 // so fixed-player matches can settle as soon as enough finishers exist — including multi-day rooms.
 const FORCED_COMPLETION_REASONS = new Set([
   ...MANUAL_COMPLETION_REASONS,
@@ -861,7 +891,8 @@ function assignSponsoredGiftCardPayouts(
   participants: TieParticipant[],
   playerCount: number,
 ): TiePayoutResult[] {
-  const winnerCount = getSponsoredWinnerCount(playerCount);
+  const finisherCount = participants.filter((p) => p.finishedAt !== null).length;
+  const winnerCount = getSponsoredAwardedWinnerCount(playerCount, finisherCount);
   const sorted = [...participants].sort((a, b) => {
     if (a.finishedAt && b.finishedAt) return a.finishedAt.getTime() - b.finishedAt.getTime();
     if (a.finishedAt) return -1;
@@ -4057,7 +4088,9 @@ export async function activateRoomAndStart(
       ne(raceParticipantsTable.status, "disqualified"),
       ne(raceParticipantsTable.status, "forfeited"),
     ));
-  const winnerSlotCount = getWinnerSlotCount(startingParticipantCount ?? 0);
+  const winnerSlotCount = room.type === "sponsored"
+    ? getSponsoredWinnerCount(startingParticipantCount ?? 0)
+    : getWinnerSlotCount(startingParticipantCount ?? 0);
 
   // Compare-and-set: only the caller holding the "starting" claim commits the activation.
   const [updated] = await db
@@ -6357,6 +6390,8 @@ async function persistRedisFinish(
       const winnersNeeded =
         typeof room.winnerSlotCount === "number" && room.winnerSlotCount > 0
           ? room.winnerSlotCount
+          : room.type === "sponsored"
+            ? getSponsoredWinnerCount(room.startingParticipantCount ?? room.currentPlayers ?? 0)
           : getWinnerSlotCount(
               room.startingParticipantCount ?? room.currentPlayers ?? 0,
             ) || numWinners(room.currentPlayers ?? 0);
@@ -7076,6 +7111,8 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
         const winnersNeeded =
           typeof lockedRoom.winnerSlotCount === "number" && lockedRoom.winnerSlotCount > 0
             ? lockedRoom.winnerSlotCount
+            : lockedRoom.type === "sponsored"
+              ? getSponsoredWinnerCount(lockedRoom.startingParticipantCount ?? lockedRoom.currentPlayers ?? 0)
             : getWinnerSlotCount(
                 lockedRoom.startingParticipantCount ?? lockedRoom.currentPlayers ?? 2,
               ) || numWinners(lockedRoom.currentPlayers ?? 2);
@@ -7131,7 +7168,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
         ]);
 
         // ── Early finalization: end race when required winner slots are filled ──
-        // Slots frozen at start: 2→1, 3→2, 4–10→3 (free / coins / cash).
+        // Slots frozen at start. Sponsored uses 1–2→1 and 3–10→2; classic rules differ.
         const playerCount = updated.playerCount;
         const winnersNeeded = updated.winnersNeeded;
         const finishedCount = updated.finishedCount;

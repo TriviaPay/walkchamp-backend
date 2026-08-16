@@ -23,11 +23,14 @@ describe("sponsored event rules", () => {
     expect(getSponsoredAwardedWinnerCount(1, 0)).toBe(0);
   });
 
-  it("caps awarded winners to sponsored finishers", () => {
+  it("awards only when the required sponsored winner slots are filled", () => {
     expect(getSponsoredAwardedWinnerCount(1, 1)).toBe(1);
     expect(getSponsoredAwardedWinnerCount(2, 1)).toBe(1);
-    expect(getSponsoredAwardedWinnerCount(3, 1)).toBe(1);
+    expect(getSponsoredAwardedWinnerCount(3, 1)).toBe(0);
     expect(getSponsoredAwardedWinnerCount(3, 2)).toBe(2);
+    expect(getSponsoredAwardedWinnerCount(10, 1)).toBe(0);
+    expect(getSponsoredAwardedWinnerCount(10, 2)).toBe(2);
+    expect(getSponsoredAwardedWinnerCount(10, 3)).toBe(2);
   });
 
   it("uses two winners for three to ten players", () => {

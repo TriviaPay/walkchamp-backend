@@ -19,7 +19,9 @@ describe("winner-slot freeze at race start", () => {
   });
 
   it("freezes both counts in the /start transition and never recalculates", () => {
-    expect(racesSrc).toContain("const winnerSlotCount = getWinnerSlotCount(startingParticipantCount ?? 0)");
+    expect(racesSrc).toContain('room.type === "sponsored"');
+    expect(racesSrc).toContain("getSponsoredWinnerCount(startingParticipantCount ?? 0)");
+    expect(racesSrc).toContain("getWinnerSlotCount(startingParticipantCount ?? 0)");
     expect(racesSrc).toContain("startingParticipantCount: startingParticipantCount ?? 0");
     expect(racesSrc).toContain("winnerSlotCount,");
   });
