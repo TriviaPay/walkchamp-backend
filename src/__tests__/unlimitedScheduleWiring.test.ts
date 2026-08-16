@@ -189,6 +189,33 @@ describe("APIs return viewer-personalized state", () => {
     expect(route).toContain("Date.now() < wouldStartAt.getTime()");
   });
 
+  it("join and list cards fall back to the challenge timezone when viewer timezone is missing or invalid", () => {
+    const service = read("src/lib/unlimitedChallengeService.ts");
+    const listFn = route.slice(
+      route.indexOf("async function overlayChallengeListCards"),
+      route.indexOf("/** The timezone a not-yet-joined viewer would lock"),
+    );
+    const resolver = route.slice(
+      route.indexOf("function resolveViewerTimezoneFromPreference"),
+      route.indexOf("/**", route.indexOf("async function buildViewerSchedule")),
+    );
+
+    expect(service).toContain("async function lockUserTimezone(userId: string, fallbackTimezone?: string | null)");
+    expect(service).toContain("return resolveLockableTimezone(fallbackTimezone)");
+    expect(service).toContain("const tz = await lockUserTimezone(userId, challenge.challengeTimezone)");
+
+    expect(resolver).toContain("resolveViewerTimezoneFromPreference(rawTimezone");
+    expect(resolver).toContain("return resolveLockableTimezone(fallbackTimezone)");
+    expect(route).toContain("const viewerTimezone = await resolveViewerTimezone(userId, challenge.challengeTimezone)");
+
+    expect(listFn).toContain("loadViewerTimezonePreference(userId)");
+    expect(listFn).toContain("resolveViewerTimezoneFromPreference(preferredTimezone, row.challengeTimezone)");
+    expect(listFn).toContain("participantScheduleFor(row, prospectiveTimezone).startAtUtc");
+    expect(listFn).toContain("canJoin,");
+    expect(listFn).toContain("prospectiveStartAtUtc:");
+    expect(listFn).toContain("prospectiveTimezone:");
+  });
+
   it("serializes the semantic date alongside the legacy instant", () => {
     expect(route).toContain("startLocalDate: c.startLocalDate");
     expect(route).toContain("hostTimezone: c.challengeTimezone");

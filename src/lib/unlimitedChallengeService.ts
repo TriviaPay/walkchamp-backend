@@ -73,13 +73,15 @@ async function checkPaidEligibility(userId: string, isCreate: boolean): Promise<
 }
 
 /** The IANA timezone to lock onto a new membership, from the user's saved preference. */
-async function lockUserTimezone(userId: string): Promise<string> {
+async function lockUserTimezone(userId: string, fallbackTimezone?: string | null): Promise<string> {
   const [pref] = await db
     .select({ timezone: userPreferencesTable.timezone })
     .from(userPreferencesTable)
     .where(eq(userPreferencesTable.userId, userId))
     .limit(1);
-  return resolveLockableTimezone(pref?.timezone);
+  const tz = resolveLockableTimezone(pref?.timezone);
+  if (tz !== "UTC" || pref?.timezone?.trim() === "UTC") return tz;
+  return resolveLockableTimezone(fallbackTimezone);
 }
 
 export interface CreateInput {
@@ -240,7 +242,6 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
 export async function joinUnlimitedChallenge(userId: string, challengeId: string, opts: { inviteCode?: string }): Promise<ServiceResult<{ challengeId: string }>> {
   const elig = await checkPaidEligibility(userId, false);
   if (!elig.ok) return elig;
-  const tz = await lockUserTimezone(userId);
 
   const result = await db.transaction(async (tx) => {
     await acquireOneChallengeLock(tx, userId);
@@ -251,6 +252,7 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
       .limit(1)
       .for("update");
     if (!challenge) return { ok: false as const, httpStatus: 404, body: { error: "Challenge not found." } };
+    const tz = await lockUserTimezone(userId, challenge.challengeTimezone);
 
     // Idempotent: if already a participant, succeed without re-charging.
     const [existing] = await tx

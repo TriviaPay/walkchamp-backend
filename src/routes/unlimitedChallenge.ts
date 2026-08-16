@@ -459,16 +459,28 @@ async function overlayChallengeListCards(
   userId: string,
 ) {
   const challengeIds = rows.map((r) => r.id);
-  const [challenges, participantCounts, playersByChallenge] = await Promise.all([
+  const [challenges, participantCounts, playersByChallenge, preferredTimezone] = await Promise.all([
     overlayMembership(rows, userId),
     loadChallengeParticipantCounts(challengeIds),
     loadChallengeCardPlayers(rows),
+    loadViewerTimezonePreference(userId),
   ]);
+  const rowById = new Map(rows.map((row) => [row.id, row] as const));
 
   return challenges.map((challenge) => {
     const players = playersByChallenge.get(challenge.id) ?? [];
+    const row = rowById.get(challenge.id)!;
+    const prospectiveTimezone = resolveViewerTimezoneFromPreference(preferredTimezone, row.challengeTimezone);
+    const prospectiveStartAtUtc = participantScheduleFor(row, prospectiveTimezone).startAtUtc;
+    const canJoin =
+      !challenge.currentUserRegistered
+      && challenge.status === "waiting"
+      && Date.now() < prospectiveStartAtUtc.getTime();
     return {
       ...challenge,
+      canJoin,
+      prospectiveStartAtUtc: challenge.currentUserRegistered ? null : prospectiveStartAtUtc.toISOString(),
+      prospectiveTimezone: challenge.currentUserRegistered ? null : prospectiveTimezone,
       participantCount: participantCounts.get(challenge.id) ?? 0,
       players,
       participants: players,
@@ -477,13 +489,23 @@ async function overlayChallengeListCards(
 }
 
 /** The timezone a not-yet-joined viewer would lock if they joined now. */
-async function resolveViewerTimezone(userId: string): Promise<string> {
+function resolveViewerTimezoneFromPreference(rawTimezone: string | null | undefined, fallbackTimezone?: string | null): string {
+  const tz = resolveLockableTimezone(rawTimezone);
+  if (tz !== "UTC" || rawTimezone?.trim() === "UTC") return tz;
+  return resolveLockableTimezone(fallbackTimezone);
+}
+
+async function loadViewerTimezonePreference(userId: string): Promise<string | null> {
   const [pref] = await db
     .select({ timezone: userPreferencesTable.timezone })
     .from(userPreferencesTable)
     .where(eq(userPreferencesTable.userId, userId))
     .limit(1);
-  return resolveLockableTimezone(pref?.timezone);
+  return pref?.timezone ?? null;
+}
+
+async function resolveViewerTimezone(userId: string, fallbackTimezone?: string | null): Promise<string> {
+  return resolveViewerTimezoneFromPreference(await loadViewerTimezonePreference(userId), fallbackTimezone);
 }
 
 /**
@@ -784,7 +806,7 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
 
   // canJoin uses THIS viewer's would-be local start, matching the join cutoff in the service. A
   // Chicago viewer can still join a challenge that already began for participants in India.
-  const viewerTimezone = await resolveViewerTimezone(userId);
+  const viewerTimezone = await resolveViewerTimezone(userId, challenge.challengeTimezone);
   const wouldStartAt = participantScheduleFor(challenge, viewerTimezone).startAtUtc;
   const canJoin = !membership && challenge.status === "waiting" && Date.now() < wouldStartAt.getTime();
 

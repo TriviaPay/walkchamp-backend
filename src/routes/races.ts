@@ -3004,9 +3004,40 @@ router.post("/rooms/:roomId/register", requireAuth, async (req, res) => {
       errorBody = { error: "Room not found." };
       return;
     }
+    if (room.status === "open" || room.status === "full") {
+      if (room.roomExpiresAt && Date.now() >= room.roomExpiresAt.getTime()) {
+        errorStatus = 409;
+        errorBody = { error: "This Waiting Room has expired.", code: "waiting_room_expired" };
+        return;
+      }
+      if (room.currentPlayers >= room.maxPlayers) {
+        errorStatus = 409;
+        errorBody = { error: "Room is full.", code: "room_full" };
+        return;
+      }
+      errorStatus = 409;
+      errorBody = {
+        error: "This room is open now. Use the join endpoint.",
+        code: "open_room_join_required",
+        raceId: room.id,
+        room_id: room.id,
+        entryType: room.entryType,
+        entry_type: room.entryType,
+        entryAmountCents: room.entryAmountCents,
+        entry_amount_cents: room.entryAmountCents,
+        coinEntryAmount: room.coinEntryAmount ?? 0,
+        coin_entry_amount: room.coinEntryAmount ?? 0,
+        joinEndpoint: room.entryType === "coins_battle"
+          ? `/api/coins-battle/${room.id}/join`
+          : room.entryAmountCents > 0
+            ? `/api/races/${room.id}/join-paid`
+            : `/api/races/${room.id}/join`,
+      };
+      return;
+    }
     if (room.status !== "scheduled") {
       errorStatus = 409;
-      errorBody = { error: "Room is no longer accepting registrations." };
+      errorBody = { error: "Room is no longer accepting registrations.", code: "registration_closed" };
       return;
     }
     if (room.type !== "sponsored") {
