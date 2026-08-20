@@ -44,9 +44,12 @@ describe("CU rollout safety contracts", () => {
     const compose = readFileSync(`${root}/docker-compose.coolify.yml`, "utf8");
     const apiEntrypoint = readFileSync(`${root}/deploy/coolify/api-entrypoint.sh`, "utf8");
     const workerEntrypoint = readFileSync(`${root}/deploy/coolify/worker-entrypoint.sh`, "utf8");
+    const workerHealthcheck = readFileSync(`${root}/deploy/coolify/worker-healthcheck.sh`, "utf8");
     expect(compose).not.toContain("REDIS_PASSWORD:?REDIS_PASSWORD");
     expect(compose).toContain("REDIS_PASSWORD: ${REDIS_PASSWORD:-}");
     expect(apiEntrypoint).toContain('if [ -z "${REDIS_PASSWORD:-}" ]');
     expect(workerEntrypoint).toContain('if [ -z "${REDIS_PASSWORD:-}" ]');
+    expect(workerHealthcheck).toContain('queue_url="redis://default:${queue_url#redis://:}"');
+    expect(workerHealthcheck).toContain('redis-cli --no-auth-warning -u "${queue_url}" ping');
   });
 });

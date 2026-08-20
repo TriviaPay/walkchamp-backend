@@ -15,8 +15,14 @@ heartbeat_age="$((current_epoch - heartbeat_epoch))"
 # Prove the BullMQ queue Redis is actually reachable (audit 2026-08-17 H17). The heartbeat above
 # only proves the node process is alive; a wrong/rotated REDIS_PASSWORD leaves the worker running
 # but silently unable to pull settlement/refund/webhook jobs — a green-but-dead worker. Ping the
-# queue instance so Coolify restarts the container on an auth/connectivity failure. The URL carries
-# the password (redis://:pass@host), which redis-cli -u parses.
+# queue instance so Coolify restarts the container on an auth/connectivity failure. Some redis-cli
+# builds do not apply password-only URLs to Redis' default ACL user, even though ioredis accepts the
+# same URL. Normalize that form to an explicit default user before probing.
 if [ -n "${REDIS_QUEUE_URL:-}" ]; then
-  redis-cli -u "${REDIS_QUEUE_URL}" ping | grep -q PONG
+  queue_url="${REDIS_QUEUE_URL}"
+  case "${queue_url}" in
+    redis://:*) queue_url="redis://default:${queue_url#redis://:}" ;;
+    rediss://:*) queue_url="rediss://default:${queue_url#rediss://:}" ;;
+  esac
+  redis-cli --no-auth-warning -u "${queue_url}" ping | grep -q PONG
 fi
