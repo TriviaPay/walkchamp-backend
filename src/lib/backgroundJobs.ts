@@ -1,11 +1,14 @@
 import { logger } from "./logger.js";
-import { recoverStaleRaces, cleanupOverdueRaces, recoverPendingRedisFinishes, resettlePendingRaces } from "../routes/races.js";
+import { recoverStaleRaces, cleanupOverdueRaces, recoverPendingRedisFinishes, resettlePendingRaces, alertStaleHeldRaces } from "../routes/races.js";
 import { startScheduler, runSchedulerTick } from "./scheduler.js";
 import { processSponsuredEvents, autoFillSchedule, nextSponsoredStartAt } from "../routes/sponsoredEvents.js";
 import { runDepositReconciliationTick } from "./depositSettlement.js";
 import { runWalletLedgerReconciliationTick } from "./walletLedgerReconciliation.js";
 import { flushSessionLastSeen } from "./sessionService.js";
 import { checkpointRedisRaces } from "./raceLiveHydration.js";
+import { dispatchOutboxBatch } from "./outbox.js";
+import { checkpointWalkDays, syncWalkIngestControlFromPostgres } from "./walkRedisIngest.js";
+import { flushPresenceTelemetry } from "./redisPresence.js";
 
 let started = false;
 
@@ -29,20 +32,16 @@ async function runPass(label: string, steps: [string, () => Promise<unknown>][])
 
 /**
  * Time-sensitive work, every 15 minutes. These two are ungatable — neither a due sponsored
- * event nor a race owing a deferred payout leaves any trace in Redis for a gate to read, so
- * both must poll. Coalescing them onto one timer means they share a single autosuspend tail
- * instead of paying one each.
+ * Normal writers now leave an indexed transactional-outbox record. This cadence repairs
+ * records that could not be handed to BullMQ; it intentionally does not scan sponsored or
+ * race tables. The hourly pass below remains the full reconciliation safety net.
  *
- * 15 minutes is the responsiveness/cost trade: a sponsored event can start up to 15 minutes
- * after its scheduledStartAt, and a deferred payout retries within 15 minutes of its grace
- * window (hours) expiring. Shortening this is the main knob if starts need to be punctual —
- * each halving roughly doubles the idle compute bill.
+ * Delayed BullMQ jobs provide the normal wake-up near availableAt. Fifteen minutes bounds
+ * recovery when queue delivery was unavailable without continuously waking PostgreSQL.
  */
 async function runFrequentMaintenancePass(): Promise<void> {
   await runPass("frequent", [
-    ["resettlePendingRaces", () => resettlePendingRaces()],
-    ["sponsoredEvents", () => processSponsuredEvents()],
-    ["armNextSponsoredStart", () => armNextSponsoredStart()],
+    ["outboxRepair", () => dispatchOutboxBatch()],
   ]);
 }
 
@@ -92,6 +91,12 @@ async function runCoalescedMaintenancePass(): Promise<void> {
     ["depositReconciliation", () => runDepositReconciliationTick(new Date(), { force: true })],
     ["scheduler", () => runSchedulerTick({ force: true })],
     ["walletLedgerReconciliation", () => runWalletLedgerReconciliationTick()],
+    // Alert (not resolve) on funded races held for verification review beyond their SLA so held
+    // entry fees are never silently stuck forever (audit 2026-08-17 M25).
+    ["heldRaceAlert", () => alertStaleHeldRaces()],
+    ["resettlePendingRacesFullReconciliation", () => resettlePendingRaces()],
+    ["sponsoredEventsFullReconciliation", () => processSponsuredEvents()],
+    ["armNextSponsoredStart", () => armNextSponsoredStart()],
     // Populates sponsored rooms 8 weekends out — nothing it creates is needed sooner than
     // days from now, so this cadence is generous rather than tight.
     ["sponsoredAutoFill", () => autoFillSchedule()],
@@ -155,6 +160,9 @@ export async function startWorkerOwnedRecurringJobs(): Promise<void> {
       logger.error({ err }, "session lastSeen flush tick failed");
     });
   }, 5 * 60_000);
+  setInterval(() => {
+    flushPresenceTelemetry().catch((err) => logger.error({ err }, "presence telemetry flush failed"));
+  }, 5 * 60_000);
 
   // Redis-live checkpointer (Phase 2). Self-gates on redis-live being configured + active
   // races; DB-silent when idle so it never wakes Neon.
@@ -163,6 +171,13 @@ export async function startWorkerOwnedRecurringJobs(): Promise<void> {
       logger.error({ err }, "redis-live checkpoint tick failed");
     });
   }, 45_000);
+
+  await syncWalkIngestControlFromPostgres().catch((err) => {
+    logger.error({ err }, "walk ingest control bootstrap failed");
+  });
+  setInterval(() => {
+    checkpointWalkDays().catch((err) => logger.error({ err }, "walk checkpoint tick failed"));
+  }, 30_000);
 
   // Recover finishes accepted in Redis but not yet persisted to Postgres (crash between
   // accept and durable write). Boot-run once + periodic. Idempotent.

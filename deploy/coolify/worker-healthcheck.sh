@@ -11,3 +11,12 @@ heartbeat_epoch="$(stat -c %Y "${heartbeat_file}" 2>/dev/null || stat -f %m "${h
 heartbeat_age="$((current_epoch - heartbeat_epoch))"
 
 [ "${heartbeat_age}" -le "${max_age_seconds}" ]
+
+# Prove the BullMQ queue Redis is actually reachable (audit 2026-08-17 H17). The heartbeat above
+# only proves the node process is alive; a wrong/rotated REDIS_PASSWORD leaves the worker running
+# but silently unable to pull settlement/refund/webhook jobs — a green-but-dead worker. Ping the
+# queue instance so Coolify restarts the container on an auth/connectivity failure. The URL carries
+# the password (redis://:pass@host), which redis-cli -u parses.
+if [ -n "${REDIS_QUEUE_URL:-}" ]; then
+  redis-cli -u "${REDIS_QUEUE_URL}" ping | grep -q PONG
+fi

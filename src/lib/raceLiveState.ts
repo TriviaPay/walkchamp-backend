@@ -34,6 +34,8 @@ const cfgKey = (raceId: string) => `cfg:race:${raceId}`;
 const lbKey = (raceId: string) => `lb:race:${raceId}`;
 const pKey = (raceId: string, userId: string) => `p:race:${raceId}:${userId}`;
 const dirtyKey = (raceId: string) => `dirty:race:${raceId}`;
+const dirtyInFlightKey = (raceId: string) => `dirty:race:${raceId}:inflight`;
+const dirtyAgeKey = (raceId: string) => `dirty:race:${raceId}:ages`;
 const pendingFinishKey = (raceId: string) => `finish:pending:${raceId}`;
 const finishOrdinalKey = (raceId: string) => `race:${raceId}:finishOrdinal`;
 const namesKey = (raceId: string) => `names:race:${raceId}`; // userId -> username, for zero-SQL display
@@ -95,7 +97,8 @@ export type ApplyProgressResult =
 export type LiveStanding = { userId: string; steps: number; rank: number };
 
 // ── Lua: atomic step acceptance ───────────────────────────────────────────────
-// KEYS: 1 cfg, 2 participant, 3 leaderboard, 4 dirty-set, 5 finish-ordinal, 6 pending-finish
+// KEYS: 1 cfg, 2 participant, 3 leaderboard, 4 dirty-set, 5 finish-ordinal, 6 pending-finish,
+//       7 dirty-age zset
 // ARGV: 1 userId, 2 requestedSteps, 3 clientSeq(-1=none), 4 deviceTotal(-1=none),
 //       5 nowMs, 6 stepsPerSec, 7 burst, 8 sessionId(""=none), 9 liveSource(""=none)
 const APPLY_PROGRESS_LUA = `
@@ -208,6 +211,7 @@ end
 
 redis.call("ZADD", KEYS[3], newSteps, ARGV[1])
 redis.call("SADD", KEYS[4], ARGV[1])
+redis.call("ZADD", KEYS[7], "NX", nowMs, ARGV[1])
 
 return cjson.encode({ ok = true, accepted = true, newSteps = newSteps,
   pendingReconciliation = pendingRecon, justFinished = justFinished,
@@ -262,7 +266,10 @@ export async function hydrateRace(
     pipe.hset(pKey(raceId, p.userId), fields);
     pipe.zadd(lbKey(raceId), p.currentSteps, p.userId);
     pipe.hset(namesKey(raceId), p.userId, p.username);
-    if (p.currentSteps > 0) pipe.sadd(dirtyKey(raceId), p.userId);
+    if (p.currentSteps > 0) {
+      pipe.sadd(dirtyKey(raceId), p.userId);
+      pipe.zadd(dirtyAgeKey(raceId), "NX", Date.now(), p.userId);
+    }
   }
   // Resume the ordinal counter past existing finishers so new finishes get unique, ordered ranks.
   if (maxFinishOrdinal > 0) pipe.set(finishOrdinalKey(raceId), String(maxFinishOrdinal));
@@ -305,13 +312,14 @@ export async function applyProgress(input: ApplyProgressInput): Promise<ApplyPro
   await ensureRedisLiveConnected();
   const raw = await getRedisLive().eval(
     APPLY_PROGRESS_LUA,
-    6,
+    7,
     cfgKey(input.raceId),
     pKey(input.raceId, input.userId),
     lbKey(input.raceId),
     dirtyKey(input.raceId),
     finishOrdinalKey(input.raceId),
     pendingFinishKey(input.raceId),
+    dirtyAgeKey(input.raceId),
     input.userId,
     String(Math.floor(input.requestedSteps)),
     String(input.clientSeq ?? -1),
@@ -471,15 +479,61 @@ export async function markFinishOfficial(raceId: string, userId: string): Promis
     .exec();
 }
 
-/** Drain the dirty-participant set (userIds changed since last checkpoint) atomically. */
-export async function drainDirtyParticipants(raceId: string): Promise<string[]> {
+const CLAIM_DIRTY_LUA = `
+local expired = redis.call("ZRANGEBYSCORE", KEYS[2], "-inf", ARGV[1])
+for _, member in ipairs(expired) do
+  redis.call("ZREM", KEYS[2], member)
+  redis.call("SADD", KEYS[1], member)
+end
+local members = redis.call("SPOP", KEYS[1], tonumber(ARGV[2]))
+if type(members) == "string" then members = { members } end
+for _, member in ipairs(members) do
+  redis.call("ZADD", KEYS[2], ARGV[3], member)
+end
+return members
+`;
+
+/**
+ * Claim dirty participants under a lease. Entries are acknowledged only after PostgreSQL commits;
+ * expired leases are atomically requeued. A concurrent update adds the member back to the dirty
+ * set, so acknowledging this claim cannot erase a newer update.
+ */
+export async function claimDirtyParticipants(
+  raceId: string,
+  options?: { limit?: number; leaseMs?: number; nowMs?: number },
+): Promise<string[]> {
+  await ensureRedisLiveConnected();
+  const nowMs = options?.nowMs ?? Date.now();
+  const raw = await getRedisLive().eval(
+    CLAIM_DIRTY_LUA,
+    2,
+    dirtyKey(raceId),
+    dirtyInFlightKey(raceId),
+    String(nowMs),
+    String(options?.limit ?? 500),
+    String(nowMs + (options?.leaseMs ?? 90_000)),
+  );
+  return Array.isArray(raw) ? raw.map(String) : [];
+}
+
+export async function acknowledgeDirtyParticipants(raceId: string, userIds: string[]): Promise<void> {
+  if (userIds.length === 0) return;
   await ensureRedisLiveConnected();
   const redis = getRedisLive();
-  const [members] = (await redis.multi().smembers(dirtyKey(raceId)).del(dirtyKey(raceId)).exec()) as [
-    [Error | null, string[]],
-    [Error | null, number],
-  ];
-  return members?.[1] ?? [];
+  const pipe = redis.multi();
+  pipe.zrem(dirtyInFlightKey(raceId), ...userIds);
+  for (const userId of userIds) {
+    const stillDirty = await redis.sismember(dirtyKey(raceId), userId);
+    if (!stillDirty) pipe.zrem(dirtyAgeKey(raceId), userId);
+  }
+  await pipe.exec();
+}
+
+/** Legacy test/helper alias. Production checkpointing uses claim/ack. */
+export async function drainDirtyParticipants(raceId: string): Promise<string[]> {
+  const claimed = await claimDirtyParticipants(raceId);
+  await acknowledgeDirtyParticipants(raceId, claimed);
+  return claimed;
 }
 
 /** Fetch selected participant hashes (full recovery state) for checkpointing. */
@@ -502,7 +556,7 @@ export async function clearRaceLiveState(raceId: string, userIds: string[]): Pro
     await ensureRedisLiveConnected();
     const redis = getRedisLive();
     const pipe = redis.multi();
-    pipe.del(cfgKey(raceId), lbKey(raceId), dirtyKey(raceId), pendingFinishKey(raceId), finishOrdinalKey(raceId), namesKey(raceId));
+    pipe.del(cfgKey(raceId), lbKey(raceId), dirtyKey(raceId), dirtyInFlightKey(raceId), dirtyAgeKey(raceId), pendingFinishKey(raceId), finishOrdinalKey(raceId), namesKey(raceId));
     for (const userId of userIds) pipe.del(pKey(raceId, userId));
     await pipe.exec();
   } catch (err) {

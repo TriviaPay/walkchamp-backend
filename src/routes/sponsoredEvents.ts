@@ -13,13 +13,13 @@ import { eq, and, sql, inArray, lte, or, gte, gt, asc, ne, desc } from "drizzle-
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { triggerEvent } from "../lib/pusher.js";
 import { getCoinBalance, recordCoinLedgerEntry } from "../lib/coinsService.js";
-import { grantVariableCoinReward } from "../lib/coinRewardService.js";
 import { logger } from "../lib/logger.js";
 import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration, registerOrReviveScheduledRegistration } from "../lib/raceIntegrity.js";
 import { markRaceActive } from "../lib/raceRegistry.js";
 import { resolveLiveStateModeForNewRace, initializeRaceLiveState } from "../lib/raceLiveHydration.js";
 import { notifyPromotionalSponsoredEvent } from "../lib/pushNotificationService.js";
-import { createPendingSponsoredGiftCardAwards } from "../lib/sponsoredGiftCards.js";
+import { autoCompleteRace } from "./races.js";
+import { enqueueOutboxEvent, insertOutboxEventTx } from "../lib/outbox.js";
 import {
   getSponsoredAwardedWinnerCount,
   getSponsoredPrizePoolCents,
@@ -138,7 +138,9 @@ export async function autoFillSchedule(): Promise<void> {
 
     if (existing.length > 0) continue;
 
-    const [inserted] = await db.insert(raceRoomsTable).values({
+    let outboxRow: Awaited<ReturnType<typeof insertOutboxEventTx>> = null;
+    const [inserted] = await db.transaction(async (tx) => {
+      const rows = await tx.insert(raceRoomsTable).values({
       creatorId: recent.creatorId,
       title: ev.title,
       type: "sponsored",
@@ -153,7 +155,15 @@ export async function autoFillSchedule(): Promise<void> {
       inviteCode,
       isPrivate: false,
       trackLayout: pickTrackLayout(ev.day, ev.date),
-    }).returning({ id: raceRoomsTable.id });
+      }).returning({ id: raceRoomsTable.id });
+      if (rows[0]) outboxRow = await insertOutboxEventTx(tx, {
+        topic: "scheduled-jobs", eventType: "sponsored.start", aggregateType: "race",
+        aggregateId: rows[0].id, idempotencyKey: `sponsored.start:${rows[0].id}`,
+        payload: { roomId: rows[0].id }, availableAt: startAt,
+      });
+      return rows;
+    });
+    if (outboxRow) void enqueueOutboxEvent(outboxRow);
 
     if (inserted) {
       void notifyPromotionalSponsoredEvent({
@@ -207,7 +217,7 @@ export async function nextSponsoredStartAt(): Promise<Date | null> {
 }
 
 // ── Background job: auto-start/cancel due events ───────────────────────────────
-export async function processSponsuredEvents() {
+export async function processSponsuredEvents(onlyRoomId?: string) {
   try {
     const now = new Date();
     const dueRooms = await db
@@ -219,6 +229,7 @@ export async function processSponsuredEvents() {
           eq(raceRoomsTable.scheduleType, "scheduled"),
           eq(raceRoomsTable.status, "scheduled"),
           lte(raceRoomsTable.scheduledStartAt, now),
+          ...(onlyRoomId ? [eq(raceRoomsTable.id, onlyRoomId)] : []),
         ),
       );
 
@@ -343,7 +354,7 @@ export async function processSponsuredEvents() {
       }
     }
     // ── Phase 2: Finalize in_progress events whose 3-hour window has elapsed ──
-    await finalizeSponsoredEvents(now);
+    if (!onlyRoomId) await finalizeSponsoredEvents(now);
 
     // autoFillSchedule() deliberately does NOT run here. It issues one SELECT per weekend
     // slot (16 queries) and only ever creates rooms 8 weekends out, so running it on this
@@ -355,9 +366,10 @@ export async function processSponsuredEvents() {
 }
 
 // ── Finalize sponsored events that have run their full 3-hour window ──────────
-// Winners = participants who hit targetSteps (finishedGoal=true).
-// Non-winners get 100 consolation coins. Room is marked completed.
-const CONSOLATION_COINS = 100;
+// All settlement is delegated to autoCompleteRace. It owns the single transactional claim,
+// gift-card awards, consolation coin ledger entries, participant/result state, and retry semantics.
+// Keeping a second settlement implementation here previously created both double-award races and
+// a crash window where status was completed before any award existed.
 
 async function finalizeSponsoredEvents(now: Date) {
   const RACE_DURATION_MS = 3 * 60 * 60 * 1000;
@@ -377,106 +389,7 @@ async function finalizeSponsoredEvents(now: Date) {
   logger.info({ count: dueRooms.length }, "[SponsoredEventsJob] finalizing expired events");
 
   for (const room of dueRooms) {
-    // Get all active participants
-    const parts = await db
-      .select({
-        userId:       raceParticipantsTable.userId,
-        currentSteps: raceParticipantsTable.currentSteps,
-        finishedGoal: raceParticipantsTable.finishedGoal,
-        finishedAt:   raceParticipantsTable.finishedAt,
-        finishRank:   raceParticipantsTable.finishRank,
-      })
-      .from(raceParticipantsTable)
-      .where(eq(raceParticipantsTable.raceRoomId, room.id));
-
-    // Identify winners (reached target steps)
-    const finisherCount = parts.filter((p) => p.finishedGoal && p.finishedAt).length;
-    const winnerCount = getSponsoredAwardedWinnerCount(parts.length, finisherCount);
-    const winnerIds = new Set(
-      parts
-        .filter((p) => p.finishedGoal && p.finishedAt)
-        .sort((a, b) => (a.finishedAt?.getTime() ?? 0) - (b.finishedAt?.getTime() ?? 0))
-        .slice(0, winnerCount)
-        .map((p) => p.userId),
-    );
-    await createPendingSponsoredGiftCardAwards({
-      raceRoomId: room.id,
-      winnerUserIds: [...winnerIds],
-      prizeAmountCents: PRIZE_PER_WINNER_CENTS,
-      metadata: {
-        eventTitle: room.title,
-        source: "sponsored_event_finalizer",
-      },
-    });
-
-    // Non-winners: grant 100 consolation coins (idempotent)
-    const nonWinners = parts.filter((p) => !winnerIds.has(p.userId));
-    for (const p of nonWinners) {
-      await grantVariableCoinReward({
-        userId:      p.userId,
-        amount:      CONSOLATION_COINS,
-        rewardCode:  "sponsored_consolation",
-        sourceId:    room.id,
-        description: "Sponsored event consolation prize",
-      });
-    }
-
-    // Mark room completed
-    await db
-      .update(raceRoomsTable)
-      .set({
-        status: "completed",
-        completedAt: now,
-        updatedAt: now,
-        winnerCount,
-        winnersPoolCents: winnerIds.size * PRIZE_PER_WINNER_CENTS,
-        unawardedAmountCents: Math.max(0, getSponsoredPrizePoolCents(parts.length) - winnerIds.size * PRIZE_PER_WINNER_CENTS),
-      })
-      .where(eq(raceRoomsTable.id, room.id));
-
-    // Mark participants inactive
-    await db
-      .update(raceParticipantsTable)
-      .set({ status: "completed" })
-      .where(eq(raceParticipantsTable.raceRoomId, room.id));
-
-    // Broadcast race finished
-    triggerEvent("public-presence", "race:finished", { room_id: room.id }).catch(() => {});
-    triggerEvent(PUSHER_CHANNEL, "sponsored_event.completed", {
-      room_id: room.id,
-      invalidate: ["walk_bootstrap", "sponsored_events"],
-    }).catch(() => {});
-
-    // Push notifications
-    const prizeDisplay = `$${(PRIZE_PER_WINNER_CENTS / 100).toFixed(0)}`;
-    for (const p of parts) {
-      const isWinner = winnerIds.has(p.userId);
-      if (isWinner) {
-        sendPushToUser(
-          p.userId,
-          "🏆 You won a gift card!",
-          `Congratulations! You finished ${room.title} and won a ${prizeDisplay} Amazon gift card. We'll email you shortly.`,
-          { type: "sponsored_event_winner", room_id: room.id },
-        );
-        triggerEvent(`private-user-${p.userId}`, "sponsored:won", {
-          room_id:   room.id,
-          title:     room.title,
-          prize:     prizeDisplay,
-        }).catch(() => {});
-      } else {
-        sendPushToUser(
-          p.userId,
-          "Sponsored Race Ended",
-          `${room.title} has ended. You earned ${CONSOLATION_COINS} coins for participating! Keep walking! 🚶`,
-          { type: "sponsored_event_consolation", room_id: room.id, coins: CONSOLATION_COINS },
-        );
-      }
-    }
-
-    logger.info(
-      { roomId: room.id, winners: winnerIds.size, consolation: nonWinners.length },
-      "[SponsoredEventsJob] finalized",
-    );
+    await autoCompleteRace(room.id, "sponsored_duration_expired");
   }
 }
 
@@ -756,7 +669,9 @@ router.post("/sponsored-events/generate-weekend", requireAuth, requireAdminKey, 
         continue;
       }
 
-      const [inserted] = await db.insert(raceRoomsTable).values({
+      let outboxRow: Awaited<ReturnType<typeof insertOutboxEventTx>> = null;
+      const [inserted] = await db.transaction(async (tx) => {
+        const rows = await tx.insert(raceRoomsTable).values({
         creatorId: userId,
         title: ev.title,
         type: "sponsored",
@@ -771,7 +686,15 @@ router.post("/sponsored-events/generate-weekend", requireAuth, requireAdminKey, 
         inviteCode,
         isPrivate: false,
         trackLayout: pickTrackLayout(ev.day, ev.date),
-      }).returning({ id: raceRoomsTable.id });
+        }).returning({ id: raceRoomsTable.id });
+        if (rows[0]) outboxRow = await insertOutboxEventTx(tx, {
+          topic: "scheduled-jobs", eventType: "sponsored.start", aggregateType: "race",
+          aggregateId: rows[0].id, idempotencyKey: `sponsored.start:${rows[0].id}`,
+          payload: { roomId: rows[0].id }, availableAt: startAt,
+        });
+        return rows;
+      });
+      if (outboxRow) void enqueueOutboxEvent(outboxRow);
 
       if (inserted) {
         void notifyPromotionalSponsoredEvent({

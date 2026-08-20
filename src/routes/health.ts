@@ -10,6 +10,7 @@ import {
 } from "../lib/redisRuntimeValidation.js";
 import { getRuntimeLoadState } from "../middleware/loadShedding.js";
 import { readinessStatusCode, shouldExposeReadinessDetails } from "../lib/healthVisibility.js";
+import { getWalkDirtyHealth } from "../lib/walkRedisIngest.js";
 
 const router: IRouter = Router();
 type CheckValue = "ok" | "warning" | "error" | "skipped";
@@ -96,11 +97,14 @@ router.get("/readyz", async (req, res) => {
   // live-race durability guarantee is actually enforced (not silently violated).
   const shouldInspectLiveRedis = config.redis.liveUrl !== null
     && config.nodeEnv !== "test"
-    && config.features.redisLiveRaceEnabled;
+    && (config.features.redisLiveRaceEnabled
+      || config.features.redisWalkShadowWrite
+      || config.features.redisWalkServe);
 
   let redisCacheStatus: RedisRuntimeStatus | null = null;
   let redisQueueStatus: RedisRuntimeStatus | null = null;
   let redisLiveStatus: RedisRuntimeStatus | null = null;
+  let walkDirty: Awaited<ReturnType<typeof getWalkDirtyHealth>> | null = null;
   let databaseCheck: CheckValue = "skipped";
   let migrationCheck: CheckValue = "skipped";
   let redisCacheCheck: CheckValue = shouldCheckRedis ? "error" : "skipped";
@@ -185,6 +189,12 @@ router.get("/readyz", async (req, res) => {
       redisLiveCheck = redisCheckValue(redisLiveStatus, false);
       if (!redisLiveStatus.ok) errors.push(...redisLiveStatus.errors);
       warnings.push(...redisLiveStatus.warnings);
+      if (config.features.redisWalkShadowWrite || config.features.redisWalkServe) {
+        walkDirty = await getWalkDirtyHealth();
+        if ((walkDirty.oldestDirtyAgeMs ?? 0) > 90_000) {
+          warnings.push(`oldest walk dirty entry is ${walkDirty.oldestDirtyAgeMs}ms old`);
+        }
+      }
     } catch (err) {
       redisLiveCheck = "error";
       errors.push(err instanceof Error ? err.message : "redis-live readiness check failed");
@@ -213,6 +223,7 @@ router.get("/readyz", async (req, res) => {
       queue: redisQueueStatus,
       live: redisLiveStatus,
     },
+    walkDirty,
     warnings,
     errors,
   });

@@ -1,4 +1,12 @@
-import { pgTable, text, integer, timestamp, date, boolean, index, uniqueIndex, jsonb } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, timestamp, date, boolean, index, uniqueIndex, jsonb } from "drizzle-orm/pg-core";
+
+export const walkIngestControlTable = pgTable("walk_ingest_control", {
+  id: integer("id").primaryKey().default(1),
+  mode: text("mode").notNull().default("postgres"),
+  epoch: bigint("epoch", { mode: "number" }).notNull().default(1),
+  changedAt: timestamp("changed_at", { withTimezone: true }).notNull().defaultNow(),
+  reason: text("reason"),
+});
 
 // ── Daily step totals per user (one row per user per day) ─────────────────────
 export const stepDailyTotalsTable = pgTable(
@@ -16,6 +24,8 @@ export const stepDailyTotalsTable = pgTable(
     // "unverified" (all provisional sensor sources), or "mixed". Provisional Walk-screen
     // estimates never mark a day as verified.
     sourceClass: text("source_class").notNull().default("unverified"),
+    ingestEpoch: bigint("ingest_epoch", { mode: "number" }).notNull().default(0),
+    ingestVersion: bigint("ingest_version", { mode: "number" }).notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -43,6 +53,8 @@ export const stepDailyDeviceTotalsTable = pgTable(
     caloriesBurned: integer("calories_burned").notNull().default(0),
     activeMinutes: integer("active_minutes").notNull().default(0),
     sourceClass: text("source_class").notNull().default("unverified"),
+    ingestEpoch: bigint("ingest_epoch", { mode: "number" }).notNull().default(0),
+    ingestVersion: bigint("ingest_version", { mode: "number" }).notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
@@ -73,10 +85,14 @@ export const stepSessionsTable = pgTable(
     source: text("source"),
     // True only when `source` normalizes to a verified health source (health_connect | healthkit).
     isVerifiedSource: boolean("is_verified_source").notNull().default(false),
+    ingestSessionKey: text("ingest_session_key"),
+    lastActivityAt: timestamp("last_activity_at", { withTimezone: true }),
+    sessionFinal: boolean("session_final").notNull().default(false),
   },
   (t) => [
     index("step_sessions_user_idx").on(t.userId),
     index("step_sessions_started_idx").on(t.startedAt),
+    uniqueIndex("step_sessions_ingest_session_key_idx").on(t.ingestSessionKey),
   ],
 );
 

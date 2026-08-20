@@ -11,7 +11,8 @@ import {
   addParticipant,
   isRaceHydrated,
   getRaceConfig,
-  drainDirtyParticipants,
+  claimDirtyParticipants,
+  acknowledgeDirtyParticipants,
   getParticipantsState,
   LIVE_RACE_STATE,
   type LiveParticipantSeed,
@@ -192,7 +193,7 @@ export async function checkpointRedisRaces(): Promise<void> {
       // Don't checkpoint a race that's finalizing/frozen — the finalize flush owns those rows.
       const cfg = await getRaceConfig(raceId);
       if (cfg && cfg.status !== LIVE_RACE_STATE.ACTIVE) continue;
-      const dirty = await drainDirtyParticipants(raceId);
+      const dirty = await claimDirtyParticipants(raceId);
       if (dirty.length === 0) continue;
       const states = await getParticipantsState(raceId, dirty);
       await db.transaction(async (tx) => {
@@ -209,6 +210,7 @@ export async function checkpointRedisRaces(): Promise<void> {
             ));
         }
       });
+      await acknowledgeDirtyParticipants(raceId, dirty);
     } catch (err) {
       logger.error({ err, raceId }, "[raceLiveHydration] checkpoint failed");
     }

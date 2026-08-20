@@ -35,6 +35,13 @@ const envSchema = z
     // Phase 2 canary: route live race step state through redis-live instead of Postgres.
     // OFF by default; only races that START while this is true adopt redis storage mode.
     ENABLE_REDIS_LIVE_RACE: z.enum(["true", "false"]).optional(),
+    ENABLE_REDIS_PRESENCE_MIRROR_WRITE: z.enum(["true", "false"]).optional(),
+    ENABLE_REDIS_PRESENCE_SERVE: z.enum(["true", "false"]).optional(),
+    ENABLE_REDIS_WALK_SHADOW_WRITE: z.enum(["true", "false"]).optional(),
+    ENABLE_REDIS_WALK_SERVE: z.enum(["true", "false"]).optional(),
+    REDIS_WALK_CANARY_PERCENT: z.coerce.number().int().min(0).max(100).optional(),
+    ENABLE_REDIS_LEADERBOARD_MIRROR_WRITE: z.enum(["true", "false"]).optional(),
+    ENABLE_REDIS_LEADERBOARD_SERVE: z.enum(["true", "false"]).optional(),
     // Hybrid live + verified step processing. OFF by default; when off every live/verified/
     // reconcile/finalize path falls through to today's exact behavior. Backend-authoritative
     // reconciliation tolerances live in config.hybridReconciliation (never client-supplied).
@@ -76,6 +83,7 @@ const envSchema = z
     FEATURE_COIN_ENTRY_CHALLENGES: z.enum(["true", "false"]).optional(),
     FEATURE_UNLIMITED_GOAL: z.enum(["true", "false"]).optional(),
     UNLIMITED_GOAL_GRACE_HOURS: z.string().optional(),
+    UNLIMITED_VERIFICATION_MODE: z.enum(["manual", "client_source"]).optional(),
     UNLIMITED_GOAL_ZERO_WINNER_POLICY: z
       .enum(["refund_entry_contributions", "rollover_prize_pool", "manual_review"])
       .optional(),
@@ -179,6 +187,13 @@ const featureFlags = {
     : false,
   edgeStrictModeEnabled: parseBoolean(rawEnv.ENABLE_EDGE_STRICT_MODE),
   redisLiveRaceEnabled: parseBoolean(rawEnv.ENABLE_REDIS_LIVE_RACE),
+  redisPresenceMirrorWrite: parseBoolean(rawEnv.ENABLE_REDIS_PRESENCE_MIRROR_WRITE),
+  redisPresenceServe: parseBoolean(rawEnv.ENABLE_REDIS_PRESENCE_SERVE),
+  redisWalkShadowWrite: parseBoolean(rawEnv.ENABLE_REDIS_WALK_SHADOW_WRITE),
+  redisWalkServe: parseBoolean(rawEnv.ENABLE_REDIS_WALK_SERVE),
+  redisWalkCanaryPercent: rawEnv.REDIS_WALK_CANARY_PERCENT ?? 0,
+  redisLeaderboardMirrorWrite: parseBoolean(rawEnv.ENABLE_REDIS_LEADERBOARD_MIRROR_WRITE),
+  redisLeaderboardServe: parseBoolean(rawEnv.ENABLE_REDIS_LEADERBOARD_SERVE),
   hybridReconciliationEnabled: parseBoolean(rawEnv.ENABLE_HYBRID_RECONCILIATION),
   hybridStrictVerificationEnabled: parseBoolean(rawEnv.ENABLE_HYBRID_STRICT_VERIFICATION),
   bloomGuardsMode: parseBloomGuardsMode(rawEnv.BLOOM_GUARDS_MODE),
@@ -194,6 +209,12 @@ const featureFlags = {
   allowDemoSeeds: parseBoolean(rawEnv.ALLOW_DEMO_SEEDS),
   mockProvidersEnabled: parseBoolean(rawEnv.MOCK_PROVIDERS_ENABLED),
 };
+
+// A source label supplied by the mobile client is useful provenance, but it is not cryptographic
+// proof that Health Connect / HealthKit produced the number. Production funded challenges therefore
+// default to an ops-verification hold. Non-production keeps the legacy automatic mode for local QA.
+const unlimitedVerificationMode: "manual" | "client_source" =
+  rawEnv.UNLIMITED_VERIFICATION_MODE ?? (isProduction ? "manual" : "client_source");
 
 const realMoneyReadiness = {
   paymentsLiveMode: parseBoolean(rawEnv.PAYMENTS_LIVE_MODE, true),
@@ -231,16 +252,29 @@ if (featureFlags.bullmqWebhookProcessingEnabled && !redisQueueUrl) {
   configErrors.push("REDIS_QUEUE_URL or REDIS_URL is required when ENABLE_BULLMQ_WEBHOOK_PROCESSING=true");
 }
 
-if (featureFlags.redisLiveRaceEnabled) {
+if (featureFlags.redisLiveRaceEnabled || featureFlags.redisWalkShadowWrite || featureFlags.redisWalkServe) {
   if (!redisLiveUrl) {
     configErrors.push("REDIS_LIVE_URL (or a fallback queue/REDIS_URL) is required when ENABLE_REDIS_LIVE_RACE=true");
   } else if (isProduction && (redisLiveUrl === redisQueueUrl || redisLiveUrl === redisCacheUrl)) {
     // Live race state must not share the BullMQ queue instance (a race memory spike could
     // starve payment/recovery jobs) nor the eviction-enabled cache (would evict race keys).
     configErrors.push(
-      "ENABLE_REDIS_LIVE_RACE=true requires a DEDICATED REDIS_LIVE_URL in production (must differ from REDIS_CACHE_URL and REDIS_QUEUE_URL)",
+      "Redis live-state features require a DEDICATED REDIS_LIVE_URL in production (must differ from REDIS_CACHE_URL and REDIS_QUEUE_URL)",
     );
   }
+}
+
+if (featureFlags.redisPresenceServe && !featureFlags.redisPresenceMirrorWrite) {
+  configErrors.push("ENABLE_REDIS_PRESENCE_SERVE=true requires ENABLE_REDIS_PRESENCE_MIRROR_WRITE=true");
+}
+if ((featureFlags.redisWalkShadowWrite || featureFlags.redisWalkServe) && !redisLiveUrl) {
+  configErrors.push("Redis walk ingestion requires REDIS_LIVE_URL");
+}
+if (featureFlags.redisWalkServe && !featureFlags.redisWalkShadowWrite) {
+  configErrors.push("ENABLE_REDIS_WALK_SERVE=true requires ENABLE_REDIS_WALK_SHADOW_WRITE=true");
+}
+if (featureFlags.redisLeaderboardServe && !featureFlags.redisLeaderboardMirrorWrite) {
+  configErrors.push("ENABLE_REDIS_LEADERBOARD_SERVE=true requires ENABLE_REDIS_LEADERBOARD_MIRROR_WRITE=true");
 }
 
 if (isProduction) {
@@ -319,6 +353,41 @@ if (isProduction) {
     }
     if (!rawEnv.RAZORPAY_WEBHOOK_SECRET?.trim()) {
       configErrors.push("RAZORPAY_WEBHOOK_SECRET is required when cash features are enabled in production");
+    }
+    // Audit 2026-08-17 F-12: with the reconciliation pass off, a funded race settles on the
+    // client-declared live step stream with no health-verification cross-check at all. The
+    // strict hold for funded races is forced in code (races.ts), but it only runs inside the
+    // hybrid pass — so cash in production requires the pass itself to be armed.
+    if (!featureFlags.hybridReconciliationEnabled) {
+      configErrors.push("ENABLE_HYBRID_RECONCILIATION=true is required when cash features are enabled in production (funded payouts must never settle on unverified live steps)");
+    }
+    if (featureFlags.unlimitedGoalEnabled && unlimitedVerificationMode !== "manual") {
+      configErrors.push("UNLIMITED_VERIFICATION_MODE=manual is required when funded Unlimited challenges are enabled in production (client-declared health sources are not payout attestation)");
+    }
+  }
+}
+
+// Validate Redis connection URLs parse and carry a URL-safe password (audit 2026-08-17 M17). The
+// Coolify compose splices REDIS_PASSWORD directly into redis://:${REDIS_PASSWORD}@host, so a
+// password with a URL-reserved character (@ # / % : ?) mangles the URL and fails cryptically at
+// connect time (WRONGPASS / URIError) instead of loudly at boot. Enforced in production only —
+// dev setups may use a local password-less or differently-encoded Redis.
+if (isProduction) {
+  for (const [name, url] of [
+    ["REDIS_CACHE_URL", redisCacheUrl],
+    ["REDIS_QUEUE_URL", redisQueueUrl],
+    ["REDIS_LIVE_URL", redisLiveUrl],
+  ] as const) {
+    if (!url) continue;
+    let parsed: URL | null = null;
+    try {
+      parsed = new URL(url);
+    } catch {
+      configErrors.push(`${name} is not a valid URL — check REDIS_PASSWORD for URL-reserved characters; use an alphanumeric password`);
+      continue;
+    }
+    if (parsed.password && !/^[A-Za-z0-9]+$/.test(parsed.password)) {
+      configErrors.push(`${name} password is not URL-safe — REDIS_PASSWORD must be alphanumeric, or the spliced redis://:pass@host URL breaks`);
     }
   }
 }
@@ -418,6 +487,7 @@ export const config = {
     defaultDailyGoalSteps: 10000,
     graceHours: unlimitedGoalGraceHours,
     graceMs: unlimitedGoalGraceHours * 60 * 60_000,
+    verificationMode: unlimitedVerificationMode,
     zeroWinnerPolicy: unlimitedGoalZeroWinnerPolicy,
   },
   hybridReconciliation: {

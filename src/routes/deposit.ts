@@ -131,7 +131,7 @@ async function getUserCountryCode(userId: string): Promise<string | null> {
 async function markDepositReturnObserved(
   transactionId: string,
   patch: Record<string, unknown>,
-  opts: { onlyIfPending?: boolean } = {},
+  opts: { onlyIfPending?: boolean; setCancelled?: boolean } = {},
 ) {
   const [depositTx] = await db
     .select({ id: depositTransactionsTable.id, status: depositTransactionsTable.status, metadata: depositTransactionsTable.metadata })
@@ -146,9 +146,17 @@ async function markDepositReturnObserved(
   // metadata rewritten by anyone who knows the transaction UUID.
   if (opts.onlyIfPending && depositTx.status !== "pending") return;
 
+  // Flip a not-yet-settled deposit to a terminal "cancelled" status when the user abandons
+  // checkout (audit 2026-08-17 H8). Without this the row stays "processing" forever, the client
+  // poll never resolves, and the app shows a 24h "verifying" phantom + repeatedly force-navigates
+  // to the Wallet tab. A payment that actually raced through still resurrects via the provider
+  // webhook — settleDepositOnce credits on provider truth regardless of this local status.
+  const canCancel = Boolean(opts.setCancelled) && (depositTx.status === "pending" || depositTx.status === "processing");
+
   await db
     .update(depositTransactionsTable)
     .set({
+      ...(canCancel ? { status: "cancelled", failureReason: "user_cancelled" } : {}),
       metadata: {
         ...((depositTx.metadata as Record<string, unknown> | null) ?? {}),
         ...patch,
@@ -314,7 +322,7 @@ router.get("/wallet/deposit/stripe/return", async (req, res) => {
     await markDepositReturnObserved(transaction_id, {
       returnSeenAt: new Date().toISOString(),
       returnDisplayStatus: "cancelled",
-    });
+    }, { setCancelled: true });
     return res.redirect(appDoneUrl("cancelled", transaction_id));
   }
 
@@ -1036,11 +1044,14 @@ router.post("/wallet/deposit/razorpay/browser-cancel", async (req, res) => {
   const parsed = browserUpdateSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ ok: false });
 
+  // setCancelled flips a non-terminal (pending/processing) row to "cancelled" so the client poll
+  // resolves; canCancel inside markDepositReturnObserved still protects already-settled deposits,
+  // and a payment that actually completed resurrects via the provider webhook (audit H8).
   await markDepositReturnObserved(parsed.data.transaction_id, {
     browserCancelSeenAt: new Date().toISOString(),
     browserCancelReason: parsed.data.reason ?? "browser_cancel",
     returnDisplayStatus: "cancelled",
-  }, { onlyIfPending: true });
+  }, { setCancelled: true });
 
   return res.json({ ok: true });
 });
@@ -1144,7 +1155,7 @@ router.post("/wallet/deposit/:provider/cancel", requireAuth, async (req, res) =>
     userCancelSeenAt: new Date().toISOString(),
     userCancelReason: parsed.data.reason ?? "user_cancel",
     returnDisplayStatus: "cancelled",
-  });
+  }, { setCancelled: true });
 
   req.log.info({ transaction_id, provider }, "[PaymentBackend] transaction cancelled");
   return res.json({ success: true, status: depositTx.status, displayStatus: "cancelled" });

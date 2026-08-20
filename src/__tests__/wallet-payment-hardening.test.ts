@@ -154,10 +154,11 @@ describe("wallet payment hardening", () => {
     expect(migration).toContain("CREATE TABLE IF NOT EXISTS \"sponsored_gift_card_awards\"");
     expect(helper).toContain("createPendingSponsoredGiftCardAwards");
     expect(helper).toContain(".onConflictDoNothing()");
-    expect(sponsoredEventsRoute).toContain("source: \"sponsored_event_finalizer\"");
+    expect(sponsoredEventsRoute).toContain('await autoCompleteRace(room.id, "sponsored_duration_expired")');
     expect(sponsoredEventsRoute).toContain("getSponsoredWinnerCount(parts.length)");
     expect(racesRoute).toContain("source: \"race_auto_completion\"");
     expect(racesRoute).toContain("assignSponsoredGiftCardPayouts");
+    expect(racesRoute).toContain("createPendingSponsoredGiftCardAwards");
     expect(adminRoute).toContain("/admin/sponsored-gift-card-awards");
     expect(adminRoute).toContain("redactGiftCardAward");
     expect(adminRoute).toContain("sponsored_gift_card_fulfilled");
@@ -257,7 +258,9 @@ describe("wallet payment hardening", () => {
     expect(walletRoute).toContain("withdrawalIdempotencyKey = `withdrawal:${userId}:${idempotency.key}`");
     expect(walletRoute).toContain(".for(\"update\")");
     expect(walletRoute).toContain("availableBalanceCents: sql`${walletsTable.availableBalanceCents} - ${amountCents}`");
-    expect(walletRoute).toContain("withdrawableBalanceCents: sql`${walletsTable.withdrawableBalanceCents} - ${amountCents}`");
+    // B2: withdrawals gate on availableBalanceCents (any cleared balance is withdrawable); the
+    // withdrawable column is kept mirrored to available rather than being the gate.
+    expect(walletRoute).toContain("withdrawableBalanceCents: sql`GREATEST(0, ${walletsTable.availableBalanceCents} - ${amountCents})`");
     expect(walletRoute).toContain("idempotencyKey: `withdrawal_requested:${wd.id}`");
     expect(withdrawalSchema).toContain("idempotencyKey: text(\"idempotency_key\")");
     expect(withdrawalSchema).toContain("withdrawals_idempotency_key_unique_idx");
@@ -275,7 +278,8 @@ describe("wallet payment hardening", () => {
     expect(adminRoute).toContain("idempotencyKey: `withdrawal_rejected:${withdrawalId}`");
     expect(adminRoute).toContain("status: \"cancelled\"");
     expect(adminRoute).toContain("availableBalanceCents: afterAvailable");
-    expect(adminRoute).toContain("withdrawableBalanceCents: afterWithdrawable");
+    // B2: withdrawable mirrors available on reject (any cleared balance is withdrawable).
+    expect(adminRoute).toContain("withdrawableBalanceCents: afterAvailable");
     expect(migration).toContain("'withdrawal_rejected') AND \"amount_cents\" > 0");
   });
 

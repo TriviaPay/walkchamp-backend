@@ -11,6 +11,7 @@ import {
   raceResultsTable,
   liveRaceCommentsTable,
   liveRaceReactionsTable,
+  spectateSessionsTable,
   friendsTable,
   friendRequestsTable,
   userTitlesTable,
@@ -25,7 +26,7 @@ import {
   unlimitedChallengesTable,
   unlimitedChallengeParticipantsTable,
 } from "../../db/src/schema/index.js";
-import { eq, and, desc, asc, sql, ne, inArray, notInArray, or, lt } from "drizzle-orm";
+import { eq, and, desc, asc, sql, ne, inArray, notInArray, or, lt, gt, isNull } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { z } from "zod";
 import { allocateRoomCode } from "../lib/uniqueCodes.js";
@@ -34,6 +35,13 @@ import { logger } from "../lib/logger.js";
 import { config } from "../lib/config.js";
 import { setUserDefaultTrackTheme, validateThemeOwnership } from "./trackThemes.js";
 import { grantCoinReward, getRaceWinRewardCode, grantVariableCoinReward } from "../lib/coinRewardService.js";
+import { insertOutboxEventTx, enqueueOutboxEvent } from "../lib/outbox.js";
+import { captureException } from "../lib/sentry.js";
+import { invalidateLeaderboardSnapshots } from "../lib/leaderboardSnapshotCache.js";
+import {
+  captureWalkSettlementWatermarks,
+  satisfyWalkSettlementBarrier,
+} from "../lib/walkRedisIngest.js";
 import { evaluateAndNotify } from "./achievementHooks.js";
 import { requireAdminKey } from "../middleware/requireAdminKey.js";
 import { recordCoinLedgerEntry } from "../lib/coinsService.js";
@@ -110,6 +118,7 @@ import {
   getSponsoredAwardedWinnerCount,
   getSponsoredPrizePoolCents,
   getSponsoredWinnerCount,
+  SPONSORED_EVENT_CONSOLATION_COINS,
   SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS,
   SPONSORED_EVENT_TARGET_STEPS,
 } from "../lib/sponsoredEventRules.js";
@@ -118,6 +127,7 @@ import { toLiveStepSource } from "../lib/stepSources.js";
 import { reconcileParticipant, finalizationDecision } from "../lib/raceReconciliation.js";
 import { writeAuditLog } from "../lib/auditLog.js";
 import { sendNotification } from "./notifications.js";
+import { sendPushToUser } from "./push.js";
 import { computeCanStart, terminateWaitingRoom, enqueueWaitingRoomLifecycleJobs } from "../lib/waitingRoom.js";
 import { getUnlimitedBlockingMembership } from "../lib/challengeMembership.js";
 import { UNLIMITED_NON_ACTIVE_STATUSES } from "../lib/unlimitedChallengeStatuses.js";
@@ -1015,27 +1025,37 @@ async function markRoomTerminalPendingSettlement(
   raceId: string,
   settlementStatus: "awaiting_verification" | "review_required",
   endedReason: string,
+  retryAt?: Date,
 ): Promise<void> {
   const now = new Date();
-  const updated = await db
-    .update(raceRoomsTable)
-    .set({
-      status: "completed",
-      // completedAt is the moment the race stopped being live, not the moment it was paid.
-      // payoutFinalizedAt (set in the payout transaction) records settlement separately.
-      completedAt: now,
-      updatedAt: now,
-      settlementStatus,
-    })
-    .where(and(
-      eq(raceRoomsTable.id, raceId),
-      eq(raceRoomsTable.status, "in_progress"),
-    ))
-    .returning({ id: raceRoomsTable.id })
+  let outboxRow: Awaited<ReturnType<typeof insertOutboxEventTx>> = null;
+  const updated = await db.transaction(async (tx) => {
+    const rows = await tx.update(raceRoomsTable).set({
+        status: "completed",
+        completedAt: now,
+        updatedAt: now,
+        settlementStatus,
+      }).where(and(eq(raceRoomsTable.id, raceId), eq(raceRoomsTable.status, "in_progress")))
+      .returning({ id: raceRoomsTable.id });
+    if (rows.length > 0 && settlementStatus === "awaiting_verification") {
+      outboxRow = await insertOutboxEventTx(tx, {
+        topic: "scheduled-jobs",
+        eventType: "race.settlement_retry",
+        aggregateType: "race",
+        aggregateId: raceId,
+        idempotencyKey: `race.settlement_retry:${raceId}:${retryAt?.getTime() ?? now.getTime()}`,
+        payload: { raceId },
+        availableAt: retryAt ?? now,
+      });
+    }
+    return rows;
+  })
     .catch((err) => {
       logger.error({ err, raceId }, "autoCompleteRace: failed to mark room terminal pending settlement");
       return [] as { id: string }[];
     });
+
+  if (outboxRow) void enqueueOutboxEvent(outboxRow);
 
   if (updated.length > 0) {
     logger.info(
@@ -1048,6 +1068,35 @@ async function markRoomTerminalPendingSettlement(
       settlementPending: true,
     });
   }
+}
+
+// Funded races held for verification review should be resolved by ops within a bounded window.
+// There is no auto-refund (a product decision), so at minimum surface stuck held pots as an alert
+// so entry fees are not silently held forever (audit 2026-08-17 M25).
+const HELD_RACE_ALERT_AGE_MS = 6 * 60 * 60_000;
+
+export async function alertStaleHeldRaces(now: Date = new Date()): Promise<void> {
+  const cutoff = new Date(now.getTime() - HELD_RACE_ALERT_AGE_MS);
+  const stuck = await db
+    .select({ id: raceRoomsTable.id, settlementStatus: raceRoomsTable.settlementStatus, updatedAt: raceRoomsTable.updatedAt })
+    .from(raceRoomsTable)
+    .where(and(
+      eq(raceRoomsTable.status, "completed"),
+      inArray(raceRoomsTable.settlementStatus, ["review_required", "awaiting_verification"]),
+      gt(raceRoomsTable.entryAmountCents, 0),
+      lt(raceRoomsTable.updatedAt, cutoff),
+    ));
+  if (stuck.length === 0) return;
+  const raceIds = stuck.map((r) => r.id);
+  logger.error(
+    { count: stuck.length, raceIds: raceIds.slice(0, 50) },
+    "[HeldRaceAlert] %d funded race(s) held for verification review beyond the %dh SLA — entry fees are held pending manual resolution",
+    stuck.length,
+    HELD_RACE_ALERT_AGE_MS / 3_600_000,
+  );
+  captureException(new Error(`${stuck.length} funded races held for review beyond SLA`), {
+    raceIds: raceIds.slice(0, 50),
+  });
 }
 
 export async function autoCompleteRace(raceId: string, endedReason = "time_expired"): Promise<void> {
@@ -1087,7 +1136,10 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
     try {
       await flushRedisRaceToPostgres(raceId);
     } catch (err) {
-      logger.error({ err, raceId }, "autoCompleteRace: redis flush failed — finalizing on last checkpoint");
+      // A payout must never use a stale checkpoint. Recovery will re-enter this
+      // function through the delayed outbox job or hourly reconciliation.
+      logger.error({ err, raceId }, "autoCompleteRace: redis flush failed — settlement deferred");
+      return;
     }
   }
 
@@ -1118,6 +1170,28 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
       ne(raceParticipantsTable.status, "disqualified"),
     ))
     .orderBy(desc(raceParticipantsTable.currentSteps));
+
+  if (config.features?.redisWalkServe && participants.length > 0) {
+    // UTC-12 through UTC+14 means a participant's current local calendar day
+    // is always one of these three dates. Capture all existing Redis days, then
+    // require PostgreSQL to reach every captured (epoch, version) watermark.
+    const utcDay = new Date().toISOString().slice(0, 10);
+    const adjacentDate = (offsetDays: number) => {
+      const value = new Date(`${utcDay}T00:00:00Z`);
+      value.setUTCDate(value.getUTCDate() + offsetDays);
+      return value.toISOString().slice(0, 10);
+    };
+    const candidateDays = [adjacentDate(-1), utcDay, adjacentDate(1)];
+    try {
+      const watermarks = await captureWalkSettlementWatermarks(participants.flatMap((participant) =>
+        candidateDays.map((localDate) => ({ userId: participant.userId, localDate })),
+      ));
+      await satisfyWalkSettlementBarrier(watermarks);
+    } catch (err) {
+      logger.error({ err, raceId }, "autoCompleteRace: walk checkpoint barrier unsatisfied — settlement deferred");
+      return;
+    }
+  }
 
   // ── Authoritative step total (§15) ─────────────────────────────────────────
   // Winner/payout logic is UNCHANGED — it just receives this integer. When the hybrid flag is on
@@ -1150,9 +1224,13 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
   // Session conflicts (§18) force review. Both source values are preserved for audit.
   // STRICT verification applies to participant-funded (real-money) races: their winners/payouts
   // must NEVER come from provisional live progress. A missing verification is held (pending →
-  // review), never auto-settled on live. Non-strict races (coins/sponsored, or strict flag off)
-  // keep the pragmatic fallback: settle on the server-capped live total after the short timeout.
-  const strictRace = useHybrid && config.hybridReconciliation.strictEnabled && room.entryAmountCents > 0;
+  // review), never auto-settled on live. Non-strict races (coins/sponsored) keep the pragmatic
+  // fallback: settle on the server-capped live total after the short timeout.
+  // Funded ⇒ strict is forced in code (audit 2026-08-17 F-12): the env policy can widen
+  // strictness but can never switch it off for a real-money race — an env omission must not
+  // reopen the pay-from-live path this comment forbids. config.ts additionally refuses to boot
+  // a production cash deployment without ENABLE_HYBRID_RECONCILIATION.
+  const strictRace = useHybrid && room.entryAmountCents > 0;
   // Participants held (review_required) on a strict race — used for selective payout below.
   const heldUserIds = new Set<string>();
   if (useHybrid && isPrizedRace) {
@@ -1255,7 +1333,12 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
       // The PAYOUT waits, but the race does not: the winner slots are already filled, so the
       // room leaves the live state now and settles when verification lands (or ops resolves).
       if (anyPendingInGrace) {
-        await markRoomTerminalPendingSettlement(raceId, "awaiting_verification", endedReason);
+        await markRoomTerminalPendingSettlement(
+          raceId,
+          "awaiting_verification",
+          endedReason,
+          new Date(raceEndedAtMs + graceMs),
+        );
         logger.info({ raceId, strictRace }, "autoCompleteRace: deferring payout — awaiting verification within grace window");
         return; // scheduler / POST /verify re-enters; verification may still arrive
       }
@@ -1635,6 +1718,8 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
   // If results insertion fails for any reason, the race is still marked done so
   // cleanupOverdueRaces won't loop forever retrying a broken insert.
   let markedCompleted = false;
+  // Durable Coins Battle payout backstop, inserted inside the settle tx below (audit 2026-08-17 M2).
+  let coinsBattleOutboxRow: Awaited<ReturnType<typeof insertOutboxEventTx>> = null;
   try {
     await db.transaction(async (tx) => {
       const payoutFinalizedAt = new Date();
@@ -1696,6 +1781,27 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
       if (updated.length === 0) return;
       markedCompleted = true;
 
+      // Persist the Coins Battle payout atomically with settlement (audit 2026-08-17 M2). The
+      // fire-and-forget grant later is the fast path; this durable outbox row is the backstop so a
+      // crash/deploy between this commit and that grant cannot destroy the user-funded coin pool —
+      // the worker re-drives it, and grantVariableCoinReward is idempotent on rewardCode+sourceId,
+      // so the two paths never double-credit.
+      if (room.entryType === "coins_battle" && coinPrizeMap.size > 0) {
+        const coinPayouts = [...coinPrizeMap.entries()].map(([userId, coins]) => ({
+          userId,
+          coins,
+          rank: payouts.find((p) => p.userId === userId)?.displayRank ?? 1,
+        }));
+        coinsBattleOutboxRow = await insertOutboxEventTx(tx, {
+          topic: "coin-reconciliation",
+          eventType: "coins_battle.payout",
+          aggregateType: "race_room",
+          aggregateId: raceId,
+          idempotencyKey: `coins-battle-payout:${raceId}`,
+          payload: { raceId, payouts: coinPayouts },
+        });
+      }
+
       if (room.entryAmountCents > 0) {
         await creditCashChallengePrizes(tx, {
           raceRoomId: raceId,
@@ -1717,12 +1823,38 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
             source: "race_auto_completion",
           },
         });
+
+        // Sponsored consolation is part of the same commit as the terminal status and gift-card
+        // awards. A crash can therefore leave neither or all rewards, never a completed room whose
+        // non-winners silently missed their coins. Ledger idempotency also makes settlement retries
+        // harmless.
+        for (const result of resultRows) {
+          const isGiftCardWinner = result.eligibleForPrize && result.prizeCents > 0;
+          const isDisqualified = result.status === "disqualified_simulation";
+          if (isGiftCardWinner || isDisqualified) continue;
+          await recordCoinLedgerEntry(tx, {
+            userId: result.userId,
+            amount: SPONSORED_EVENT_CONSOLATION_COINS,
+            transactionType: "earn",
+            source: "sponsored_consolation",
+            sourceId: raceId,
+            rewardCode: "sponsored_consolation",
+            reasonCode: "sponsored_event_completed",
+            idempotencyKey: `sponsored-consolation:${raceId}:${result.userId}`,
+            description: "Sponsored event consolation prize",
+            metadata: { raceId },
+          });
+        }
       }
     });
   } catch (err) {
     logger.error({ raceId, err }, "autoCompleteRace: race_rooms status update failed");
     throw err;
   }
+
+  // Opportunistically deliver the durable Coins Battle payout now that settlement has committed
+  // (the hourly outbox repair scan is the safety net if this misses) — audit 2026-08-17 M2.
+  if (coinsBattleOutboxRow) void enqueueOutboxEvent(coinsBattleOutboxRow);
 
   if (!markedCompleted) {
     logger.warn(
@@ -1737,6 +1869,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
     );
     return;
   }
+  void invalidateLeaderboardSnapshots("race", "coin").catch(() => {});
 
   // ── Step 2: Insert result rows (best-effort — race is already closed above) ──
   // Failures here are logged but do not un-complete the race.
@@ -1887,6 +2020,46 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
       isWinner: r.eligibleForPrize && r.prizeCents > 0,
     };
   });
+
+  if (isSponsored) {
+    // Settlement is already committed above. Restore the product-facing completion events here,
+    // outside the transaction: notification-provider failures must never roll back durable awards.
+    void triggerEvent("public-presence", "race:finished", { room_id: raceId }).catch(() => {});
+    void triggerEvent("public-sponsored-events", "sponsored_event.completed", {
+      room_id: raceId,
+      invalidate: ["walk_bootstrap", "sponsored_events"],
+    }).catch(() => {});
+
+    const prizeDisplay = `$${(SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS / 100).toFixed(0)}`;
+    for (const result of resultRows) {
+      const isWinner = result.eligibleForPrize && result.prizeCents > 0;
+      const isDisqualified = result.status === "disqualified_simulation";
+      if (isWinner) {
+        void sendPushToUser(
+          result.userId,
+          "🏆 You won a gift card!",
+          `Congratulations! You finished ${room.title} and won a ${prizeDisplay} Amazon gift card. We'll email you shortly.`,
+          { type: "sponsored_event_winner", room_id: raceId },
+        ).catch((err) => logger.warn({ raceId, userId: result.userId, err }, "sponsored winner push failed"));
+        void triggerEvent(`private-user-${result.userId}`, "sponsored:won", {
+          room_id: raceId,
+          title: room.title,
+          prize: prizeDisplay,
+        }).catch(() => {});
+      } else if (!isDisqualified) {
+        void sendPushToUser(
+          result.userId,
+          "Sponsored Race Ended",
+          `${room.title} has ended. You earned ${SPONSORED_EVENT_CONSOLATION_COINS} coins for participating! Keep walking! 🚶`,
+          {
+            type: "sponsored_event_consolation",
+            room_id: raceId,
+            coins: SPONSORED_EVENT_CONSOLATION_COINS,
+          },
+        ).catch((err) => logger.warn({ raceId, userId: result.userId, err }, "sponsored consolation push failed"));
+      }
+    }
+  }
 
   logger.info({ raceId, resultCount: resultsPayload.length }, "[RaceFinalize] pusher_broadcast: race:completed + race:winners");
 
@@ -3932,6 +4105,10 @@ export async function activateRoomAndStart(
       }
       const provider = resolvePaymentProvider(hostProfile?.countryCode);
 
+      // Participants who cannot pay the entry are disqualified and excluded, NOT thrown on
+      // (audit 2026-08-17 H3): a single broke/deleted registrant must never cancel the whole
+      // scheduled room for everyone else. A real DB error still throws and reverts the claim.
+      const cashDisqualifiedUserIds: string[] = [];
       try {
         await db.transaction(async (tx) => {
           for (const p of participants) {
@@ -3945,18 +4122,45 @@ export async function activateRoomAndStart(
               description: `Entry fee for race: ${room.title}`,
             });
             if (!result.ok) {
-              throw new Error(result.error);
+              await tx
+                .update(raceParticipantsTable)
+                .set({ status: "disqualified" })
+                .where(and(eq(raceParticipantsTable.raceRoomId, raceId), eq(raceParticipantsTable.userId, p.userId)));
+              cashDisqualifiedUserIds.push(p.userId);
+              continue;
             }
             await grantReferralBonusForCashChallenge(tx, {
               referredUserId: p.userId,
               raceRoomId: raceId,
             });
           }
+          if (cashDisqualifiedUserIds.length > 0) {
+            await tx
+              .update(raceRoomsTable)
+              .set({
+                currentPlayers: sql`greatest(${raceRoomsTable.currentPlayers} - ${cashDisqualifiedUserIds.length}, 0)`,
+                updatedAt: new Date(),
+              })
+              .where(eq(raceRoomsTable.id, raceId));
+          }
         });
       } catch (err) {
         logger.error({ raceId, err }, "activateRoomAndStart: cash entry charge failed — reverting claim");
         await revertClaim();
         return { ok: false, httpStatus: 402, body: { error: "Entry fee could not be charged.", code: "entry_charge_failed" } };
+      }
+
+      for (const uid of cashDisqualifiedUserIds) {
+        void triggerEvent(`private-user-${uid}`, "race:disqualified", {
+          raceId,
+          reason: "insufficient_balance",
+        }).catch(() => {});
+      }
+      if (cashDisqualifiedUserIds.length > 0) {
+        logger.info(
+          { raceId, disqualifiedCount: cashDisqualifiedUserIds.length },
+          "[CashChallenge] participants disqualified for insufficient balance at start",
+        );
       }
 
       logger.info(
@@ -7800,6 +8004,32 @@ router.post("/races/:id/spectate", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const raceId = String(req.params.id);
   const count = registerSpectator(raceId, userId);
+
+  // Persist a durable spectate session for non-participants (audit 2026-08-17 H1). The LiveKit
+  // listen-token gate (entitlements.ts) and the Pusher race-channel auth both require a
+  // spectate_sessions row; the app only calls this heartbeat, never POST /spectate/start, so
+  // without this every spectator was 403'd from voice. Insert once per session (idempotent by a
+  // pre-check, since spectate_sessions has no unique constraint) and only for non-participants —
+  // participants are authorized through the participant branch, not a spectate row.
+  try {
+    if (!(await isRaceParticipant(userId, raceId))) {
+      const [existing] = await db
+        .select({ id: spectateSessionsTable.id })
+        .from(spectateSessionsTable)
+        .where(and(
+          eq(spectateSessionsTable.userId, userId),
+          eq(spectateSessionsTable.raceRoomId, raceId),
+          isNull(spectateSessionsTable.completedAt),
+        ))
+        .limit(1);
+      if (!existing) {
+        await db.insert(spectateSessionsTable).values({ userId, raceRoomId: raceId });
+      }
+    }
+  } catch (err) {
+    req.log.warn({ err, userId, raceId }, "spectate session persist failed (voice may be unavailable)");
+  }
+
   void triggerEvent(`public-live-race-${raceId}`, "race:spectator_count", { count });
   return res.json({ count });
 });

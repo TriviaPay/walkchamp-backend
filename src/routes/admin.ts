@@ -10,14 +10,18 @@ import {
   notificationsTable,
   operationalLocksTable,
   sponsoredGiftCardAwardsTable,
+  authSessionsTable,
+  scheduledRoomRegistrationsTable,
 } from "../../db/src/schema/index.js";
-import { eq, and, desc, ilike, or, sql, inArray } from "drizzle-orm";
+import { eq, and, desc, ilike, or, sql, inArray, gt } from "drizzle-orm";
 import { logger } from "../lib/logger.js";
 import { z } from "zod";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { requireAdminRole } from "../middleware/requireAdminRole.js";
 import { requireCashFeaturesEnabled } from "../middleware/requireCashFeaturesEnabled.js";
 import { writeAuditLog } from "../lib/auditLog.js";
+import { cacheAccountStatus, revokeSession } from "../lib/sessionService.js";
+import { getDescopeClient } from "../lib/descope.js";
 import {
   approveRefund,
   getRefund,
@@ -27,10 +31,108 @@ import {
 } from "../lib/refundService.js";
 import { assertOperationalLockOpen, setOperationalLock, WALLET_LEDGER_ANOMALY_LOCK } from "../lib/operationalLocks.js";
 import { sendPushToUser } from "./push.js";
+import { resolveUnlimitedDayVerification } from "../lib/unlimitedChallengeJobs.js";
+import {
+  beginWalkRedisRehydration,
+  completeWalkRedisRehydration,
+  getWalkDirtyHealth,
+  seedWalkDayFromPostgres,
+  switchWalkAuthorityToPostgres,
+  syncWalkIngestControlFromPostgres,
+} from "../lib/walkRedisIngest.js";
 
 const router = Router();
 
 router.use("/admin", requireAuth, requireAdminRole);
+
+const walkAuthorityReasonSchema = z.object({ reason: z.string().trim().min(3).max(500) });
+const walkSeedSchema = z.object({
+  epoch: z.number().int().positive(),
+  days: z.array(z.object({ userId: z.string().min(1), localDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/) })).max(10_000),
+});
+
+router.get("/admin/walk-ingest/control", async (_req, res) => {
+  const [control, dirty] = await Promise.all([syncWalkIngestControlFromPostgres(), getWalkDirtyHealth()]);
+  return res.json({ control, dirty });
+});
+
+router.post("/admin/walk-ingest/postgres", async (req, res) => {
+  const parsed = walkAuthorityReasonSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "A reason is required." });
+  const epoch = await switchWalkAuthorityToPostgres(parsed.data.reason);
+  return res.json({ ok: true, mode: "postgres", epoch });
+});
+
+router.post("/admin/walk-ingest/rehydration/begin", async (req, res) => {
+  const parsed = walkAuthorityReasonSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "A reason is required." });
+  const epoch = await beginWalkRedisRehydration(parsed.data.reason);
+  return res.json({ ok: true, mode: "rehydrating", epoch });
+});
+
+router.post("/admin/walk-ingest/rehydration/seed", async (req, res) => {
+  const parsed = walkSeedSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid rehydration seed." });
+  for (const day of parsed.data.days) await seedWalkDayFromPostgres(parsed.data.epoch, day.userId, day.localDate);
+  return res.json({ ok: true, seeded: parsed.data.days.length, epoch: parsed.data.epoch });
+});
+
+router.post("/admin/walk-ingest/rehydration/complete", async (req, res) => {
+  const parsed = walkSeedSchema.extend({ shadow: z.boolean(), reason: z.string().trim().min(3).max(500) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid rehydration completion." });
+  await completeWalkRedisRehydration(parsed.data.epoch, parsed.data.shadow, parsed.data.reason, parsed.data.days);
+  return res.json({ ok: true, mode: parsed.data.shadow ? "redis_shadow" : "redis", epoch: parsed.data.epoch });
+});
+
+const unlimitedDayVerificationSchema = z.discriminatedUnion("decision", [
+  z.object({
+    decision: z.literal("approve"),
+    authoritativeSteps: z.number().int().min(0).max(200_000),
+    reason: z.string().trim().min(3).max(500),
+  }),
+  z.object({
+    decision: z.literal("reject"),
+    reason: z.string().trim().min(3).max(500),
+  }),
+]);
+
+// Production-funded Unlimited days stay pending until this authenticated ops boundary supplies
+// the authoritative total. The regular mobile step endpoint can never call this path.
+router.post("/admin/unlimited-challenges/:challengeId/days/:dayId/verification-resolve", async (req, res) => {
+  const parsed = unlimitedDayVerificationSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Invalid verification decision", details: parsed.error.issues });
+  }
+
+  const result = await resolveUnlimitedDayVerification({
+    challengeId: String(req.params.challengeId),
+    dayId: String(req.params.dayId),
+    decision: parsed.data.decision,
+    authoritativeSteps: parsed.data.decision === "approve" ? parsed.data.authoritativeSteps : undefined,
+  });
+  if (!result.found) return res.status(404).json({ error: "Unlimited challenge day not found" });
+  if (!result.resolved && result.status !== "passed" && result.status !== "failed") {
+    return res.status(409).json({ error: "Day is not pending verification", status: result.status });
+  }
+
+  await writeAuditLog({
+    actorUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
+    actorType: "admin",
+    action: "unlimited_day.verification_resolved",
+    entityType: "unlimited_challenge_day",
+    entityId: String(req.params.dayId),
+    reason: parsed.data.reason,
+    metadata: {
+      challengeId: String(req.params.challengeId),
+      decision: parsed.data.decision,
+      authoritativeSteps: result.authoritativeSteps ?? null,
+      status: result.status ?? null,
+      alreadyResolved: !result.resolved,
+    },
+  });
+
+  return res.json({ ok: true, ...result });
+});
 
 function redactGiftCardAward<T extends { fulfillmentCode?: string | null }>(award: T): Omit<T, "fulfillmentCode"> & { hasFulfillmentCode: boolean } {
   const { fulfillmentCode, ...safeAward } = award;
@@ -447,6 +549,59 @@ router.get("/admin/users/:id", async (req, res) => {
   return res.json({ profile, wallet: wallet ?? null, recentTransactions: recentTxs });
 });
 
+// Side effects of restricting an account (ban/suspend) — audit 2026-08-17 H4. A status flip alone
+// left the user racing on live sessions and eligible to win real money. Revoke every session so no
+// device outlives the restriction, and (for a ban) disqualify their live/pending race entries so
+// settlement never pays a banned account. requireActiveAccount additionally blocks step submission.
+async function enforceAccountRestriction(
+  userId: string,
+  restrictionReason: string,
+  opts: { disqualifyRaces: boolean },
+): Promise<void> {
+  await cacheAccountStatus(userId, opts.disqualifyRaces ? "banned" : "suspended");
+  const activeSessions = await db
+    .select({ sessionId: authSessionsTable.sessionId })
+    .from(authSessionsTable)
+    .where(and(eq(authSessionsTable.userId, userId), eq(authSessionsTable.status, "active")));
+  for (const s of activeSessions) {
+    await revokeSession(s.sessionId, userId, restrictionReason).catch((err) =>
+      logger.warn({ err, userId }, "revokeSession during account restriction failed"),
+    );
+  }
+  try {
+    await getDescopeClient().management.user.logoutUserByUserId(userId);
+  } catch (err) {
+    logger.warn({ err, userId }, "descope logout during account restriction failed");
+  }
+
+  if (opts.disqualifyRaces) {
+    // Disqualify (forfeit) live/pending participations so the banned user is excluded from
+    // winner selection — settlement already skips "disqualified". Entry stays in the pool.
+    await db
+      .update(raceParticipantsTable)
+      .set({ status: "disqualified" })
+      .where(and(
+        eq(raceParticipantsTable.userId, userId),
+        inArray(raceParticipantsTable.status, ["joined", "active"]),
+        inArray(
+          raceParticipantsTable.raceRoomId,
+          db
+            .select({ id: raceRoomsTable.id })
+            .from(raceRoomsTable)
+            .where(inArray(raceRoomsTable.status, ["open", "full", "starting", "in_progress"])),
+        ),
+      ));
+    // Drop pending scheduled registrations so a banned user is not materialized at start.
+    await db
+      .update(scheduledRoomRegistrationsTable)
+      .set({ status: "cancelled" })
+      .where(and(
+        eq(scheduledRoomRegistrationsTable.userId, userId),
+        inArray(scheduledRoomRegistrationsTable.status, ["registered", "activated"]),
+      ));
+  }
+}
+
 // ── POST /api/admin/users/:id/ban ─────────────────────────────────────────────
 const banSchema = z.object({ reason: z.string().min(3).max(500) });
 
@@ -459,6 +614,8 @@ router.post("/admin/users/:id/ban", async (req, res) => {
     .update(profilesTable)
     .set({ accountStatus: "banned" })
     .where(eq(profilesTable.id, userId));
+
+  await enforceAccountRestriction(userId, "account_banned", { disqualifyRaces: true });
 
   logger.info({ userId, reason: parsed.data.reason }, "Admin: user banned");
   void writeAuditLog({
@@ -488,6 +645,10 @@ router.post("/admin/users/:id/suspend", async (req, res) => {
     .set({ accountStatus: "suspended" })
     .where(eq(profilesTable.id, userId));
 
+  // Suspension is temporary — revoke sessions so the user cannot act while suspended, but keep
+  // their race entries (requireActiveAccount blocks step submission, so they cannot progress).
+  await enforceAccountRestriction(userId, "account_suspended", { disqualifyRaces: false });
+
   logger.info({ userId, reason: parsed.data.reason, durationHours: parsed.data.durationHours }, "Admin: user suspended");
   void writeAuditLog({
     actorUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
@@ -508,6 +669,7 @@ router.post("/admin/users/:id/reinstate", async (req, res) => {
     .update(profilesTable)
     .set({ accountStatus: "active" })
     .where(eq(profilesTable.id, userId));
+  await cacheAccountStatus(userId, "active");
   logger.info({ userId }, "Admin: user reinstated");
   void writeAuditLog({
     actorUserId: (req as unknown as AuthenticatedRequest).descopeUserId ?? null,
@@ -699,8 +861,6 @@ router.post("/admin/withdrawals/:id/reject", requireCashFeaturesEnabled, async (
 
     const beforeAvailable = wallet.availableBalanceCents;
     const afterAvailable = beforeAvailable + row.amountCents;
-    const beforeWithdrawable = wallet.withdrawableBalanceCents;
-    const afterWithdrawable = beforeWithdrawable + row.amountCents;
 
     await tx
       .update(withdrawalsTable)
@@ -718,7 +878,8 @@ router.post("/admin/withdrawals/:id/reject", requireCashFeaturesEnabled, async (
       .update(walletsTable)
       .set({
         availableBalanceCents: afterAvailable,
-        withdrawableBalanceCents: afterWithdrawable,
+        // Mirror withdrawable to available (any cleared balance is withdrawable).
+        withdrawableBalanceCents: afterAvailable,
         updatedAt: new Date(),
       })
       .where(eq(walletsTable.id, wallet.id));
@@ -753,8 +914,6 @@ router.post("/admin/withdrawals/:id/reject", requireCashFeaturesEnabled, async (
         balanceAfterCents: afterAvailable,
         metadata: {
           reason: parsed.data.reason,
-          withdrawableBeforeCents: beforeWithdrawable,
-          withdrawableAfterCents: afterWithdrawable,
         },
       })
       .onConflictDoNothing();

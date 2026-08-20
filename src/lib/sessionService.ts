@@ -59,6 +59,49 @@ export type SessionStatusResult =
   | { active: true; session: AuthSession }
   | { active: false; code: SessionErrorCode };
 
+const ACCOUNT_GATE_PREFIX = "account:gate:";
+const ACTIVE_ACCOUNT_GATE_TTL_S = 60;
+const RESTRICTED_ACCOUNT_GATE_TTL_S = 300;
+
+/** Cache a known account status after an admin/deletion/refund transition. */
+export async function cacheAccountStatus(userId: string, status: string): Promise<void> {
+  try {
+    await ensureRedisCacheConnected();
+    await getRedisCache().set(
+      ACCOUNT_GATE_PREFIX + userId,
+      status,
+      "EX",
+      status === "active" ? ACTIVE_ACCOUNT_GATE_TTL_S : RESTRICTED_ACCOUNT_GATE_TTL_S,
+    );
+  } catch (err) {
+    logger.warn({ err, userId }, "[AccountGate] cache write failed");
+  }
+}
+
+/**
+ * Account-status gate shared by every requireAuth route. Redis keeps the hot path off Postgres;
+ * cache miss/error falls back to the authoritative profile row. Null preserves existing profile-
+ * bootstrap behavior for JWT owners who have not created a profile yet.
+ */
+export async function getAccountStatusForAuthGate(userId: string): Promise<string | null> {
+  try {
+    await ensureRedisCacheConnected();
+    const cached = await getRedisCache().get(ACCOUNT_GATE_PREFIX + userId);
+    if (cached) return cached;
+  } catch (err) {
+    logger.warn({ err, userId }, "[AccountGate] cache read failed — using DB");
+  }
+
+  const [profile] = await db
+    .select({ accountStatus: profilesTable.accountStatus })
+    .from(profilesTable)
+    .where(eq(profilesTable.id, userId))
+    .limit(1);
+  if (!profile) return null;
+  void cacheAccountStatus(userId, profile.accountStatus);
+  return profile.accountStatus;
+}
+
 /** High-entropy, non-sequential internal session id echoed back by the client. */
 export function generateSessionId(): string {
   return randomBytes(32).toString("base64url");

@@ -16,8 +16,21 @@ import { z } from "zod";
 import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
 import { isFeatureEnabled } from "../lib/featureFlags.js";
 import { isOnlineNow, walkingAfter } from "../lib/presence.js";
+import { config } from "../lib/config.js";
+import {
+  redisFriendPresenceSnapshot,
+  redisPresenceCounts,
+  redisPresenceHeartbeat,
+  redisPresenceOffline,
+  redisPresenceSnapshotForIds,
+  type PresenceStatus,
+} from "../lib/redisPresence.js";
 
 const router = Router();
+// Keep the route compatible with narrow config mocks used by endpoint tests and
+// maintenance scripts. Production config always provides `features`.
+const redisPresenceMirrorWrite = config.features?.redisPresenceMirrorWrite === true;
+const redisPresenceServe = config.features?.redisPresenceServe === true;
 
 // Racing = participant in an in_progress race (computed from race tables, not flags)
 // A scheduled registration counts as room membership while it is live; "active" is the state a
@@ -57,7 +70,7 @@ async function computeCounts() {
     .where(eq(raceRoomsTable.status, "in_progress"));
   const activeRaces = activeRacesRows[0]?.count ?? 0;
 
-  return { online, walking, racing, activeRaces };
+  return { online, walking, racing, spectating: 0, activeRaces };
 }
 
 // ── GET /api/presence/online-ids ──────────────────────────────────────────────
@@ -80,6 +93,10 @@ router.get("/presence/online-ids", requireAuth, async (_req, res) => {
 
 router.get("/presence/friends/online", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
+  if (redisPresenceServe) {
+    const snapshot = await redisFriendPresenceSnapshot(userId);
+    return res.json({ ...snapshot, userIds: snapshot.users.map((user) => user.userId) });
+  }
   const friends = await db
     .select({ userId: friendsTable.friendId })
     .from(friendsTable)
@@ -125,6 +142,11 @@ router.get("/presence/groups/:groupId/online", requireAuth, async (req, res) => 
       eq(walkingGroupMembersTable.groupId, groupId),
       eq(walkingGroupMembersTable.status, "active"),
     ));
+
+  if (redisPresenceServe) {
+    const snapshot = await redisPresenceSnapshotForIds(memberRows.map((row) => row.userId));
+    return res.json({ ...snapshot, userIds: snapshot.users.map((user) => user.userId) });
+  }
 
   const rows = memberRows.length === 0
     ? []
@@ -197,6 +219,11 @@ router.get("/presence/races/:raceId/online", requireAuth, async (req, res) => {
     ...registrants.map((row) => row.userId),
   ])];
 
+  if (redisPresenceServe) {
+    const snapshot = await redisPresenceSnapshotForIds(memberIds);
+    return res.json({ ...snapshot, userIds: snapshot.users.map((user) => user.userId) });
+  }
+
   const rows = memberIds.length === 0
     ? []
     : await db
@@ -212,9 +239,11 @@ router.get("/presence/races/:raceId/online", requireAuth, async (req, res) => {
 
 // ── GET /api/presence/summary ─────────────────────────────────────────────────
 router.get("/presence/summary", requireAuth, async (_req, res) => {
-  const { online, walking, racing } = await computeCounts();
+  const { online, walking, racing, spectating = 0 } = redisPresenceServe
+    ? await redisPresenceCounts()
+    : await computeCounts();
   return res.json({
-    counts: { online, walking, racing, spectating: 0 },
+    counts: { online, walking, racing, spectating },
   });
 });
 
@@ -236,12 +265,19 @@ const heartbeatSchema = z.object({
 });
 
 router.post("/presence/heartbeat", requireAuth, requireActiveAccount, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.descopeUserId;
   const parsed = heartbeatSchema.safeParse(req.body);
   const status = parsed.success ? parsed.data.status : "online";
   const now = new Date();
 
-  await db
+  let redisState: Awaited<ReturnType<typeof redisPresenceHeartbeat>> | null = null;
+  if (redisPresenceMirrorWrite) {
+    const deviceId = authReq.deviceInfo?.deviceId || authReq.sessionId || authReq.descopeSessionId || "legacy";
+    redisState = await redisPresenceHeartbeat(userId, deviceId, status as PresenceStatus);
+  }
+
+  if (!redisPresenceServe) await db
     .insert(userPresenceTable)
     .values({ userId, status, lastSeenAt: now })
     .onConflictDoUpdate({
@@ -250,25 +286,32 @@ router.post("/presence/heartbeat", requireAuth, requireActiveAccount, async (req
     });
 
   // Broadcast updated summary (fire and forget)
-  computeCounts()
-    .then(({ online, walking, racing }) => {
-      const counts = { online, walking, racing, spectating: 0 };
-      return triggerEvent("public-presence", "presence:summary_updated", { counts });
-    })
-    .catch(() => {});
+  if (!redisPresenceServe || redisState?.changed) {
+    (redisPresenceServe ? redisPresenceCounts() : computeCounts())
+      .then(({ online, walking, racing, spectating = 0 }) => {
+        const counts = { online, walking, racing, spectating };
+        return triggerEvent("public-presence", "presence:summary_updated", { counts });
+      })
+      .catch(() => {});
+  }
 
-  return res.json({ ok: true, status });
+  return res.json({ ok: true, status: redisState?.status ?? status, revision: redisState?.revision ?? 0 });
 });
 
 // ── POST /api/presence/offline ────────────────────────────────────────────────
 router.post("/presence/offline", requireAuth, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
-  await db
+  const authReq = req as AuthenticatedRequest;
+  const userId = authReq.descopeUserId;
+  if (redisPresenceMirrorWrite) {
+    const deviceId = authReq.deviceInfo?.deviceId || authReq.sessionId || authReq.descopeSessionId || "legacy";
+    await redisPresenceOffline(userId, deviceId);
+  }
+  if (!redisPresenceServe) await db
     .update(userPresenceTable)
     .set({ status: "offline" })
     .where(eq(userPresenceTable.userId, userId));
 
-  computeCounts()
+  (redisPresenceServe ? redisPresenceCounts() : computeCounts())
     .then(({ online, walking, racing }) => {
       const counts = { online, walking, racing, spectating: 0 };
       return triggerEvent("public-presence", "presence:summary_updated", { counts });

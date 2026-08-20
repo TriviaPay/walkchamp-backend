@@ -32,11 +32,12 @@ describe("IAP credentials reach the deployed container", () => {
     expect(missing).toEqual([]);
   });
 
-  it("keeps the store-side test flags on, since that is how QA and App Review buy", () => {
-    // Sandbox receipts (TestFlight, App Review) and Play license-tester purchases are the
-    // supported way to exercise Mic Pass on a production-mode server.
-    expect(compose).toContain("APPLE_IAP_ALLOW_SANDBOX: ${APPLE_IAP_ALLOW_SANDBOX:-true}");
-    expect(compose).toContain("GOOGLE_PLAY_ALLOW_TEST_PURCHASES: ${GOOGLE_PLAY_ALLOW_TEST_PURCHASES:-true}");
+  it("keeps the store-side test flags off by default in production (F-02)", () => {
+    // Sandbox receipt verification is lenient and coins convert to cash-equivalent value, so
+    // accepting sandbox/test purchases in production is a coin mint. App Review and TestFlight
+    // do buy in sandbox — the operator sets these true in the Coolify UI for the review window.
+    expect(compose).toContain("APPLE_IAP_ALLOW_SANDBOX: ${APPLE_IAP_ALLOW_SANDBOX:-false}");
+    expect(compose).toContain("GOOGLE_PLAY_ALLOW_TEST_PURCHASES: ${GOOGLE_PLAY_ALLOW_TEST_PURCHASES:-false}");
   });
 
   it("does not let a missing credential fail the deploy", () => {

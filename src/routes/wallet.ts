@@ -71,7 +71,9 @@ function walletToDollars(wallet: typeof walletsTable.$inferSelect) {
     availableBalanceMinor: wallet.availableBalanceCents,
     pendingBalance: wallet.pendingBalanceCents / 100,
     heldBalanceMinor: wallet.pendingBalanceCents,
-    withdrawableBalance: wallet.withdrawableBalanceCents / 100,
+    // Any cleared available balance is withdrawable; derive from available so the value is
+    // correct even for wallets predating the withdrawable-column deprecation.
+    withdrawableBalance: wallet.availableBalanceCents / 100,
     totalEarned: wallet.totalEarnedCents / 100,
     totalBalanceMinor: wallet.availableBalanceCents + wallet.pendingBalanceCents,
     totalEarnedMinor: wallet.totalEarnedCents,
@@ -326,11 +328,15 @@ router.post("/wallet/withdraw", requireAuth, async (req, res) => {
           .returning();
       }
 
-      if (amountCents > wallet.withdrawableBalanceCents || amountCents > wallet.availableBalanceCents) {
+      // Policy: any cleared available balance is withdrawable (deposits, prizes, refunds all
+      // land in availableBalanceCents). The legacy withdrawableBalanceCents column was never
+      // credited, so it is no longer the gate — availableBalanceCents is the source of truth
+      // and withdrawableBalanceCents is kept mirrored to it below for direct readers.
+      if (amountCents > wallet.availableBalanceCents) {
         throw new WithdrawalRequestError(
           400,
           "INSUFFICIENT_WITHDRAWABLE_BALANCE",
-          `Insufficient withdrawable balance. Available: $${(wallet.withdrawableBalanceCents / 100).toFixed(2)}`,
+          `Insufficient balance. Available: $${(wallet.availableBalanceCents / 100).toFixed(2)}`,
         );
       }
 
@@ -361,20 +367,18 @@ router.post("/wallet/withdraw", requireAuth, async (req, res) => {
 
       const beforeAvailable = wallet.availableBalanceCents;
       const afterAvailable = beforeAvailable - amountCents;
-      const beforeWithdrawable = wallet.withdrawableBalanceCents;
-      const afterWithdrawable = beforeWithdrawable - amountCents;
 
       const updatedWallet = await tx
         .update(walletsTable)
         .set({
           availableBalanceCents: sql`${walletsTable.availableBalanceCents} - ${amountCents}`,
-          withdrawableBalanceCents: sql`${walletsTable.withdrawableBalanceCents} - ${amountCents}`,
+          // Keep withdrawable mirrored to available so direct readers stay consistent.
+          withdrawableBalanceCents: sql`GREATEST(0, ${walletsTable.availableBalanceCents} - ${amountCents})`,
           updatedAt: new Date(),
         })
         .where(and(
           eq(walletsTable.id, wallet.id),
           sql`${walletsTable.availableBalanceCents} >= ${amountCents}`,
-          sql`${walletsTable.withdrawableBalanceCents} >= ${amountCents}`,
         ))
         .returning({ id: walletsTable.id });
 
@@ -400,8 +404,6 @@ router.post("/wallet/withdraw", requireAuth, async (req, res) => {
         balanceAfterCents: afterAvailable,
         metadata: {
           withdrawalIdempotencyKey,
-          withdrawableBeforeCents: beforeWithdrawable,
-          withdrawableAfterCents: afterWithdrawable,
         },
       });
 

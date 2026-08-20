@@ -6,6 +6,7 @@ import {
   userPurchasesTable,
   raceRoomsTable,
   raceParticipantsTable,
+  spectateSessionsTable,
   voiceSessionsTable,
   coinBalancesTable,
   coinTransactionsTable,
@@ -660,7 +661,9 @@ router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
     return res.status(403).json({ success: false, code: "RACE_NOT_LIVE", message: "Race is not currently live." });
   }
 
-  // 2. Check whether the user is an active participant.
+  // 2. Check whether the user has a participant row. Only joined/active users may publish, but a
+  // participant who already finished or was disqualified while the room is still live may keep
+  // listening; they must not be forced through the spectator-session branch.
   const [participant] = await db
     .select({ status: raceParticipantsTable.status })
     .from(raceParticipantsTable)
@@ -668,15 +671,15 @@ router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
       and(
         eq(raceParticipantsTable.raceRoomId, raceId),
         eq(raceParticipantsTable.userId, userId),
-        inArray(raceParticipantsTable.status, ["joined", "active"]),
       ),
     )
     .limit(1);
+  const isActiveParticipant = !!participant && ["joined", "active"].includes(participant.status);
 
   // 3. Publishing rights — active participants with Mic Pass may speak.
   // Spectators can still join the room, but only as listen-only.
   let canPublishAudio = false;
-  if (participant) {
+  if (isActiveParticipant) {
     const [micPassRow] = await db
       .select({ id: userEntitlementsTable.id })
       .from(userEntitlementsTable)
@@ -691,8 +694,30 @@ router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
 
     canPublishAudio = !!micPassRow;
     req.log.info({ userId, raceId, canPublishAudio }, "[MicPass] has_mic_pass: %s", canPublishAudio);
-  } else {
+  } else if (!participant) {
+    // Listen-only is spectator-scoped (audit 2026-08-17 F-13): the same bar as the Pusher
+    // race-channel auth — a non-participant must hold a spectate session for THIS race, not
+    // merely be logged in with a guessed raceId.
+    const [spectatorSession] = await db
+      .select({ id: spectateSessionsTable.id })
+      .from(spectateSessionsTable)
+      .where(
+        and(
+          eq(spectateSessionsTable.raceRoomId, raceId),
+          eq(spectateSessionsTable.userId, userId),
+        ),
+      )
+      .limit(1);
+    if (!spectatorSession) {
+      return res.status(403).json({
+        success: false,
+        code: "VOICE_NOT_AUTHORIZED",
+        message: "Join the race or spectate it before requesting voice access.",
+      });
+    }
     req.log.info({ userId, raceId }, "[Voice] spectator listen-only token issued");
+  } else {
+    req.log.info({ userId, raceId, participantStatus: participant.status }, "[Voice] inactive participant listen-only token issued");
   }
 
   // 4. Generate a short-lived LiveKit token scoped to this race's room.

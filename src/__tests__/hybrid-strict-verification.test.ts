@@ -8,9 +8,26 @@ import { readFileSync } from "node:fs";
 const read = (p: string) => readFileSync(p, "utf8");
 
 describe("strict verification is scoped to participant-funded (real-money) races", () => {
-  it("gates strict on the hybrid flag AND a real-money entry amount", () => {
+  it("forces strict for ANY funded race — no env flag can turn it off (F-12)", () => {
     const races = read("src/routes/races.ts");
-    expect(races).toContain("config.hybridReconciliation.strictEnabled && room.entryAmountCents > 0");
+    expect(races).toContain("const strictRace = useHybrid && room.entryAmountCents > 0");
+    // The old gate let strictEnabled (default false) disarm the hold on a default prod env.
+    expect(races).not.toContain("strictEnabled && room.entryAmountCents");
+  });
+
+  it("refuses to boot a production cash deployment without the reconciliation pass (F-12)", () => {
+    const cfg = read("src/lib/config.ts");
+    expect(cfg).toContain(
+      "ENABLE_HYBRID_RECONCILIATION=true is required when cash features are enabled in production",
+    );
+  });
+
+  it("forwards the hybrid flags to the deployed container, defaulted ON (F-12)", () => {
+    const compose = read("docker-compose.coolify.yml");
+    expect(compose).toContain("ENABLE_HYBRID_RECONCILIATION: ${ENABLE_HYBRID_RECONCILIATION:-true}");
+    expect(compose).toContain(
+      "HYBRID_REQUIRE_VERIFICATION_FOR_PAYOUT: ${HYBRID_REQUIRE_VERIFICATION_FOR_PAYOUT:-true}",
+    );
   });
 });
 

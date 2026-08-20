@@ -209,6 +209,18 @@ describe.skipIf(!HAS_REDIS)("raceLiveState (integration, real redis)", () => {
     expect(await live.drainDirtyParticipants(RACE)).toEqual([]); // drained
   });
 
+  it("requeues an expired dirty lease and preserves an update that arrives in flight", async () => {
+    await live.hydrateRace(RACE, cfg({ targetSteps: 1_000_000 }), [seed("a")]);
+    await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 100, clientSeq: 1, deviceTotal: null, nowMs: LATE });
+    expect(await live.claimDirtyParticipants(RACE, { nowMs: T0, leaseMs: 1_000 })).toEqual(["a"]);
+    expect(await live.claimDirtyParticipants(RACE, { nowMs: T0 + 500, leaseMs: 1_000 })).toEqual([]);
+    expect(await live.claimDirtyParticipants(RACE, { nowMs: T0 + 1_001, leaseMs: 1_000 })).toEqual(["a"]);
+
+    await live.applyProgress({ raceId: RACE, userId: "a", requestedSteps: 200, clientSeq: 2, deviceTotal: null, nowMs: LATE });
+    await live.acknowledgeDirtyParticipants(RACE, ["a"]);
+    expect(await live.claimDirtyParticipants(RACE, { nowMs: T0 + 1_002, leaseMs: 1_000 })).toEqual(["a"]);
+  });
+
   it("coalesces broadcasts via a cross-process lease", async () => {
     await live.hydrateRace(RACE, cfg(), [seed("a")]);
     expect(await live.tryAcquireBroadcastLease(RACE, 1000)).toBe(true);

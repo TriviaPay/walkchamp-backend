@@ -26,6 +26,7 @@ import coinsBattleRouter from "./coinsBattle.js";
 import unlimitedChallengeRouter from "./unlimitedChallenge.js";
 import pushRouter from "./push.js";
 import referralRouter from "./referral.js";
+import storeNotificationsRouter from "./storeNotifications.js";
 import adminRouter from "./admin.js";
 
 const router: IRouter = Router();
@@ -57,6 +58,7 @@ router.use(coinsBattleRouter);
 router.use(unlimitedChallengeRouter);
 router.use(pushRouter);
 router.use(referralRouter);
+router.use(storeNotificationsRouter);
 router.use(adminRouter);
 
 export default router;

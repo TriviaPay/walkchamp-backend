@@ -1,4 +1,4 @@
-import { and, asc, eq, lte, sql } from "drizzle-orm";
+import { and, asc, eq, lt, lte, or, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { outboxEventsTable } from "../../db/src/schema/index.js";
 import { enqueueJob, type AppQueueName } from "./queue.js";
@@ -93,6 +93,10 @@ function outboxJobId(event: OutboxRow): string {
   return `outbox-${event.id}`;
 }
 
+export function computeOutboxDelayMs(availableAt: Date, nowMs = Date.now()): number {
+  return Math.max(0, availableAt.getTime() - nowMs);
+}
+
 /**
  * Lock a pending row, enqueue it with a safe deterministic job id, and finalize its
  * status. Shared by the opportunistic post-commit path and the hourly repair scan, so a
@@ -130,6 +134,7 @@ async function deliverOutboxEvent(event: OutboxRow): Promise<boolean> {
   if (locked.length === 0) return false; // already delivered / claimed elsewhere
 
   try {
+    const delay = computeOutboxDelayMs(event.availableAt);
     await enqueueJob(event.topic as AppQueueName, event.eventType, {
       outboxEventId: event.id,
       idempotencyKey: event.idempotencyKey,
@@ -138,6 +143,7 @@ async function deliverOutboxEvent(event: OutboxRow): Promise<boolean> {
       payload: event.payload,
     }, {
       jobId: outboxJobId(event),
+      ...(delay > 0 ? { delay } : {}),
     });
 
     await db
@@ -146,12 +152,10 @@ async function deliverOutboxEvent(event: OutboxRow): Promise<boolean> {
       .where(eq(outboxEventsTable.id, event.id));
     return true;
   } catch (err) {
-    const retryAt = new Date(Date.now() + Math.min(60_000, 1_000 * 2 ** Math.min(event.attemptCount + 1, 6)));
     await db
       .update(outboxEventsTable)
       .set({
         status: "pending",
-        availableAt: retryAt,
         lockedAt: null,
         lockedBy: null,
         lastError: err instanceof Error ? err.message : String(err),
@@ -175,10 +179,28 @@ export async function enqueueOutboxEvent(event: OutboxRow): Promise<void> {
   }
 }
 
+// A row should leave "dispatching" within seconds. Anything older than this crashed between the
+// pending→dispatching compare-and-set and the finalize/reset, and the pending-only scan below
+// never reclaims it (audit 2026-08-17 H5). Re-delivering is safe: the deterministic outbox job id
+// de-dupes at the queue, so a row that actually made it through is not double-processed.
+const DISPATCHING_STALE_MS = 10 * 60_000;
+
 /** Repair scan: pick up pending rows the opportunistic path missed and deliver them. */
 export async function dispatchOutboxBatch(opts?: { batchSize?: number }): Promise<number> {
   const batchSize = opts?.batchSize ?? 100;
   const now = new Date();
+
+  // Reclaim stale "dispatching" rows back to pending so the select below re-delivers them.
+  await db
+    .update(outboxEventsTable)
+    .set({ status: "pending", lockedAt: null, lockedBy: null })
+    .where(and(
+      eq(outboxEventsTable.status, "dispatching"),
+      or(
+        lt(outboxEventsTable.lockedAt, new Date(now.getTime() - DISPATCHING_STALE_MS)),
+        sql`${outboxEventsTable.lockedAt} is null`,
+      ),
+    ));
 
   const events = await db
     .select()

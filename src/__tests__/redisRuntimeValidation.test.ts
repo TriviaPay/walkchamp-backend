@@ -77,4 +77,19 @@ describe("redis runtime validation helpers", () => {
       expect.stringContaining("85%"),
     ]));
   });
+
+  it("marks noeviction OOM write rejections and failed AOF writes as critical", () => {
+    const status = evaluateRedisRuntime(
+      "live",
+      { maxmemory: "100", "maxmemory-policy": "noeviction", appendonly: "yes", appendfsync: "everysec" },
+      { used_memory: "50", used_memory_rss: "75", mem_fragmentation_ratio: "1.5" },
+      { evicted_keys: "0" },
+      { aof_last_write_status: "err", aof_last_bgrewrite_status: "err", aof_buffer_length: "1024" },
+      { errorstat_OOM: "count=2" },
+    );
+    expect(status.ok).toBe(false);
+    expect(status.writeRejections).toBe(2);
+    expect(status.errors.join(" ")).toContain("rejected 2 writes");
+    expect(status.errors.join(" ")).toContain("AOF last write status");
+  });
 });

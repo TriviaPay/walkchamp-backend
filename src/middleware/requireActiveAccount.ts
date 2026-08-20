@@ -1,8 +1,6 @@
-import { db } from "../../db/src/index.js";
-import { profilesTable } from "../../db/src/schema/index.js";
-import { eq } from "drizzle-orm";
 import { type NextFunction, type Request, type Response } from "express";
 import { type AuthenticatedRequest } from "./requireAuth.js";
+import { getAccountStatusForAuthGate } from "../lib/sessionService.js";
 
 const BLOCKED_STATUSES = new Set(["suspended", "banned", "deleted"]);
 
@@ -17,22 +15,21 @@ export async function requireActiveAccount(
     return;
   }
 
-  const [profile] = await db
-    .select({ accountStatus: profilesTable.accountStatus })
-    .from(profilesTable)
-    .where(eq(profilesTable.id, userId))
-    .limit(1);
+  const authReq = req as AuthenticatedRequest;
+  const accountStatus = authReq.accountStatus
+    ?? await getAccountStatusForAuthGate(userId);
+  authReq.accountStatus = accountStatus;
 
-  if (!profile) {
+  if (!accountStatus) {
     res.status(404).json({ error: "Profile not found" });
     return;
   }
 
-  if (BLOCKED_STATUSES.has(profile.accountStatus)) {
+  if (BLOCKED_STATUSES.has(accountStatus)) {
     res.status(403).json({
       error: "Account is not allowed to perform this action.",
       code: "ACCOUNT_RESTRICTED",
-      status: profile.accountStatus,
+      status: accountStatus,
     });
     return;
   }

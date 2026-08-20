@@ -144,13 +144,18 @@ export function devIapPurchasesEnabled(): boolean {
   return envBoolean("ENABLE_DEV_IAP_PURCHASES", process.env.NODE_ENV !== "production");
 }
 
-/** Sandbox/TestFlight and Play license-tester purchases. On by default: App Review buys in sandbox. */
+/**
+ * Sandbox/TestFlight and Play license-tester purchases. Sandbox verification is lenient by
+ * design, and coins convert to cash-equivalent value, so production must not accept these
+ * unless an operator turns them on explicitly (e.g. time-boxed for an App Review window).
+ * Outside production they stay on so QA can buy.
+ */
 function appleSandboxAllowed(): boolean {
-  return envBoolean("APPLE_IAP_ALLOW_SANDBOX", true);
+  return envBoolean("APPLE_IAP_ALLOW_SANDBOX", process.env.NODE_ENV !== "production");
 }
 
 function googleTestPurchasesAllowed(): boolean {
-  return envBoolean("GOOGLE_PLAY_ALLOW_TEST_PURCHASES", true);
+  return envBoolean("GOOGLE_PLAY_ALLOW_TEST_PURCHASES", process.env.NODE_ENV !== "production");
 }
 
 /** Non-secret snapshot for startup logs and ops checks. */

@@ -126,14 +126,15 @@ describe("verified step totals broadcast progress_updated immediately", () => {
 
   it("credits the day BEFORE broadcasting so the event carries the fresh total", () => {
     const handler = walk.slice(walk.indexOf('router.post("/walk/steps"'), walk.indexOf('router.get("/walk/history"'));
-    expect(handler.indexOf("applyVerifiedStepsToUnlimitedDays")).toBeLessThan(
-      handler.indexOf("findActiveUnlimitedDaysForUser"),
-    );
+    const creditIndex = handler.indexOf("unlimitedCredits = await applyVerifiedStepsToUnlimitedDays");
+    const broadcastLookupIndex = handler.indexOf("findActiveUnlimitedDaysForUser", creditIndex);
+    expect(creditIndex).toBeGreaterThan(-1);
+    expect(creditIndex).toBeLessThan(broadcastLookupIndex);
     // The credit is now AWAITED before the broadcast is even scheduled — a stronger ordering
     // guarantee than the previous single fire-and-forget block, and it lets the response report
     // what was credited.
     expect(handler).toContain("unlimitedCredits = await applyVerifiedStepsToUnlimitedDays({");
-    expect(handler.indexOf("unlimitedCredits = await")).toBeLessThan(
+    expect(creditIndex).toBeLessThan(
       handler.indexOf("// Broadcast, fire-and-forget"),
     );
   });

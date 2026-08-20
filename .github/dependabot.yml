@@ -1,0 +1,8 @@
+# Keeps the SHA-pinned actions in ci.yml current (audit 2026-08-16 F-09): Dependabot bumps the
+# pinned commit and updates the version comment, so pinning never means silently falling behind.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

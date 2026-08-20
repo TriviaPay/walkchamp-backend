@@ -213,6 +213,22 @@ describe("Apple App Store verification", () => {
     expect(calls).toHaveLength(1); // sandbox host never tried
   });
 
+  it("refuses a sandbox receipt in production when APPLE_IAP_ALLOW_SANDBOX is unset (F-02)", async () => {
+    // Sandbox purchases mint real coins if accepted, so production must be opt-in, not opt-out.
+    configureApple();
+    const nodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      const calls = stubFetch(() => ({ status: 404, body: {} }));
+      const result = await verifyStorePurchase(micPassInput);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.code).toBe("IAP_RECEIPT_INVALID");
+      expect(calls).toHaveLength(1); // sandbox host never tried
+    } finally {
+      process.env.NODE_ENV = nodeEnv;
+    }
+  });
+
   it("retries in sandbox when production 401s, so a not-yet-live app still verifies", async () => {
     // Observed in production 2026-08-07: the same In-App Purchase key that sandbox accepts
     // (404 "Transaction id not found") is 401'd by the production host until the app ships.
@@ -430,7 +446,21 @@ describe("Google Play verification", () => {
     if (!result.ok) expect(result.code).toBe("IAP_RECEIPT_INVALID");
   });
 
-  it("accepts a license-tester purchase by default and marks it sandbox", async () => {
+  it("refuses a license-tester purchase in production when GOOGLE_PLAY_ALLOW_TEST_PURCHASES is unset (F-02)", async () => {
+    configureGoogle();
+    const nodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      stubFetch(googleHandler({ purchaseState: 0, purchaseType: 0, orderId: "GPA.test" }));
+      const result = await verifyStorePurchase(androidInput);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.code).toBe("IAP_RECEIPT_INVALID");
+    } finally {
+      process.env.NODE_ENV = nodeEnv;
+    }
+  });
+
+  it("accepts a license-tester purchase outside production by default and marks it sandbox", async () => {
     configureGoogle();
     stubFetch(googleHandler({ purchaseState: 0, purchaseType: 0, orderId: "GPA.test", purchaseTimeMillis: "1754500000000" }));
 

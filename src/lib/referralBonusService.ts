@@ -1,4 +1,4 @@
-import { and, eq, ne, or, sql } from "drizzle-orm";
+import { and, eq, gte, ne, or, sql } from "drizzle-orm";
 import {
   auditLogsTable,
   profilesTable,
@@ -10,6 +10,17 @@ import { lockWalletByUserId, type DbTx } from "./raceIntegrity.js";
 
 export const REFERRAL_BONUS_CENTS = 300;
 export const REFERRAL_BONUS_CURRENCY = "usd";
+
+// Velocity cap (audit 2026-08-16 F-07): each award pays $6 of real wallet value, so an operator
+// farming N self-referred accounts must not be able to mint bonuses at scale. The cap bounds a
+// referrer's awards in a rolling 24h window; hitting it is logged as an abuse signal.
+export const REFERRAL_BONUS_VELOCITY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_REFERRAL_BONUS_MAX_PER_REFERRER_PER_DAY = 5;
+
+export function referralBonusDailyCap(): number {
+  const raw = Number.parseInt(process.env.REFERRAL_BONUS_MAX_PER_REFERRER_PER_DAY ?? "", 10);
+  return Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_REFERRAL_BONUS_MAX_PER_REFERRER_PER_DAY;
+}
 export const REFERRER_REFERRAL_BONUS_DESCRIPTION = "Invited friend joined a Cash Challenge";
 export const REFERRED_REFERRAL_BONUS_DESCRIPTION = "Joined first Cash Challenge using referral";
 
@@ -142,6 +153,37 @@ export async function grantReferralBonusForCashChallenge(
 
   if (!referrer) {
     return { credited: false, reason: "referrer_not_found" };
+  }
+
+  const velocityCap = referralBonusDailyCap();
+  const windowStart = new Date(Date.now() - REFERRAL_BONUS_VELOCITY_WINDOW_MS);
+  const [{ recentAwardCount }] = await tx
+    .select({ recentAwardCount: sql<number>`count(*)::int` })
+    .from(referralBonusAwardsTable)
+    .where(
+      and(
+        eq(referralBonusAwardsTable.referrerUserId, referrer.id),
+        gte(referralBonusAwardsTable.creditedAt, windowStart),
+      ),
+    );
+
+  if (recentAwardCount >= velocityCap) {
+    await tx.insert(auditLogsTable).values({
+      actorType: "system",
+      action: "referral_bonus_velocity_capped",
+      entityType: "profile",
+      entityId: referrer.id,
+      reason: "daily_referral_bonus_cap_reached",
+      metadata: {
+        referrerUserId: referrer.id,
+        referredUserId: input.referredUserId,
+        triggerRaceRoomId: input.raceRoomId,
+        recentAwardCount,
+        velocityCap,
+        windowHours: REFERRAL_BONUS_VELOCITY_WINDOW_MS / (60 * 60 * 1000),
+      },
+    });
+    return { credited: false, reason: "referrer_velocity_capped" };
   }
 
   const creditedAt = new Date();

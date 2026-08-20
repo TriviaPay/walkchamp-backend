@@ -9,14 +9,16 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    # Actions are pinned to full commit SHAs (audit 2026-08-16 F-09): a retagged or compromised
+    # major tag would otherwise run arbitrary code in a job that can read the deploy secrets.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
-          version: 10.15.1
+          version: 10.34.5
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
           cache: pnpm
@@ -27,23 +29,34 @@ jobs:
       - run: pnpm run build
       - run: pnpm audit --prod
 
+  # Build the runtime image in CI (audit 2026-08-17 M18) so Dockerfile/entrypoint surgery (USER
+  # switch, package removal, new COPYs) fails here on a PR instead of only at the Coolify deploy,
+  # where a broken image burns the deploy window. No push — this only proves the image builds.
+  docker-build:
+    name: Build container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Build image (no push)
+        run: docker build -t walkchamp-backend:ci .
+
   secret-scan:
     runs-on: ubuntu-latest
     steps:
       # gitleaks scans the pushed commit range, so it needs the parent commit present. The
       # default shallow checkout leaves it out and the scan dies on "unknown revision".
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
 
-      - uses: gitleaks/gitleaks-action@v3
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
 
   # Pushes to main deploy themselves once verify + secret-scan are green. Coolify always builds
   # the current head of main, so a deploy triggered here can pick up a newer commit than the one
   # that triggered it; the concurrency group keeps those from overlapping rather than racing.
   deploy:
     name: Deploy to production
-    needs: [verify, secret-scan]
+    needs: [verify, secret-scan, docker-build]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     concurrency:

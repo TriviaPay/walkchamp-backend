@@ -53,7 +53,7 @@ describe("a deferred cash race leaves the live state", () => {
   it("marks the room terminal at the grace-window deferral instead of returning live", () => {
     const fn = races.slice(races.indexOf("export async function autoCompleteRace"));
     const graceBlock = fn.slice(fn.indexOf("if (anyPendingInGrace)"), fn.indexOf("if (anyPendingInGrace)") + 600);
-    expect(graceBlock).toContain('markRoomTerminalPendingSettlement(raceId, "awaiting_verification"');
+    expect(graceBlock).toMatch(/markRoomTerminalPendingSettlement\(\s*raceId,\s*"awaiting_verification"/);
   });
 
   it("marks the room terminal at the ops review hold too", () => {
@@ -107,16 +107,22 @@ describe("the payout can still run after the race went terminal", () => {
     expect(cleanup).not.toContain("resettlePendingRaces()");
   });
 
-  it("sweeps deferred payouts from the unconditional frequent maintenance pass", () => {
-    // The sweep's query cannot be gated (a pending payout leaves no trace in the active-race
-    // registry), so it must sit on a coalesced timer rather than the 15s tick, which would
-    // keep Neon compute awake permanently.
+  it("repairs outbox delivery frequently and retains hourly full reconciliation", () => {
+    // Lifecycle writers now create delayed outbox records transactionally. The frequent pass
+    // repairs delivery from the indexed outbox instead of scanning race tables; an hourly full
+    // sweep remains as the safety net for legacy/manual rows.
     const jobs = readFileSync("src/lib/backgroundJobs.ts", "utf8");
-    const pass = jobs.slice(
+    const frequentPass = jobs.slice(
       jobs.indexOf("async function runFrequentMaintenancePass"),
       jobs.indexOf("async function runCoalescedMaintenancePass"),
     );
-    expect(pass).toContain("resettlePendingRaces()");
+    const hourlyPass = jobs.slice(
+      jobs.indexOf("async function runCoalescedMaintenancePass"),
+      jobs.indexOf("export async function startWorkerOwnedRecurringJobs"),
+    );
+    expect(frequentPass).toContain("dispatchOutboxBatch()");
+    expect(frequentPass).not.toContain("resettlePendingRaces()");
+    expect(hourlyPass).toContain("resettlePendingRaces()");
     expect(jobs).toContain("FREQUENT_MAINTENANCE_INTERVAL_MS");
   });
 

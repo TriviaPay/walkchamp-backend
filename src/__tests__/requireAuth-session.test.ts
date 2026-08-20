@@ -15,9 +15,10 @@ function setMinEnforceVersion(v: string | null) {
   (config.auth as { minSessionEnforceVersion: string | null }).minSessionEnforceVersion = v;
 }
 
-const { mockValidateSession, mockGetSessionById } = vi.hoisted(() => ({
+const { mockValidateSession, mockGetSessionById, mockGetAccountStatus } = vi.hoisted(() => ({
   mockValidateSession: vi.fn(),
   mockGetSessionById: vi.fn(),
+  mockGetAccountStatus: vi.fn(),
 }));
 
 vi.mock("../lib/descope", () => ({
@@ -32,6 +33,7 @@ vi.mock("../lib/sessionService", async (importActual) => {
     ...actual,
     getSessionById: mockGetSessionById,
     getSessionForAuthGate: mockGetSessionById,
+    getAccountStatusForAuthGate: mockGetAccountStatus,
     touchSession: vi.fn(),
   };
 });
@@ -46,6 +48,8 @@ const USER = "user_1";
 beforeEach(() => {
   mockValidateSession.mockResolvedValue({ token: { sub: USER, email: "u@example.com" } });
   mockGetSessionById.mockReset();
+  mockGetAccountStatus.mockReset();
+  mockGetAccountStatus.mockResolvedValue("active");
   setMinEnforceVersion(null);
 });
 afterEach(() => {
@@ -62,6 +66,18 @@ function ctx(headers: Record<string, string>) {
 }
 
 describe("requireAuth session gate — with X-Session-Id", () => {
+  it("rejects a restricted account before evaluating its session", async () => {
+    mockGetAccountStatus.mockResolvedValue("banned");
+    const { req, res, next, status, json } = ctx({ "x-session-id": "sid_active" });
+
+    await requireAuth(req, res, next);
+
+    expect(status).toHaveBeenCalledWith(403);
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ code: "ACCOUNT_RESTRICTED" }));
+    expect(mockGetSessionById).not.toHaveBeenCalled();
+    expect(next).not.toHaveBeenCalled();
+  });
+
   it("passes an active session belonging to the user and attaches sessionId", async () => {
     mockGetSessionById.mockResolvedValue({
       sessionId: "sid_active",

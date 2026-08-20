@@ -21,7 +21,16 @@ export type RedisRuntimeStatus = {
     maxmemory: number | null;
     usedMemoryRatio: number | null;
     evictedKeys: number | null;
+    rss: number | null;
+    fragmentationRatio: number | null;
   };
+  persistence: {
+    aofLastWriteStatus: string | null;
+    aofLastRewriteStatus: string | null;
+    aofPendingRewrite: number | null;
+    aofBufferLength: number | null;
+  };
+  writeRejections: number | null;
 };
 
 let queueMemoryGateCache:
@@ -63,10 +72,16 @@ export function evaluateRedisRuntime(
   runtimeConfig: Record<string, string>,
   memoryInfo: Record<string, string>,
   statsInfo: Record<string, string>,
+  persistenceInfo: Record<string, string> = {},
+  errorInfo: Record<string, string> = {},
 ): RedisRuntimeStatus {
   const maxmemory = parseNumber(runtimeConfig.maxmemory);
   const usedMemory = parseNumber(memoryInfo.used_memory);
   const evictedKeys = parseNumber(statsInfo.evicted_keys);
+  const rss = parseNumber(memoryInfo.used_memory_rss);
+  const fragmentationRatio = parseNumber(memoryInfo.mem_fragmentation_ratio);
+  const oomMatch = errorInfo.errorstat_OOM?.match(/count=(\d+)/);
+  const writeRejections = oomMatch ? Number(oomMatch[1]) : 0;
   const usedMemoryRatio =
     usedMemory != null && maxmemory != null && maxmemory > 0
       ? usedMemory / maxmemory
@@ -104,6 +119,18 @@ export function evaluateRedisRuntime(
     if (evictedKeys != null && evictedKeys > 0) {
       errors.push(`${name} has evicted ${evictedKeys} keys; this Redis must not evict`);
     }
+    if (writeRejections > 0) {
+      errors.push(`${name} has rejected ${writeRejections} writes with OOM errors`);
+    }
+    if (persistenceInfo.aof_last_write_status && persistenceInfo.aof_last_write_status !== "ok") {
+      errors.push(`${name} AOF last write status is ${persistenceInfo.aof_last_write_status}`);
+    }
+    if (persistenceInfo.aof_last_bgrewrite_status && persistenceInfo.aof_last_bgrewrite_status !== "ok") {
+      warnings.push(`${name} AOF last rewrite status is ${persistenceInfo.aof_last_bgrewrite_status}`);
+    }
+    if (fragmentationRatio != null && fragmentationRatio >= 1.5) {
+      warnings.push(`${name} memory fragmentation ratio is ${fragmentationRatio}`);
+    }
     if (usedMemoryRatio != null && usedMemoryRatio >= 0.85) {
       errors.push(`${name} memory usage is at or above 85%; pause noncritical enqueue sources`);
     } else if (usedMemoryRatio != null && usedMemoryRatio >= 0.70) {
@@ -127,7 +154,16 @@ export function evaluateRedisRuntime(
       maxmemory,
       usedMemoryRatio,
       evictedKeys,
+      rss,
+      fragmentationRatio,
     },
+    persistence: {
+      aofLastWriteStatus: persistenceInfo.aof_last_write_status ?? null,
+      aofLastRewriteStatus: persistenceInfo.aof_last_bgrewrite_status ?? null,
+      aofPendingRewrite: parseNumber(persistenceInfo.aof_rewrite_scheduled),
+      aofBufferLength: parseNumber(persistenceInfo.aof_buffer_length),
+    },
+    writeRejections,
   };
 }
 
@@ -137,13 +173,15 @@ async function inspectRedisClient(role: RedisRole, redis: RedisClient): Promise<
   }
 
   await redis.ping();
-  const [maxmemoryRaw, maxmemoryPolicyRaw, appendonlyRaw, appendfsyncRaw, memoryRaw, statsRaw] = await Promise.all([
+  const [maxmemoryRaw, maxmemoryPolicyRaw, appendonlyRaw, appendfsyncRaw, memoryRaw, statsRaw, persistenceRaw, errorRaw] = await Promise.all([
     redis.config("GET", "maxmemory"),
     redis.config("GET", "maxmemory-policy"),
     redis.config("GET", "appendonly"),
     redis.config("GET", "appendfsync"),
     redis.info("memory"),
     redis.info("stats"),
+    redis.info("persistence"),
+    redis.info("errorstats"),
   ]);
   const runtimeConfig = {
     ...redisConfigPairsToObject(maxmemoryRaw),
@@ -157,6 +195,8 @@ async function inspectRedisClient(role: RedisRole, redis: RedisClient): Promise<
     runtimeConfig,
     parseRedisInfo(memoryRaw),
     parseRedisInfo(statsRaw),
+    parseRedisInfo(persistenceRaw),
+    parseRedisInfo(errorRaw),
   );
 }
 

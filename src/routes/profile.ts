@@ -1,13 +1,20 @@
 import { Router, type RequestHandler } from "express";
 import multer from "multer";
+import { randomUUID } from "node:crypto";
 import { db } from "../../db/src/index.js";
 import { profilesTable, walletsTable, achievementDefinitionsTable, userTitlesTable, friendsTable, friendRequestsTable } from "../../db/src/schema/index.js";
 import { raceResultsTable } from "../../db/src/schema/index.js";
 import { stepDailyTotalsTable, userStepSourcesTable } from "../../db/src/schema/index.js";
 import { coinBalancesTable } from "../../db/src/schema/index.js";
 import { raceParticipantsTable, raceRoomsTable, userPreferencesTable } from "../../db/src/schema/index.js";
+import { authSessionsTable, withdrawalsTable } from "../../db/src/schema/index.js";
+import { unlimitedChallengesTable, unlimitedChallengeParticipantsTable, depositTransactionsTable, scheduledRoomRegistrationsTable } from "../../db/src/schema/index.js";
 import { localDateInTimeZone, resolveTodayKey } from "../lib/localDate.js";
-import { eq, and, or, desc, ne, gt, notInArray, sql } from "drizzle-orm";
+import { eq, and, or, desc, ne, gt, notInArray, inArray, sql } from "drizzle-orm";
+import { lockWalletByUserId } from "../lib/raceIntegrity.js";
+import { cacheAccountStatus, revokeSession } from "../lib/sessionService.js";
+import { getDescopeClient } from "../lib/descope.js";
+import { writeAuditLog } from "../lib/auditLog.js";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import {
   deleteStoredObject,
@@ -17,7 +24,6 @@ import {
   objectUrl,
   putStoredObject,
 } from "../lib/objectStorage.js";
-import { proxyStoredObjectResponse } from "../lib/objectMediaProxy.js";
 import { triggerEvent } from "../lib/pusher.js";
 import { z } from "zod";
 import { buildGeneratedObjectKey, validateRasterUpload } from "../lib/uploadPolicy.js";
@@ -27,6 +33,7 @@ import { createRedisRateLimit, rateLimitByActorOrIp } from "../lib/rateLimit.js"
 import { normalizeCountryCode } from "../lib/country.js";
 import { isRewardedRaceWinResult } from "../lib/leaderboardPredicates.js";
 import { fetchTotalRaceWinningsCents } from "../lib/raceWinnings.js";
+import { getProfileAvatarProjection, setProfileAvatarProjection } from "../lib/profileProjection.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -345,7 +352,8 @@ router.get("/profile/me", requireAuth, async (req, res) => {
       wallet: {
         availableBalance:    (w?.availableBalanceCents    ?? 0) / 100,
         pendingBalance:      (w?.pendingBalanceCents      ?? 0) / 100,
-        withdrawableBalance: (w?.withdrawableBalanceCents ?? 0) / 100,
+        // Any cleared available balance is withdrawable — derive from available.
+        withdrawableBalance: (w?.availableBalanceCents     ?? 0) / 100,
         totalEarned:         (w?.totalEarnedCents         ?? 0) / 100,
       },
       active_title: activeTitleData,
@@ -490,6 +498,7 @@ router.post("/profile/me/avatar", requireAuth, uploadLimiter, upload.single("ava
       .where(eq(profilesTable.id, userId));
 
     const avatarVersion = now.getTime();
+    void setProfileAvatarProjection(userId, avatarUrl, avatarVersion).catch(() => {});
     triggerEvent("public-presence", "avatar:updated", { userId, avatarVersion }).catch(() => {});
 
     return res.json({ success: true, avatarUrl, displayUrl, avatarVersion });
@@ -508,23 +517,12 @@ router.get("/profile/avatar/:userId", async (req, res) => {
   if (!isObjectStorageConfigured()) return res.status(503).end();
 
   try {
-    const [profile] = await db
-      .select({ avatarUrl: profilesTable.avatarUrl })
-      .from(profilesTable)
-      .where(eq(profilesTable.id, userId))
-      .limit(1);
-    const objKey = objectKeyFromUrl(profile?.avatarUrl);
-    if (!objKey) return res.status(404).end();
-
-    await proxyStoredObjectResponse(req, res, {
-      routeName: "profile-avatar",
-      objectKey: objKey,
-      maxBytes: config.runtime.uploadBodyLimitBytes,
-      cacheControl: req.query.v
-        ? "public, max-age=31536000, immutable"
-        : "no-cache, must-revalidate",
-    });
-    return;
+    const profile = await getProfileAvatarProjection(userId);
+    if (!profile?.avatarUrl || !objectKeyFromUrl(profile.avatarUrl)) return res.status(404).end();
+    res.setHeader("Cache-Control", req.query.v
+      ? "public, max-age=31536000, immutable"
+      : "public, max-age=60, must-revalidate");
+    return res.redirect(302, profile.avatarUrl);
   } catch (err) {
     if (isObjectStorageConfigError(err)) {
       return res.status(503).end();
@@ -553,6 +551,8 @@ router.delete("/profile/me/avatar", requireAuth, async (req, res) => {
     .update(profilesTable)
     .set({ avatarUrl: null, updatedAt: now })
     .where(eq(profilesTable.id, userId));
+
+  void setProfileAvatarProjection(userId, null, now.getTime()).catch(() => {});
 
   triggerEvent("public-presence", "avatar:updated", { userId, avatarVersion: now.getTime() }).catch(() => {});
 
@@ -791,15 +791,249 @@ router.post("/me/step-source", requireAuth, async (req, res) => {
 });
 
 // ── DELETE /api/me/account ────────────────────────────────────────────────────
+// Deletion is refused while money is still in play (audit 2026-08-16 F-03): a positive wallet
+// balance, an unresolved withdrawal, or an in-flight paid race must settle first — otherwise the
+// balance would be orphaned. On success the profile PII is anonymized in place (Apple 5.1.1(v) /
+// Play data-deletion require the data to go, not just the login), and every session is revoked.
 router.delete("/me/account", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
 
-  await db
-    .update(profilesTable)
-    .set({ accountStatus: "deleted", updatedAt: new Date() })
-    .where(eq(profilesTable.id, userId));
+  const outcome = await db.transaction(async (tx) => {
+    const wallet = await lockWalletByUserId(tx, userId);
+    if (
+      wallet &&
+      (wallet.availableBalanceCents > 0 ||
+        wallet.pendingBalanceCents > 0 ||
+        wallet.withdrawableBalanceCents > 0)
+    ) {
+      return {
+        blocked: {
+          code: "WALLET_BALANCE_REMAINING" as const,
+          message: "Withdraw your remaining wallet balance before deleting your account.",
+        },
+      };
+    }
 
-  req.log.info({ userId }, "account self-deleted by user request");
+    const [openWithdrawal] = await tx
+      .select({ id: withdrawalsTable.id })
+      .from(withdrawalsTable)
+      .where(
+        and(
+          eq(withdrawalsTable.userId, userId),
+          inArray(withdrawalsTable.status, ["pending", "approved"]),
+        ),
+      )
+      .limit(1);
+    if (openWithdrawal) {
+      return {
+        blocked: {
+          code: "WITHDRAWAL_IN_PROGRESS" as const,
+          message: "A withdrawal is still being processed. Wait for it to finish before deleting your account.",
+        },
+      };
+    }
+
+    const [activePaidRace] = await tx
+      .select({ id: raceParticipantsTable.id })
+      .from(raceParticipantsTable)
+      .innerJoin(raceRoomsTable, eq(raceParticipantsTable.raceRoomId, raceRoomsTable.id))
+      .where(
+        and(
+          eq(raceParticipantsTable.userId, userId),
+          inArray(raceParticipantsTable.status, ["joined", "active"]),
+          inArray(raceRoomsTable.status, ["open", "full", "starting", "in_progress"]),
+          gt(raceRoomsTable.entryAmountCents, 0),
+        ),
+      )
+      .limit(1);
+    if (activePaidRace) {
+      return {
+        blocked: {
+          code: "ACTIVE_PAID_RACE" as const,
+          message: "Leave or finish your paid challenge before deleting your account.",
+        },
+      };
+    }
+
+    // Unlimited-challenge stake (audit 2026-08-17 H6): the stake lives in a separate table the
+    // original guard never queried, so a user could delete mid-challenge and have the later payout
+    // credited to a locked-out wallet. Every unlimited challenge is funded (entry_fee_cents ≥ 1000).
+    const [activeUnlimited] = await tx
+      .select({ id: unlimitedChallengeParticipantsTable.id })
+      .from(unlimitedChallengeParticipantsTable)
+      .innerJoin(unlimitedChallengesTable, eq(unlimitedChallengeParticipantsTable.challengeId, unlimitedChallengesTable.id))
+      .where(
+        and(
+          eq(unlimitedChallengeParticipantsTable.userId, userId),
+          inArray(unlimitedChallengesTable.status, ["waiting", "starting", "active", "settling"]),
+        ),
+      )
+      .limit(1);
+    if (activeUnlimited) {
+      return {
+        blocked: {
+          code: "ACTIVE_UNLIMITED_CHALLENGE" as const,
+          message: "Finish or leave your active streak challenge before deleting your account.",
+        },
+      };
+    }
+
+    // Funded race that has ended but whose payout is still pending settlement/verification — the
+    // prize is still owed to this user (audit 2026-08-17 H6).
+    const [pendingSettlementRace] = await tx
+      .select({ id: raceParticipantsTable.id })
+      .from(raceParticipantsTable)
+      .innerJoin(raceRoomsTable, eq(raceParticipantsTable.raceRoomId, raceRoomsTable.id))
+      .where(
+        and(
+          eq(raceParticipantsTable.userId, userId),
+          eq(raceRoomsTable.status, "completed"),
+          gt(raceRoomsTable.entryAmountCents, 0),
+          inArray(raceRoomsTable.settlementStatus, ["pending", "awaiting_verification", "review_required"]),
+        ),
+      )
+      .limit(1);
+    if (pendingSettlementRace) {
+      return {
+        blocked: {
+          code: "SETTLEMENT_PENDING" as const,
+          message: "A challenge you played is still being settled. Try again once it finishes.",
+        },
+      };
+    }
+
+    // Live Coins Battle — coins are staked and a coin prize is still payable.
+    const [activeCoinsBattle] = await tx
+      .select({ id: raceParticipantsTable.id })
+      .from(raceParticipantsTable)
+      .innerJoin(raceRoomsTable, eq(raceParticipantsTable.raceRoomId, raceRoomsTable.id))
+      .where(
+        and(
+          eq(raceParticipantsTable.userId, userId),
+          inArray(raceParticipantsTable.status, ["joined", "active"]),
+          inArray(raceRoomsTable.status, ["open", "full", "starting", "in_progress"]),
+          gt(raceRoomsTable.coinEntryAmount, 0),
+        ),
+      )
+      .limit(1);
+    if (activeCoinsBattle) {
+      return {
+        blocked: {
+          code: "ACTIVE_COINS_BATTLE" as const,
+          message: "Finish your active Coins Battle before deleting your account.",
+        },
+      };
+    }
+
+    // In-flight deposit — a late provider webhook could credit an anonymized/locked wallet.
+    // (Abandoned checkouts are marked "cancelled" by the deposit cancel paths, so they do not block.)
+    const [inFlightDeposit] = await tx
+      .select({ id: depositTransactionsTable.id })
+      .from(depositTransactionsTable)
+      .where(
+        and(
+          eq(depositTransactionsTable.userId, userId),
+          inArray(depositTransactionsTable.status, ["pending", "processing"]),
+        ),
+      )
+      .limit(1);
+    if (inFlightDeposit) {
+      return {
+        blocked: {
+          code: "DEPOSIT_IN_PROGRESS" as const,
+          message: "A deposit is still processing. Wait for it to finish before deleting your account.",
+        },
+      };
+    }
+
+    const [profile] = await tx
+      .select({ avatarUrl: profilesTable.avatarUrl })
+      .from(profilesTable)
+      .where(eq(profilesTable.id, userId))
+      .limit(1);
+
+    // Random rather than derived from the user id, so the anonymized row cannot be joined back
+    // to the identity it replaced. The unique indexes on email/username stay satisfied.
+    const anonymousId = randomUUID().replace(/-/g, "");
+    await tx
+      .update(profilesTable)
+      .set({
+        accountStatus: "deleted",
+        email: `deleted+${anonymousId}@anonymized.invalid`,
+        fullName: "Deleted User",
+        username: `deleted_${anonymousId}`,
+        dateOfBirth: null,
+        phoneNumber: null,
+        country: null,
+        countryCode: null,
+        countryFlag: null,
+        region: null,
+        avatarUrl: null,
+        bio: null,
+        referredBy: null,
+        marketingOptIn: false,
+        updatedAt: new Date(),
+      })
+      .where(eq(profilesTable.id, userId));
+
+    // Cancel pending scheduled-room registrations (audit 2026-08-17 M13): otherwise the deleted
+    // user still counts toward a room's minimum and is materialized as "Deleted User" on the track
+    // (and still targeted by that room's notifications) at scheduled start.
+    await tx
+      .update(scheduledRoomRegistrationsTable)
+      .set({ status: "cancelled", cancelledAt: new Date() })
+      .where(and(
+        eq(scheduledRoomRegistrationsTable.userId, userId),
+        inArray(scheduledRoomRegistrationsTable.status, ["registered", "activated"]),
+      ));
+
+    return { avatarUrl: profile?.avatarUrl ?? null };
+  });
+
+  if ("blocked" in outcome && outcome.blocked) {
+    return res.status(409).json({ error: outcome.blocked.message, code: outcome.blocked.code });
+  }
+
+  await cacheAccountStatus(userId, "deleted");
+
+  // At most one session is active (DB unique index), but revoke whatever is there so no
+  // authenticated device outlives the account.
+  const activeSessions = await db
+    .select({ sessionId: authSessionsTable.sessionId })
+    .from(authSessionsTable)
+    .where(and(eq(authSessionsTable.userId, userId), eq(authSessionsTable.status, "active")));
+  for (const session of activeSessions) {
+    await revokeSession(session.sessionId, userId, "account_deleted");
+  }
+
+  // Best-effort provider-side revocation: local sessions are already dead, so a Descope
+  // hiccup must not fail the deletion.
+  try {
+    await getDescopeClient().management.user.logoutUserByUserId(userId);
+  } catch (err) {
+    req.log.warn({ err, userId }, "descope logout during account deletion failed");
+  }
+
+  const avatarUrl = "avatarUrl" in outcome ? outcome.avatarUrl : null;
+  if (avatarUrl && isObjectStorageConfigured()) {
+    try {
+      const key = objectKeyFromUrl(avatarUrl);
+      if (key) await deleteStoredObject(key);
+    } catch (err) {
+      req.log.warn({ err, userId }, "avatar purge during account deletion failed");
+    }
+  }
+
+  void writeAuditLog({
+    actorUserId: userId,
+    actorType: "user",
+    action: "account_deleted",
+    entityType: "profile",
+    entityId: userId,
+    reason: "self_service_deletion",
+  });
+
+  req.log.info({ userId }, "account self-deleted: PII anonymized, sessions revoked");
   return res.json({ success: true });
 });
 

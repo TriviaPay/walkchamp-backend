@@ -17,4 +17,10 @@ set -eu
 # need an advisory lock around the migration step so replicas don't race.
 /usr/local/bin/run-migrations
 
+# Hot-table index builds (F-14) run CONCURRENTLY in the background: they must not extend the
+# healthcheck window, and CONCURRENTLY cannot run inside the migration transaction anyway.
+# Double-fork via a subshell so the builder is reparented to tini (PID 1) immediately and reaped,
+# rather than becoming an unreaped zombie child of the exec'd node process (audit 2026-08-17 L7).
+( /usr/local/bin/ensure-concurrent-indexes & )
+
 exec node --enable-source-maps ./dist/index.mjs

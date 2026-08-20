@@ -13,8 +13,11 @@ import { getLeaderboardPeriodDates } from "../lib/leaderboardPeriods.js";
 import {
   fetchStepLeaderboardRows,
   type StepLeaderboardPeriod,
+  type StepLeaderboardRow,
 } from "../lib/stepLeaderboardQuery.js";
 import { fetchTotalRaceWinningsCents } from "../lib/raceWinnings.js";
+import { beginLeaderboardSnapshotFill, writeLeaderboardSnapshot } from "../lib/leaderboardSnapshotCache.js";
+import { readStepProjectionRanking } from "../lib/leaderboardProjection.js";
 
 const router = Router();
 
@@ -98,14 +101,37 @@ router.get("/leaderboard", requireAuth, async (req, res) => {
       req.query.weekStart,
       req.query.monthStart,
     );
-  const rankedRows = await fetchStepLeaderboardRows(db, {
-    userId,
-    period,
-    startDate: periodDates.startDate,
-    endDate: periodDates.endDate,
-    countryCode: scope === "regional" ? regionalCountryCode : null,
-    friendIds,
-  });
+  const projectionKey = period === "all_time"
+    ? "all_time"
+    : period === "today"
+      ? `day:${periodDates.startDate}`
+      : period === "week"
+        ? `week:${periodDates.startDate}`
+        : `month:${periodDates.startDate?.slice(0, 7)}`;
+  const projected = scope !== "regional"
+    ? await readStepProjectionRanking({ key: projectionKey, userId, friendIds })
+    : null;
+  const projectionRows: StepLeaderboardRow[] | null = await (async () => {
+    if (!projected) return null;
+    const profileRows = projected.length === 0 ? [] : await db.select({
+      id: profilesTable.id, username: profilesTable.username, fullName: profilesTable.fullName,
+      country: profilesTable.country, countryCode: profilesTable.countryCode,
+      countryFlag: profilesTable.countryFlag, avatarColor: profilesTable.avatarColor,
+      avatarUrl: profilesTable.avatarUrl, updatedAt: profilesTable.updatedAt,
+    }).from(profilesTable).where(and(
+      inArray(profilesTable.id, projected.map((row) => row.userId)),
+      sql`${profilesTable.accountStatus} NOT IN ('banned', 'deleted')`,
+    ));
+    if (profileRows.length !== projected.length) return null;
+    const profiles = new Map(profileRows.map((profile) => [profile.id, profile]));
+    return projected.map((ranked) => ({
+      ...profiles.get(ranked.userId)!, steps: ranked.steps, rank: ranked.rank,
+    })) as StepLeaderboardRow[];
+  })();
+  const rankedRows = projectionRows ?? await fetchStepLeaderboardRows(db, {
+      userId, period, startDate: periodDates.startDate, endDate: periodDates.endDate,
+      countryCode: scope === "regional" ? regionalCountryCode : null, friendIds,
+    });
   const rows = rankedRows.filter((r) => r.rank <= 100);
 
   // ── Batch-fetch active titles for all users in result ────────────────────
@@ -166,6 +192,9 @@ router.get("/leaderboard", requireAuth, async (req, res) => {
 router.get("/leaderboard/races", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const entryType = req.query.entryType as string | undefined;
+  const snapshotIdentity = `${userId}:${entryType ?? "all"}`;
+  const snapshotFill = await beginLeaderboardSnapshotFill<Record<string, unknown>>("race", snapshotIdentity);
+  if (snapshotFill.cached) return res.json(snapshotFill.cached);
 
   const validEntryTypes = ["free", "paid_1", "paid_3", "paid_5"] as const;
   type EntryType = (typeof validEntryTypes)[number];
@@ -325,12 +354,16 @@ router.get("/leaderboard/races", requireAuth, async (req, res) => {
     userTotalWinning = await fetchTotalRaceWinningsCents(db, userId) / 100;
   }
 
-  return res.json({ leaderboard, userRank, userWins, userTotalWinning });
+  const payload = { leaderboard, userRank, userWins, userTotalWinning };
+  void writeLeaderboardSnapshot("race", snapshotIdentity, payload, snapshotFill.token).catch(() => {});
+  return res.json(payload);
 });
 
 // ── GET /api/leaderboard/coins ─────────────────────────────────────────────────
 router.get("/leaderboard/coins", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
+  const snapshotFill = await beginLeaderboardSnapshotFill<Record<string, unknown>>("coin", userId);
+  if (snapshotFill.cached) return res.json(snapshotFill.cached);
 
   type CoinRow = {
     uid: string;
@@ -433,7 +466,9 @@ router.get("/leaderboard/coins", requireAuth, async (req, res) => {
   const userRank = myRankedRow?.rank ?? 9999;
   const userMetric = Number(myRankedRow?.total_coins ?? 0);
 
-  return res.json({ leaderboard, userRank: Number(userRank), userMetric });
+  const payload = { leaderboard, userRank: Number(userRank), userMetric };
+  void writeLeaderboardSnapshot("coin", userId, payload, snapshotFill.token).catch(() => {});
+  return res.json(payload);
 });
 
 // ── GET /api/leaderboard/groups ────────────────────────────────────────────────
@@ -441,6 +476,9 @@ router.get("/leaderboard/groups", requireAuth, async (req, res) => {
   const period = (req.query.period as string) === "all_time" ? "all_time" : "today";
   const rawLocalDate = req.query.localDate as string | undefined;
   const today = getLeaderboardPeriodDates("today", rawLocalDate).startDate;
+  const snapshotIdentity = `${period}:${today}`;
+  const snapshotFill = await beginLeaderboardSnapshotFill<Record<string, unknown>>("group", snapshotIdentity);
+  if (snapshotFill.cached) return res.json(snapshotFill.cached);
 
   req.log?.info({ period, today }, "[GroupLeaderboard] fetch started");
 
@@ -522,7 +560,9 @@ router.get("/leaderboard/groups", requireAuth, async (req, res) => {
   }));
 
   req.log?.info({ period, count: groups.length, topGroup: groups[0]?.name, topSteps: groups[0]?.totalSteps }, "[GroupLeaderboard] returned");
-  return res.json({ success: true, period, label, groups, leaderboard: groups });
+  const payload = { success: true, period, label, groups, leaderboard: groups };
+  void writeLeaderboardSnapshot("group", snapshotIdentity, payload, snapshotFill.token).catch(() => {});
+  return res.json(payload);
 });
 
 export default router;

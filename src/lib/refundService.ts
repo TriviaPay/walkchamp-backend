@@ -20,6 +20,7 @@ import {
   type RefundItem,
 } from "../../db/src/schema/index.js";
 import { writeAuditLog } from "./auditLog.js";
+import { insertOutboxEventTx, enqueueOutboxEvent } from "./outbox.js";
 import { config } from "./config.js";
 import {
   lockRaceRoom,
@@ -633,6 +634,27 @@ export async function createRefundForRaceParticipantTx(
       walletDebit: debit,
       reasonCode,
     });
+    // Void the original entry debit once refunded (audit 2026-08-17 B3 — free re-join). The
+    // completed debit is what debitCashChallengeEntry / hasCompletedEntryPayment short-circuit
+    // on, so a leave-refunded player who re-joins would otherwise get a free seat. Flipping it
+    // to "cancelled" (there is no "refunded" enum value) forces the re-join to re-charge.
+    // reservedAmountForComponent already blocks a second refund of the same debit, so this only
+    // affects the re-charge path, not refund accounting.
+    if (debit.status === "completed") {
+      await tx
+        .update(walletTransactionsTable)
+        .set({
+          status: "cancelled",
+          metadata: sql`coalesce(${walletTransactionsTable.metadata}, '{}'::jsonb) || ${JSON.stringify({
+            voidedByRefundId: parent.id,
+            voidedAt: new Date().toISOString(),
+          })}::jsonb`,
+        })
+        .where(and(
+          eq(walletTransactionsTable.id, debit.id),
+          eq(walletTransactionsTable.status, "completed"),
+        ));
+    }
   }
 
   const promoAmount = walletDebits.reduce((sum, debit) => {
@@ -856,6 +878,10 @@ export async function approveRefund(input: {
   adminUserId: string;
   approvedItems?: Array<{ refundItemId: string; approvedAmount?: number; rejectReason?: string }>;
 }) {
+  // Outbox rows inserted inside the transaction are enqueued only AFTER it commits (audit
+  // 2026-08-17 H5): without this, an approved provider refund waited for the hourly repair scan,
+  // and a restart in that window stranded it indefinitely.
+  const providerOutboxRows: Array<typeof outboxEventsTable.$inferSelect> = [];
   const refund = await db.transaction(async (tx) => {
     await tx.execute(sql`select id from refunds where id = ${input.refundId} for update`);
     const [parent] = await tx.select().from(refundsTable).where(eq(refundsTable.id, input.refundId)).limit(1);
@@ -913,14 +939,15 @@ export async function approveRefund(input: {
           })
           .where(eq(refundItemsTable.id, item.id));
 
-        await tx.insert(outboxEventsTable).values({
+        const outboxRow = await insertOutboxEventTx(tx, {
           topic: "refund-processing",
           eventType: "provider_refund.approved",
           aggregateType: "refund_item",
           aggregateId: item.id,
           idempotencyKey: `refund-provider:${item.id}`,
           payload: { refundItemId: item.id },
-        }).onConflictDoNothing();
+        });
+        if (outboxRow) providerOutboxRows.push(outboxRow);
       } else if (item.destination === "wallet" || item.assetType === "coins") {
         if (approvedAmount !== item.requestedAmount) throw new Error("PARTIAL_WALLET_OR_COIN_APPROVAL_NOT_SUPPORTED");
       }
@@ -935,6 +962,12 @@ export async function approveRefund(input: {
     if (!withItems) throw new Error("REFUND_NOT_FOUND");
     return withItems;
   });
+
+  // Deliver the approved provider-refund jobs immediately now that the transaction has committed,
+  // instead of waiting up to an hour for the outbox repair scan (audit 2026-08-17 H5).
+  for (const row of providerOutboxRows) {
+    void enqueueOutboxEvent(row);
+  }
 
   void writeAuditLog({
     actorUserId: input.adminUserId,

@@ -9,17 +9,30 @@ import type { Request, Response, NextFunction } from "express";
 
 // ── Mock Descope client ────────────────────────────────────────────────────────
 // Hoist a shared spy so individual tests can change the resolved / rejected value.
-const mockValidateSession = vi.fn();
+const { mockValidateSession, mockGetAccountStatus } = vi.hoisted(() => ({
+  mockValidateSession: vi.fn(),
+  mockGetAccountStatus: vi.fn(),
+}));
 
 vi.mock("../lib/descope", () => ({
   getDescopeClient: () => ({ validateSession: mockValidateSession }),
 }));
+
+vi.mock("../lib/sessionService", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/sessionService")>();
+  return {
+    ...actual,
+    getAccountStatusForAuthGate: mockGetAccountStatus,
+  };
+});
 
 import { requireAuth } from "../middleware/requireAuth";
 
 // Default: Descope rejects every token (most tests need this behaviour).
 beforeEach(() => {
   mockValidateSession.mockRejectedValue(new Error("Simulated Descope rejection"));
+  mockGetAccountStatus.mockReset();
+  mockGetAccountStatus.mockResolvedValue("active");
 });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -129,6 +142,18 @@ describe("requireAuth — Descope validation failure", () => {
 // ── Valid token — next() is invoked ───────────────────────────────────────────
 
 describe("requireAuth — valid token", () => {
+  it("returns 403 when the authenticated account is restricted", async () => {
+    mockValidateSession.mockResolvedValueOnce({ token: { sub: "user_banned" } });
+    mockGetAccountStatus.mockResolvedValueOnce("banned");
+    const { req, res, next, status, json } = mockContext("Bearer valid.jwt.token");
+
+    await requireAuth(req, res, next);
+
+    expect(status).toHaveBeenCalledWith(403);
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ code: "ACCOUNT_RESTRICTED" }));
+    expect(next).not.toHaveBeenCalled();
+  });
+
   it("calls next() when Descope accepts the token", async () => {
     mockValidateSession.mockResolvedValueOnce({
       token: { sub: "user_abc123", email: "test@example.com" },

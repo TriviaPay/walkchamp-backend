@@ -18,15 +18,25 @@ import { logger } from "./logger.js";
  */
 
 const STUCK_STARTING_GRACE_MS = 2 * 60_000;
+// A scheduled room this far past its start time is treated as a missed window (worker outage /
+// clock jump) and cancelled rather than started, so wallets are never charged for a race nobody
+// is expecting hours/days late (audit 2026-08-17 M4).
+const SCHEDULED_START_STALE_MS = 60 * 60_000;
 
-/** Count distinct still-registered users for a scheduled room. */
+/**
+ * Count distinct users still counted toward a scheduled room's start (audit 2026-08-17 H3).
+ * Includes "activated" registrations: materializeRegistrations flips "registered"→"activated"
+ * before charging, so if a charge fails and the claim reverts to "scheduled", the next
+ * evaluation must still see those users (their participant rows already exist) instead of
+ * counting 0 and wrongly cancelling MINIMUM_PARTICIPANTS_NOT_MET.
+ */
 async function countRegisteredParticipants(roomId: string): Promise<number> {
   const [{ cnt }] = await db
     .select({ cnt: sql<number>`count(distinct ${scheduledRoomRegistrationsTable.userId})::int` })
     .from(scheduledRoomRegistrationsTable)
     .where(and(
       eq(scheduledRoomRegistrationsTable.raceRoomId, roomId),
-      eq(scheduledRoomRegistrationsTable.status, "registered"),
+      inArray(scheduledRoomRegistrationsTable.status, ["registered", "activated"]),
     ));
   return cnt ?? 0;
 }
@@ -38,6 +48,18 @@ async function countRegisteredParticipants(roomId: string): Promise<number> {
 export async function evaluateScheduledStart(roomId: string): Promise<void> {
   const [room] = await db.select().from(raceRoomsTable).where(eq(raceRoomsTable.id, roomId)).limit(1);
   if (!room || room.status !== "scheduled") return; // already started/cancelled/expired
+
+  // Missed-window guard (audit 2026-08-17 M4): after a long outage, do not silently start (and
+  // charge) a race that is now hours/days late. Cancel with a distinct reason instead.
+  const scheduledStartMs = room.scheduledStartAt?.getTime() ?? null;
+  if (scheduledStartMs !== null && Date.now() - scheduledStartMs > SCHEDULED_START_STALE_MS) {
+    await terminateWaitingRoom(roomId, { terminalStatus: "cancelled", reason: "SCHEDULED_START_WINDOW_MISSED" });
+    logger.warn(
+      { roomId, scheduledStartAt: room.scheduledStartAt, lateMs: Date.now() - scheduledStartMs },
+      "[WaitingRoom] scheduled room cancelled — start window missed (stale)",
+    );
+    return;
+  }
 
   const minimum = room.minimumParticipants ?? config.waitingRoom.minimumParticipants;
   const registered = await countRegisteredParticipants(roomId);
@@ -117,11 +139,21 @@ export async function reconcileWaitingRooms(now: Date = new Date()): Promise<voi
     for (const room of dueExpiry) await expireOpenWindow(room.id);
 
     // Rooms stuck in "starting" (process died mid-charge) → revert to a startable status so the
-    // host can retry or the window can expire. Uses the frozen currentPlayers to pick open/full.
+    // host can retry, the scheduled sweep can re-evaluate, or the window can expire. Revert BY MODE
+    // (audit 2026-08-17 H2): a scheduled room must go back to "scheduled" (not open/full), or it
+    // becomes an unrecoverable zombie — the scheduled sweep only matches status="scheduled", the
+    // host cannot start a scheduled room, and a paid room cannot be host-cancelled, so charged
+    // entry fees would be stranded. open_window rooms revert to open/full off the frozen count.
     const stuckCutoff = new Date(now.getTime() - STUCK_STARTING_GRACE_MS);
     await db
       .update(raceRoomsTable)
-      .set({ status: sql`case when ${raceRoomsTable.currentPlayers} >= ${raceRoomsTable.maxPlayers} then 'full'::race_status else 'open'::race_status end`, updatedAt: now })
+      .set({
+        status: sql`case
+          when ${raceRoomsTable.mode} = 'scheduled' then 'scheduled'::race_status
+          when ${raceRoomsTable.currentPlayers} >= ${raceRoomsTable.maxPlayers} then 'full'::race_status
+          else 'open'::race_status end`,
+        updatedAt: now,
+      })
       .where(and(eq(raceRoomsTable.status, "starting"), lt(raceRoomsTable.updatedAt, stuckCutoff)));
   } catch (err) {
     logger.error({ err }, "[WaitingRoom] reconcile tick failed");

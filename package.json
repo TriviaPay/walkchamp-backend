@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.15.1",
+  "packageManager": "pnpm@10.34.5",
   "engines": {
     "node": ">=22"
   },
@@ -29,6 +29,7 @@
     "create:today-events": "tsx ./scripts/src/createTodayEvents.ts",
     "check:sponsored-races": "tsx ./scripts/src/checkSponsoredRaces.ts",
     "audit:leaderboard": "tsx ./scripts/src/auditLeaderboardDistributions.ts",
+    "audit:cu-baseline": "tsx ./scripts/src/auditCuBaseline.ts",
     "create:evening-events": "tsx ./scripts/src/createEveningEvents.ts",
     "seed:test-titles": "tsx ./scripts/src/seedTestTitles.ts",
     "apply-db-indexes": "tsx ./scripts/src/apply-db-indexes.ts",

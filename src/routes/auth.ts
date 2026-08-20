@@ -4,6 +4,7 @@ import { profilesTable, walletsTable } from "../../db/src/schema/index.js";
 import { eq } from "drizzle-orm";
 import { getDescopeClient } from "../lib/descope.js";
 import { requireAuth, requireJwtOnly, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
 import { parseAndValidateDob } from "../lib/dateOfBirth.js";
 import { withUniqueReferralCode } from "../lib/uniqueCodes.js";
 import { config } from "../lib/config.js";
@@ -70,6 +71,13 @@ router.get("/me", requireJwtOnly, async (req, res) => {
   if (!profile) {
     // User authenticated but has no profile yet
     return res.status(404).json({ profile_completed: false, profile: null });
+  }
+  if (profile.accountStatus !== "active") {
+    return res.status(403).json({
+      error: "Account is not allowed to sign in.",
+      code: "ACCOUNT_RESTRICTED",
+      status: profile.accountStatus,
+    });
   }
 
   // Update last_seen
@@ -148,7 +156,7 @@ function sessionIdRequiredForRequest(req: Request): boolean {
 // Login hook: call after any successful authentication (including client-side OTP/social flows).
 // JWT-only so it is reachable before the client holds a session id (avoids a bootstrap deadlock
 // once the enforcement version gate is enabled).
-router.post("/auth/session/register", requireJwtOnly, async (req, res) => {
+router.post("/auth/session/register", requireJwtOnly, requireActiveAccount, async (req, res) => {
   const authReq = req as AuthenticatedRequest;
   const result = await registerOrReplaceSession({
     userId: authReq.descopeUserId,
@@ -250,6 +258,18 @@ router.post("/auth/session/revoke-current", requireJwtOnly, async (req, res) => 
   const sid = sessionIdFromRequest(req);
   if (!sid) return res.json({ ok: true });
   const result = await revokeSession(sid, authReq.descopeUserId, "logout");
+
+  // Also revoke the Descope refresh token on an EXPLICIT user logout (audit 2026-08-17 M24).
+  // revokeSession only kills the local session row; without this, a held Descope refresh token
+  // could keep minting valid JWTs after logout and — with device headers stripped — retain full
+  // access to every requireAuth route. Done only here (not inside revokeSession, which also fires
+  // on session-replacement, where a global Descope logout would kill the replacing device too).
+  try {
+    await getDescopeClient().management.user.logoutUserByUserId(authReq.descopeUserId);
+  } catch (err) {
+    req.log.warn({ err, userId: authReq.descopeUserId }, "descope logout during revoke-current failed");
+  }
+
   return res.json({ ok: result.ok });
 });
 

@@ -225,6 +225,13 @@
       "when": 1786768000000,
       "tag": "0031_unlimited_missed_day_stays_active",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1787241600000,
+      "tag": "0032_walk_ingest_authority",
+      "breakpoints": true
     }
   ]
 }

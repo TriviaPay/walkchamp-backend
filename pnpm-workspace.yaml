@@ -1,6 +1,12 @@
 packages:
   - .
 
+# Lifecycle scripts are deny-by-default in pnpm 10; only these two packages may build.
 allowBuilds:
   esbuild: true
   msgpackr-extract: true
+
+# Supply-chain guard (audit 2026-08-16 F-10): never install a version published in the last
+# 24 hours, so a just-compromised release gets caught and yanked before it can land here.
+# Requires pnpm >= 10.16 (packageManager pins a newer 10.x).
+minimumReleaseAge: 1440

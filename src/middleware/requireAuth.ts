@@ -4,6 +4,7 @@ import { config } from "../lib/config.js";
 import { writeAuditLog } from "../lib/auditLog.js";
 import {
   getSessionForAuthGate,
+  getAccountStatusForAuthGate,
   touchSession,
   extractDescopeSessionId,
   sessionErrorCodeForStatus,
@@ -14,6 +15,8 @@ import {
 
 export interface AuthenticatedRequest extends Request {
   descopeUserId: string;
+  /** Account state resolved once by the authentication gate and reused downstream. */
+  accountStatus?: string | null;
   descopeEmail?: string;
   /** Best-effort provider session id from verified claims (may be null). */
   descopeSessionId?: string | null;
@@ -121,6 +124,20 @@ export async function requireAuth(
   const userId = await attachAuth(req, res);
   if (!userId) return;
 
+  // Account state is an authorization boundary, not merely profile metadata. Apply it centrally
+  // so a deleted/banned/suspended user cannot strip X-Session-Id or reach a route that forgot to
+  // add a second account-status middleware.
+  const accountStatus = await getAccountStatusForAuthGate(userId);
+  (req as AuthenticatedRequest).accountStatus = accountStatus;
+  if (accountStatus && accountStatus !== "active") {
+    res.status(403).json({
+      error: "Account is not allowed to perform this action.",
+      code: "ACCOUNT_RESTRICTED",
+      status: accountStatus,
+    });
+    return;
+  }
+
   // ── Single active session gate (monitor-first) ──────────────────────────────
   const sessionId = header(req, "x-session-id");
 
@@ -167,5 +184,9 @@ function rejectSession(
     reason: code,
     metadata: { path: req.path },
   });
-  res.status(401).json({ code, message: SESSION_ERROR_MESSAGES[code] });
+  // Include the rejected sessionId (audit 2026-08-17 H12). The client ignores SESSION_REVOKED/
+  // EXPIRED/INVALID unless the payload names a sessionId matching its own — so omitting it meant a
+  // server-side revoke never actually logged the device out. Sending the presented sessionId lets
+  // the existing client logic act on it. (Null for the version-gate path, which stays a no-op.)
+  res.status(401).json({ code, message: SESSION_ERROR_MESSAGES[code], sessionId });
 }

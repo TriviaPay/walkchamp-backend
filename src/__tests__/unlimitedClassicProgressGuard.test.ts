@@ -97,9 +97,8 @@ describe("§2 walk/steps reports what it credited", () => {
 
   it("still emits progress_updated after crediting", () => {
     expect(handler).toContain('emitUnlimitedRealtime(d.challengeId, "progress_updated"');
-    expect(handler.indexOf("unlimitedCredits = await")).toBeLessThan(
-      handler.indexOf("findActiveUnlimitedDaysForUser"),
-    );
+    const creditIndex = handler.indexOf("unlimitedCredits = await");
+    expect(creditIndex).toBeLessThan(handler.indexOf("findActiveUnlimitedDaysForUser", creditIndex));
   });
 });
 

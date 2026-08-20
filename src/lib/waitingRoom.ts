@@ -6,7 +6,9 @@ import {
   scheduledRoomRegistrationsTable,
   type RaceRoom,
 } from "../../db/src/schema/races.js";
+import { coinTransactionsTable } from "../../db/src/schema/coins.js";
 import { createRefundBatchForRaceCancellation } from "./refundService.js";
+import { recordCoinLedgerEntry } from "./coinsService.js";
 import { triggerEvent } from "./pusher.js";
 import { sendNotification } from "../routes/notifications.js";
 import { enqueueJob } from "./queue.js";
@@ -25,7 +27,10 @@ import { logger } from "./logger.js";
 export type CancellationReason =
   | "HOST_CANCELLED"
   | "MINIMUM_PARTICIPANTS_NOT_MET"
-  | "HOST_DID_NOT_START_BEFORE_EXPIRATION";
+  | "HOST_DID_NOT_START_BEFORE_EXPIRATION"
+  // Scheduled room started so late (worker outage / clock jump) that it is treated as a missed
+  // window and cancelled rather than started/charged (audit 2026-08-17 M4).
+  | "SCHEDULED_START_WINDOW_MISSED";
 
 type RoomStartFields = Pick<
   RaceRoom,
@@ -57,6 +62,11 @@ function cancellationCopy(reason: CancellationReason): { title: string; body: st
       return {
         title: "Waiting Room expired",
         body: "Your Waiting Room expired because the race was not started within 30 minutes.",
+      };
+    case "SCHEDULED_START_WINDOW_MISSED":
+      return {
+        title: "Race cancelled",
+        body: "Your scheduled race could not start on time and was cancelled. Any entry fee has been refunded.",
       };
     case "HOST_CANCELLED":
     default:
@@ -127,6 +137,39 @@ export async function terminateWaitingRoom(
       .returning({ id: raceRoomsTable.id });
     if (!row) return { changed: false, terminalStatus: input.terminalStatus, reason: input.reason };
     changed = true;
+
+    // Coins Battle entries are charged at activation (coinEntryAmount, not entryAmountCents), so a
+    // room that was charged then reverted to "open" by the stuck-starting reconciler and is now
+    // terminated would lose the deducted coins in this free/coins branch (audit 2026-08-17 M3).
+    // Refund every coins_battle_entry spend for this room, idempotently.
+    if (pre.entryType === "coins_battle") {
+      const charges = await db
+        .select({ userId: coinTransactionsTable.userId, amount: coinTransactionsTable.amount })
+        .from(coinTransactionsTable)
+        .where(and(
+          eq(coinTransactionsTable.source, "coins_battle_entry"),
+          eq(coinTransactionsTable.sourceId, roomId),
+          eq(coinTransactionsTable.transactionType, "spend"),
+        ));
+      if (charges.length > 0) {
+        await db.transaction(async (tx) => {
+          for (const c of charges) {
+            await recordCoinLedgerEntry(tx, {
+              userId: c.userId,
+              amount: Math.abs(c.amount),
+              transactionType: "refund",
+              source: "coins_battle_refund",
+              sourceId: roomId,
+              rewardCode: null,
+              reasonCode: "coins_battle_cancelled",
+              idempotencyKey: `coins-battle-refund:${c.userId}:${roomId}`,
+              description: "Coins Battle entry refunded (room cancelled)",
+              metadata: { raceId: roomId },
+            });
+          }
+        });
+      }
+    }
   }
 
   // Clear scheduled-room state so participants are removed from active waiting-room lists.

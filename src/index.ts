@@ -5,6 +5,11 @@ import { pool } from "../db/src/index.js";
 import { closeQueues } from "./lib/queue.js";
 import { installProcessSafetyHandlers } from "./lib/processSafety.js";
 import { iapConfigStatus } from "./lib/iapVerification.js";
+import { initSentry } from "./lib/sentry.js";
+
+// Initialize error reporting before the server starts accepting traffic (audit 2026-08-17 M20).
+// Best-effort and async (Sentry is dynamically imported); startup does not block on it.
+void initSentry("api");
 
 // Background startup readiness: warm the pool and surface early warnings if the DB is briefly
 // unreachable at boot (e.g. a cold Neon wake). Non-blocking — the server still starts listening

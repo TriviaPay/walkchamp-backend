@@ -3,9 +3,24 @@ import { db } from "../../db/src/index.js";
 import { userPreferencesTable, profilesTable } from "../../db/src/schema/index.js";
 import { eq } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { config } from "../lib/config.js";
 import { z } from "zod";
 
 const router = Router();
+
+// GET /api/preferences/feature-flags — PUBLIC (no auth), the app's remote kill-switch for
+// cash-related surfaces (audit 2026-08-17 B1). Previously this route did not exist, so the client's
+// remoteFeatureFlags fetch 404'd and cash could only be toggled by shipping a new store build.
+// Returns server-authoritative flags only; the client merges these over its compile-time defaults,
+// so keys omitted here keep the client's own value.
+router.get("/preferences/feature-flags", (_req, res) => {
+  res.json({
+    cashFeatures: config.features.cashFeaturesEnabled,
+    withdrawals: config.realMoneyReadiness.withdrawalControlsReady,
+    paymentsLiveMode: config.realMoneyReadiness.paymentsLiveMode,
+    sponsoredEvents: true,
+  });
+});
 
 const IANA_TZ_REGEX = /^[A-Za-z]+(?:\/[A-Za-z0-9_+-]+)+$/;
 

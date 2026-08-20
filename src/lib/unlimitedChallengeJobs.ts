@@ -189,6 +189,21 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
     .limit(500);
 
   for (const d of due) {
+    if (config.unlimitedGoal.verificationMode === "manual") {
+      // A mobile-supplied `source: health_connect|healthkit` label is provenance, not attestation.
+      // In production-funded challenges the automatic worker may snapshot that claim for ops, but
+      // it must never turn the claim into a paid day. An authenticated admin resolves the day via
+      // resolveUnlimitedDayVerification after checking the authoritative provider/device evidence.
+      await db
+        .update(unlimitedChallengeDaysTable)
+        .set({ status: "pending_verification", updatedAt: now })
+        .where(and(
+          eq(unlimitedChallengeDaysTable.id, d.id),
+          inArray(unlimitedChallengeDaysTable.status, ["pending", "in_progress", "pending_verification"]),
+        ));
+      continue;
+    }
+
     // Best of both lanes: what the window-mapped ingest credited to this exact day, and the
     // device-local daily total. Neither lane may silently lose steps the user really walked.
     const verified = Math.max(d.creditedSteps, await getVerifiedSteps(d.userId, d.localDate));
@@ -232,13 +247,143 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
   }
 }
 
+export type UnlimitedDayVerificationResolution = {
+  found: boolean;
+  resolved: boolean;
+  status?: string;
+  passed?: boolean;
+  authoritativeSteps?: number;
+  userId?: string;
+  challengeId?: string;
+};
+
+/**
+ * Resolve one held Unlimited day from an authenticated operations decision.
+ *
+ * The worker deliberately cannot call this: the authoritative number must cross an admin/service
+ * trust boundary, not come from POST /walk/steps. Row locking makes retries and competing decisions
+ * deterministic; an already-terminal day is returned as an idempotent no-op.
+ */
+export async function resolveUnlimitedDayVerification(input: {
+  challengeId: string;
+  dayId: string;
+  decision: "approve" | "reject";
+  authoritativeSteps?: number;
+  now?: Date;
+}): Promise<UnlimitedDayVerificationResolution> {
+  const now = input.now ?? new Date();
+  const result = await db.transaction(async (tx) => {
+    const [day] = await tx
+      .select({
+        id: unlimitedChallengeDaysTable.id,
+        challengeId: unlimitedChallengeDaysTable.challengeId,
+        participantId: unlimitedChallengeDaysTable.participantId,
+        userId: unlimitedChallengeDaysTable.userId,
+        goalSteps: unlimitedChallengeDaysTable.goalSteps,
+        status: unlimitedChallengeDaysTable.status,
+        verifiedSteps: unlimitedChallengeDaysTable.verifiedSteps,
+      })
+      .from(unlimitedChallengeDaysTable)
+      .where(and(
+        eq(unlimitedChallengeDaysTable.id, input.dayId),
+        eq(unlimitedChallengeDaysTable.challengeId, input.challengeId),
+      ))
+      .limit(1)
+      .for("update");
+
+    if (!day) return { found: false, resolved: false } as UnlimitedDayVerificationResolution;
+    if (day.status === "passed" || day.status === "failed") {
+      return {
+        found: true,
+        resolved: false,
+        status: day.status,
+        passed: day.status === "passed",
+        authoritativeSteps: day.verifiedSteps,
+        userId: day.userId,
+        challengeId: day.challengeId,
+      };
+    }
+    if (day.status !== "pending_verification") {
+      return { found: true, resolved: false, status: day.status, userId: day.userId, challengeId: day.challengeId };
+    }
+
+    const authoritativeSteps = input.decision === "approve"
+      ? Math.max(0, Math.floor(input.authoritativeSteps ?? 0))
+      : 0;
+    const passed = input.decision === "approve" && authoritativeSteps >= day.goalSteps;
+    const status = passed ? "passed" : "failed";
+
+    await tx
+      .update(unlimitedChallengeDaysTable)
+      .set({
+        status,
+        verifiedSteps: authoritativeSteps,
+        passedAt: passed ? now : null,
+        finalizedAt: now,
+        updatedAt: now,
+      })
+      .where(eq(unlimitedChallengeDaysTable.id, day.id));
+
+    if (!passed) {
+      await tx
+        .update(unlimitedChallengeParticipantsTable)
+        .set({
+          prizePoolEligibilityStatus: "not_eligible",
+          eligibilityReasonCode: input.decision === "reject" ? "verification_failed" : "daily_goal_missed",
+          eligibilityFinalizedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(unlimitedChallengeParticipantsTable.id, day.participantId));
+    }
+
+    return {
+      found: true,
+      resolved: true,
+      status,
+      passed,
+      authoritativeSteps,
+      userId: day.userId,
+      challengeId: day.challengeId,
+    } as UnlimitedDayVerificationResolution;
+  });
+
+  if (result.resolved && result.userId && result.challengeId) {
+    void emitUnlimitedRealtime(
+      result.challengeId,
+      "participant_eligibility_updated",
+      {
+        challengeId: result.challengeId,
+        userId: result.userId,
+        verificationStatus: result.status,
+      },
+      {
+        event: "race:participant-eligibility-updated",
+        payload: {
+          raceId: result.challengeId,
+          userId: result.userId,
+          verificationStatus: result.status,
+        },
+      },
+    );
+  }
+  return result;
+}
+
 async function getVerifiedSteps(userId: string, localDate: string): Promise<number> {
   const [row] = await db
-    .select({ steps: stepDailyTotalsTable.steps })
+    .select({ steps: stepDailyTotalsTable.steps, sourceClass: stepDailyTotalsTable.sourceClass })
     .from(stepDailyTotalsTable)
     .where(and(eq(stepDailyTotalsTable.userId, userId), eq(stepDailyTotalsTable.date, localDate)))
     .limit(1);
-  return row?.steps ?? 0;
+  // Only a fully Health-verified day is authoritative for a funded payout (audit 2026-08-17 B4).
+  // A "mixed" or "unverified" daily total includes provisional sensor steps that a modified
+  // client can forge simply by omitting the `source` field on /walk/steps, so it must NEVER
+  // satisfy a funded day here. The per-day creditedSteps lane (populated only from verified
+  // sessions on ingest) remains the fallback via Math.max at the call site, so a legitimate
+  // mixed day is still credited its verified portion — it just cannot be topped up from an
+  // unverified total.
+  if (!row || row.sourceClass !== "verified") return 0;
+  return row.steps ?? 0;
 }
 
 /**

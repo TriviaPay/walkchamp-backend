@@ -6,6 +6,7 @@ import {
 } from "../../db/src/schema/index.js";
 import { eq, and, sql, desc, gte, lte, asc, count, inArray } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
 import { z } from "zod";
 import { evaluateStepMilestones } from "../lib/coinsService.js";
 import { evaluateAndNotify } from "./achievementHooks.js";
@@ -23,6 +24,12 @@ import {
   classifyDailySource,
 } from "../lib/stepSources.js";
 import { triggerEvent } from "../lib/pusher.js";
+import { classifyWalkSubmission } from "../lib/walkSubmissionClassifier.js";
+import { applyRedisWalkSubmission, getRedisWalkDay, scheduleWalkSessionFinalization, seedRedisShadowDayIfMissing } from "../lib/walkRedisIngest.js";
+import { findActiveUnlimitedDaysForUser } from "../lib/unlimitedLiveProgress.js";
+import { config } from "../lib/config.js";
+import { mirrorStepLeaderboardDay } from "../lib/leaderboardProjection.js";
+import { invalidateLeaderboardSnapshots } from "../lib/leaderboardSnapshotCache.js";
 
 const router = Router();
 
@@ -126,21 +133,27 @@ async function buildWalkTodayPayload(userId: string, today: string) {
     getUserGoalAndUnit(userId),
   ]);
 
-  const steps = row?.steps ?? 0;
+  const redisDay = await getRedisWalkDay(userId, today).catch(() => null);
+  const useRedis = !!redisDay && (!row
+    || redisDay.epoch > Number(row.ingestEpoch)
+    || (redisDay.epoch === Number(row.ingestEpoch) && redisDay.version > Number(row.ingestVersion)));
+  const steps = useRedis ? redisDay.steps : (row?.steps ?? 0);
   const goal = goalData.goal;
 
   // Guard against stale/tiny stored distances (e.g. 6 m for 330 steps).
   const expectedDist = Math.round(steps * 0.762);
-  const storedDist = row?.distanceMeters ?? 0;
+  const storedDist = useRedis ? redisDay.distanceMeters : (row?.distanceMeters ?? 0);
   const distanceMeters = storedDist > 0
     && storedDist >= expectedDist * 0.1
     && storedDist < expectedDist * 100
     ? storedDist
     : expectedDist;
 
-  const calories = row?.caloriesBurned ?? Math.round(steps * 0.04);
-  const activeMinutes = row?.activeMinutes && row.activeMinutes > 0
-    ? Math.max(row.activeMinutes, Math.ceil(steps / 120))
+  const storedCalories = useRedis ? redisDay.caloriesBurned : row?.caloriesBurned;
+  const storedActiveMinutes = useRedis ? redisDay.activeMinutes : row?.activeMinutes;
+  const calories = storedCalories ?? Math.round(steps * 0.04);
+  const activeMinutes = storedActiveMinutes && storedActiveMinutes > 0
+    ? Math.max(storedActiveMinutes, Math.ceil(steps / 120))
     : Math.ceil(steps / 120);
 
   const [rankRow] = await db
@@ -234,6 +247,10 @@ const submitStepsSchema = z.object({
   timezone: z.string().trim().max(64).optional(),
   /** Opt-in cheaper response when absolute total has not increased. */
   shortUnchanged: z.boolean().optional(),
+  submissionId: z.string().uuid().optional(),
+  trackingSessionId: z.string().trim().min(1).max(128).optional(),
+  sessionStartedAtUtc: z.string().datetime().optional(),
+  sessionFinal: z.boolean().optional(),
 });
 
 /** Combine a day's existing source_class with a newly-submitted session's class. */
@@ -246,7 +263,9 @@ function combineDaySourceClass(
   return prev === incoming ? (prev as "verified" | "unverified") : "mixed";
 }
 
-router.post("/walk/steps", requireAuth, async (req, res) => {
+// requireActiveAccount (audit 2026-08-17 H4): a banned/suspended user must not be able to submit
+// steps — otherwise a valid token still lets them progress in (and win) a live race after a ban.
+router.post("/walk/steps", requireAuth, requireActiveAccount, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   // Informational only (never trusted for auth) — lets us attribute today's steps
   // per physical device so a second device's real walking is additive, not dropped
@@ -366,6 +385,77 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   // floored by whatever the row already had (never regresses pre-migration data).
   const useDeviceMerge = usingAbsolute && !!deviceId && sessionVerified;
 
+  const sessionStartedAtUtc = parsed.data.sessionStartedAtUtc
+    ? new Date(parsed.data.sessionStartedAtUtc)
+    : null;
+  if (sessionStartedAtUtc && (sessionStartedAtUtc.getTime() > receivedAt.getTime() + 5 * 60_000
+    || localDateInTimeZone(effectiveTimezone, sessionStartedAtUtc) !== today)) {
+    return res.status(400).json({ error: "Invalid tracking session start.", code: "invalid_session_start" });
+  }
+
+  let classification: Awaited<ReturnType<typeof classifyWalkSubmission>> = { path: "postgres", reason: "not_checked" };
+  if (useDeviceMerge) {
+    const activeUnlimitedDays = config.features.redisWalkShadowWrite
+      ? await findActiveUnlimitedDaysForUser(userId, receivedAt).catch(() => [{ unsafe: true }])
+      : [];
+    classification = await classifyWalkSubmission({
+      userId,
+      accountStatus: (req as AuthenticatedRequest).accountStatus,
+      verifiedSource: sessionVerified,
+      hasAbsoluteTotal: usingAbsolute,
+      deviceId,
+      localDateValid: true,
+      timezoneValid: hasTrustedTimezone,
+      hasActiveUnlimitedDay: activeUnlimitedDays.length > 0,
+    });
+    if (classification.path === "retry") {
+      const submissionId = parsed.data.submissionId ?? crypto.randomUUID();
+      return res.status(503).json({
+        error: "Step ingestion authority is changing. Retry this absolute total.",
+        code: "WALK_INGEST_RETRY", retryable: true, submissionId,
+      });
+    }
+    if (classification.path === "redis" || classification.path === "redis_shadow") {
+      const submissionId = parsed.data.submissionId ?? crypto.randomUUID();
+      try {
+        if (classification.path === "redis_shadow" && classification.epoch != null) {
+          const [previousDevice] = await db.select().from(stepDailyDeviceTotalsTable).where(and(
+            eq(stepDailyDeviceTotalsTable.userId, userId), eq(stepDailyDeviceTotalsTable.date, today),
+            eq(stepDailyDeviceTotalsTable.deviceId, deviceId!),
+          )).limit(1);
+          await seedRedisShadowDayIfMissing({
+            epoch: classification.epoch, userId, localDate: today, deviceId: deviceId!,
+            day: prevStepRow ?? null, device: previousDevice ?? null,
+          });
+        }
+        const redisDay = await applyRedisWalkSubmission({
+          submissionId, userId, deviceId: deviceId!, localDate: today, timezone: effectiveTimezone,
+          sourceClass: "verified", totalSteps, distanceMeters: totalDistMeters,
+          caloriesBurned: totalCals, activeMinutes, trackingSessionId: parsed.data.trackingSessionId,
+          sessionStartedAtUtc, sessionFinal: parsed.data.sessionFinal,
+        });
+        if (classification.path === "redis") {
+          return res.json({
+            submissionId, submitted: steps, ingest: { authority: "redis", epoch: redisDay.epoch, version: redisDay.version },
+            today: { steps: redisDay.steps, goal: DAILY_GOAL,
+              distanceKm: Number((redisDay.distanceMeters / 1000).toFixed(2)),
+              calories: redisDay.caloriesBurned, activeMinutes: redisDay.activeMinutes, dailyRank: null },
+            unlimited: { verifiedSource: true, deviceLocalDate: today, credited: [], skipped: [] },
+          });
+        }
+      } catch (err) {
+        if (classification.path === "redis") {
+          req.log.error({ err, userId, submissionId }, "indeterminate Redis walk acknowledgement");
+          return res.status(503).json({
+            error: "Step sync outcome is indeterminate. Retry this absolute total.",
+            code: "WALK_INGEST_RETRY", retryable: true, submissionId,
+          });
+        }
+        req.log.warn({ err, userId, submissionId }, "walk shadow write failed");
+      }
+    }
+  }
+
   // shortUnchanged must compare against THIS device's prior contribution when
   // multi-device merge is active — otherwise a smaller second-device reading
   // (e.g. 64) is incorrectly treated as unchanged vs the account sum (e.g. 85).
@@ -416,6 +506,7 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
   const deltaDistMeters = parsed.data.distanceMeters ?? Math.round(steps * 0.762);
   const deltaCals = parsed.data.caloriesBurned ?? Math.round(steps * 0.04);
 
+  let lifetimeTotalAfter = 0;
   await db.transaction(async (tx) => {
     if (useDeviceMerge) {
       await tx
@@ -476,10 +567,13 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
         set: useDeviceMerge
           ? allowRolloverReplace
             ? {
-                steps: sql`(
+                // LEAST(200000, …) caps the summed account total (audit 2026-08-17 M5): x-device-id
+                // is a client-controlled header, so rotating it fabricates device lanes and would
+                // otherwise multiply the SUM without bound. 200k matches the per-submission cap.
+                steps: sql`LEAST(200000, (
                   SELECT COALESCE(SUM(steps), 0) FROM step_daily_device_totals
                   WHERE user_id = ${userId} AND date = ${today}
-                )`,
+                ))`,
                 distanceMeters: sql`(
                   SELECT COALESCE(SUM(distance_meters), 0) FROM step_daily_device_totals
                   WHERE user_id = ${userId} AND date = ${today}
@@ -497,10 +591,12 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
               // (GREATEST-protected) reading — computed inside this transaction so
               // concurrent syncs from two devices can't clobber each other. Floored
               // by the existing row so pre-migration single-device totals never drop.
-              steps: sql`GREATEST(${stepDailyTotalsTable.steps}, (
+              // LEAST(200000, …) caps the SUM so a rotated x-device-id header can't
+              // fabricate lanes to inflate the total without bound (audit 2026-08-17 M5).
+              steps: sql`GREATEST(${stepDailyTotalsTable.steps}, LEAST(200000, (
                 SELECT COALESCE(SUM(steps), 0) FROM step_daily_device_totals
                 WHERE user_id = ${userId} AND date = ${today}
-              ))`,
+              )))`,
               distanceMeters: sql`GREATEST(${stepDailyTotalsTable.distanceMeters}, (
                 SELECT COALESCE(SUM(distance_meters), 0) FROM step_daily_device_totals
                 WHERE user_id = ${userId} AND date = ${today}
@@ -549,18 +645,35 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
             },
       });
 
-    // Log session — always records the delta for historical session analysis.
-    await tx.insert(stepSessionsTable).values({
-      userId,
-      steps,
-      distanceMeters: deltaDistMeters,
-      caloriesBurned: deltaCals,
-      durationSeconds,
-      endedAt: new Date(),
-      isSynced: true,
-      source: source ?? null,
-      isVerifiedSource: sessionVerified,
-    });
+    const ingestSessionKey = parsed.data.trackingSessionId
+      ? `${userId}:${parsed.data.trackingSessionId}`
+      : null;
+    const sessionValues = {
+      userId, steps, distanceMeters: deltaDistMeters, caloriesBurned: deltaCals,
+      durationSeconds, startedAt: sessionStartedAtUtc ?? receivedAt,
+      endedAt: parsed.data.sessionFinal ? receivedAt : (ingestSessionKey ? null : receivedAt),
+      lastActivityAt: receivedAt, sessionFinal: parsed.data.sessionFinal ?? !ingestSessionKey,
+      ingestSessionKey, isSynced: true, source: source ?? null, isVerifiedSource: sessionVerified,
+    };
+    if (ingestSessionKey) {
+      await tx.insert(stepSessionsTable).values(sessionValues).onConflictDoUpdate({
+        target: [stepSessionsTable.ingestSessionKey],
+        set: {
+          steps: sql`GREATEST(${stepSessionsTable.steps}, ${steps})`,
+          distanceMeters: sql`GREATEST(${stepSessionsTable.distanceMeters}, ${deltaDistMeters})`,
+          caloriesBurned: sql`GREATEST(${stepSessionsTable.caloriesBurned}, ${deltaCals})`,
+          durationSeconds: sql`GREATEST(${stepSessionsTable.durationSeconds}, ${durationSeconds})`,
+          endedAt: parsed.data.sessionFinal ? receivedAt : null,
+          lastActivityAt: receivedAt,
+          sessionFinal: parsed.data.sessionFinal ?? false,
+          isSynced: true,
+          source: source ?? null,
+          isVerifiedSource: sessionVerified,
+        },
+      });
+    } else {
+      await tx.insert(stepSessionsTable).values(sessionValues);
+    }
 
     // Recompute lifetime total from daily totals — prevents double-counting across
     // multiple syncs of the same session (absolute-mode GREATEST keeps the row accurate).
@@ -569,6 +682,7 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
       .from(stepDailyTotalsTable)
       .where(eq(stepDailyTotalsTable.userId, userId));
     const lifetimeTotal = lifeRow?.total ?? 0;
+    lifetimeTotalAfter = lifetimeTotal;
 
     await tx
       .update(profilesTable)
@@ -578,6 +692,14 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
       })
       .where(eq(profilesTable.id, userId));
   });
+
+  if (parsed.data.trackingSessionId) {
+    void scheduleWalkSessionFinalization(
+      `${userId}:${parsed.data.trackingSessionId}`,
+      receivedAt,
+      parsed.data.sessionFinal ?? false,
+    ).catch(() => {});
+  }
 
   // ── Streak calculation ── (fire-and-forget so step sync never fails on this)
   (async () => {
@@ -663,6 +785,7 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
               },
             });
         }
+        void invalidateLeaderboardSnapshots("group").catch(() => {});
       } catch (_) {}
     };
     syncToGroups();
@@ -930,6 +1053,10 @@ router.post("/walk/steps", requireAuth, async (req, res) => {
       sql`${stepDailyTotalsTable.steps} > ${rowSteps}`,
     ));
   const syncDailyRank = rowSteps > 0 ? (syncRankRow?.countAbove ?? 0) + 1 : null;
+
+  void mirrorStepLeaderboardDay({
+    userId, localDate: today, previousSteps, steps: rowSteps, lifetime: lifetimeTotalAfter,
+  }).catch(() => {});
 
   return res.json({
     submitted: steps,
