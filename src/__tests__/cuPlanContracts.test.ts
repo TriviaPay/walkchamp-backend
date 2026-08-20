@@ -1,5 +1,4 @@
-import { readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { computeOutboxDelayMs } from "../lib/outbox.js";
 
@@ -11,9 +10,12 @@ describe("CU rollout safety contracts", () => {
 
   it("keeps daily step table writes inside the walk route/checkpoint service", () => {
     const root = new URL("../../", import.meta.url).pathname;
-    const output = execFileSync("rg", ["-l", "(insert|update)\\(stepDaily(Device)?TotalsTable", "src"], {
-      cwd: root, encoding: "utf8",
-    }).trim().split("\n").filter(Boolean);
+    const writerPattern = /(insert|update)\(stepDaily(Device)?TotalsTable/;
+    const output = readdirSync(`${root}/src`, { recursive: true })
+      .map(String)
+      .filter((path) => path.endsWith(".ts"))
+      .filter((path) => writerPattern.test(readFileSync(`${root}/src/${path}`, "utf8")))
+      .map((path) => `src/${path}`);
     expect(output.sort()).toEqual(["src/lib/walkRedisIngest.ts", "src/routes/walk.ts"]);
   });
 
