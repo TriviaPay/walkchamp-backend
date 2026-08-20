@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+if [ -z "${REDIS_PASSWORD:-}" ]; then
+  echo "[startup] REDIS_PASSWORD is required at runtime" >&2
+  exit 1
+fi
+
 # The api container owns schema migrations. Running them here — rather than from Coolify's
 # pre/post-deployment hooks — is what makes an automated deploy safe:
 #

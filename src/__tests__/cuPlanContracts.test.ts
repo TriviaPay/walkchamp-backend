@@ -38,4 +38,15 @@ describe("CU rollout safety contracts", () => {
     expect(completion).toContain("walk checkpoint barrier unsatisfied — settlement deferred");
     expect(completion).not.toContain("finalizing on last checkpoint");
   });
+
+  it("keeps Redis credentials runtime-only and fails closed at process startup", () => {
+    const root = new URL("../../", import.meta.url).pathname;
+    const compose = readFileSync(`${root}/docker-compose.coolify.yml`, "utf8");
+    const apiEntrypoint = readFileSync(`${root}/deploy/coolify/api-entrypoint.sh`, "utf8");
+    const workerEntrypoint = readFileSync(`${root}/deploy/coolify/worker-entrypoint.sh`, "utf8");
+    expect(compose).not.toContain("REDIS_PASSWORD:?REDIS_PASSWORD");
+    expect(compose).toContain("REDIS_PASSWORD: ${REDIS_PASSWORD:-}");
+    expect(apiEntrypoint).toContain('if [ -z "${REDIS_PASSWORD:-}" ]');
+    expect(workerEntrypoint).toContain('if [ -z "${REDIS_PASSWORD:-}" ]');
+  });
 });

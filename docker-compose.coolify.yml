@@ -25,10 +25,14 @@ x-app-env: &app-env
   # All three Redis instances require auth (audit 2026-08-16 F-06): network isolation alone is
   # one compose edit away from being gone, and an unauthenticated redis-queue is the BullMQ
   # settlement pipeline. Use a URL-safe password (alphanumeric) — it is spliced into these URLs.
-  REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis-cache:6379
-  REDIS_CACHE_URL: redis://:${REDIS_PASSWORD}@redis-cache:6379
-  REDIS_QUEUE_URL: redis://:${REDIS_PASSWORD}@redis-queue:6379
-  REDIS_LIVE_URL: redis://:${REDIS_PASSWORD}@redis-live:6379
+  # Coolify renders this compose file once during image build, when runtime-only
+  # secrets are deliberately unavailable. Empty defaults let that build render;
+  # both process entrypoints fail closed before startup if the runtime value is absent.
+  REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+  REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis-cache:6379
+  REDIS_CACHE_URL: redis://:${REDIS_PASSWORD:-}@redis-cache:6379
+  REDIS_QUEUE_URL: redis://:${REDIS_PASSWORD:-}@redis-queue:6379
+  REDIS_LIVE_URL: redis://:${REDIS_PASSWORD:-}@redis-live:6379
   DATABASE_RUNTIME_URL: ${DATABASE_RUNTIME_URL:?DATABASE_RUNTIME_URL is required}
   DATABASE_ADMIN_URL: ${DATABASE_ADMIN_URL:?DATABASE_ADMIN_URL is required}
   DESCOPE_PROJECT_ID: ${DESCOPE_PROJECT_ID:?DESCOPE_PROJECT_ID is required}
@@ -187,11 +191,11 @@ services:
     restart: unless-stopped
     mem_limit: ${REDIS_CACHE_CONTAINER_MEMORY:-384m}
     environment:
-      REDISCLI_AUTH: ${REDIS_PASSWORD}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-}
     command:
       - redis-server
       - --requirepass
-      - ${REDIS_PASSWORD}
+      - ${REDIS_PASSWORD:-}
       - --save
       - ""
       - --appendonly
@@ -212,11 +216,11 @@ services:
     restart: unless-stopped
     mem_limit: ${REDIS_QUEUE_CONTAINER_MEMORY:-768m}
     environment:
-      REDISCLI_AUTH: ${REDIS_PASSWORD}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-}
     command:
       - redis-server
       - --requirepass
-      - ${REDIS_PASSWORD}
+      - ${REDIS_PASSWORD:-}
       - --appendonly
       - "yes"
       - --appendfsync
@@ -251,13 +255,13 @@ services:
     restart: unless-stopped
     mem_limit: ${REDIS_LIVE_CONTAINER_MEMORY:-512m}
     environment:
-      REDISCLI_AUTH: ${REDIS_PASSWORD}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-}
     # AOF everysec only (no RDB save points). AOF already bounds loss to ~1s; skipping RDB
     # avoids fork/COW memory spikes on this tight-headroom instance under write load.
     command:
       - redis-server
       - --requirepass
-      - ${REDIS_PASSWORD}
+      - ${REDIS_PASSWORD:-}
       - --appendonly
       - "yes"
       - --appendfsync

@@ -1,6 +1,11 @@
 #!/bin/sh
 set -eu
 
+if [ -z "${REDIS_PASSWORD:-}" ]; then
+  echo "[startup] REDIS_PASSWORD is required at runtime" >&2
+  exit 1
+fi
+
 heartbeat_file="${WORKER_HEARTBEAT_FILE:-/tmp/worker-heartbeat}"
 heartbeat_interval="${WORKER_HEARTBEAT_INTERVAL_SECONDS:-30}"
 
