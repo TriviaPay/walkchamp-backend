@@ -51,6 +51,7 @@ describe("account deletion request email", () => {
     expect(body.username).toBe("walker123");
     expect(body.notes).toBe("Please remove my account and associated profile data.");
     expect(body._captcha).toBe("false");
+    expect(body._url).toBe("https://www.miragaming.com/walkchamp/delete-account");
   });
 
   it("fails when FormSubmit does not accept the request", async () => {

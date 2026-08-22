@@ -73,6 +73,7 @@ export async function sendAccountDeletionRequestEmail(
           _subject: subject,
           _template: "table",
           _captcha: "false",
+          _url: "https://www.miragaming.com/walkchamp/delete-account",
         }),
         signal: controller.signal,
       });
