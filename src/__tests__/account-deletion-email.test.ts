@@ -35,15 +35,31 @@ describe("account deletion request email", () => {
     expect(body.text).not.toContain("password");
   });
 
-  it("refuses to send account identifiers when the mail provider is not configured", async () => {
-    const fetchImpl = vi.fn<typeof fetch>();
+  it("uses the same FormSubmit fallback as the Mira Gaming contact form when Resend is not configured", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response('{"success":"true"}', { status: 200 }));
 
     await expect(sendAccountDeletionRequestEmail(request, {
       fetchImpl,
       resendApiKey: null,
-    })).rejects.toThrow("not configured");
+    })).resolves.toBe("formsubmit");
 
-    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(fetchImpl).toHaveBeenCalledOnce();
+    const [url, init] = fetchImpl.mock.calls[0];
+    expect(url).toBe("https://formsubmit.co/ajax/admin@miragaming.com");
+    const body = JSON.parse(String(init?.body));
+    expect(body.email).toBe("walker@example.com");
+    expect(body.username).toBe("walker123");
+    expect(body.notes).toBe("Please remove my account and associated profile data.");
+    expect(body._captcha).toBe("false");
+  });
+
+  it("fails when FormSubmit does not accept the request", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(new Response('{"success":"false"}', { status: 200 }));
+
+    await expect(sendAccountDeletionRequestEmail(request, {
+      fetchImpl,
+      resendApiKey: null,
+    })).rejects.toThrow("did not accept");
   });
 
   it("fails when the mail provider does not accept the request", async () => {

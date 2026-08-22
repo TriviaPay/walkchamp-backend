@@ -12,7 +12,7 @@ export type AccountDeletionEmailInput = {
   requestedAt: Date;
 };
 
-export type AccountDeletionEmailProvider = "resend";
+export type AccountDeletionEmailProvider = "resend" | "formsubmit";
 
 type SendOptions = {
   fetchImpl?: typeof fetch;
@@ -39,9 +39,8 @@ function accountDeletionMessage(input: AccountDeletionEmailInput): string {
 }
 
 /**
- * Sends an account-deletion request to the admin mailbox through the server-side mail provider.
- * Account identifiers must never be submitted from the browser directly to a third-party form
- * relay; only the backend holds this credential and performs delivery.
+ * Sends an account-deletion request to the admin mailbox. Resend is preferred when configured;
+ * otherwise this uses the same FormSubmit relay approved for the Mira Gaming website.
  */
 export async function sendAccountDeletionRequestEmail(
   input: AccountDeletionEmailInput,
@@ -57,7 +56,33 @@ export async function sendAccountDeletionRequestEmail(
   const timeout = setTimeout(() => controller.abort(), EMAIL_TIMEOUT_MS);
 
   try {
-    if (!resendApiKey) throw new Error("Account-deletion email is not configured");
+    if (!resendApiKey) {
+      const response = await fetchImpl(`https://formsubmit.co/ajax/${to}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          name: input.fullName || "WalkChamp user",
+          email: input.email,
+          username: input.username || "Not provided",
+          notes: input.notes || "Not provided",
+          message: text,
+          request_type: "WalkChamp account deletion",
+          _subject: subject,
+          _template: "table",
+          _captcha: "false",
+        }),
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`FormSubmit rejected account-deletion email (${response.status})`);
+      const result = await response.json() as { success?: string | boolean };
+      if (result.success !== "true" && result.success !== true) {
+        throw new Error("FormSubmit did not accept account-deletion email");
+      }
+      return "formsubmit";
+    }
 
     const response = await fetchImpl("https://api.resend.com/emails", {
       method: "POST",
