@@ -20,3 +20,4 @@
 -- while this unique index is built in production.
 
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "step_sessions_ingest_session_key_idx" ON "step_sessions" ("ingest_session_key");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "race_participants_user_room_idx" ON "race_participants" ("user_id", "race_room_id");

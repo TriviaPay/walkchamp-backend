@@ -34,6 +34,10 @@ import { normalizeCountryCode } from "../lib/country.js";
 import { isRewardedRaceWinResult } from "../lib/leaderboardPredicates.js";
 import { fetchTotalRaceWinningsCents } from "../lib/raceWinnings.js";
 import { getProfileAvatarProjection, setProfileAvatarProjection } from "../lib/profileProjection.js";
+import {
+  emptyChallengeParticipationBreakdown,
+  fetchChallengeParticipationBreakdown,
+} from "../lib/challengeParticipation.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -208,6 +212,7 @@ router.get("/profile/me", requireAuth, async (req, res) => {
     stepSourceResult,
     rankCountResult,
     totalWinningResult,
+    challengeParticipationResult,
   ] = await Promise.allSettled([
     db.select({ steps: stepDailyTotalsTable.steps })
       .from(stepDailyTotalsTable)
@@ -262,6 +267,7 @@ router.get("/profile/me", requireAuth, async (req, res) => {
         notInArray(profilesTable.accountStatus, ["banned", "deleted"]),
       )),
     fetchTotalRaceWinningsCents(db, userId),
+    fetchChallengeParticipationBreakdown(db, userId),
   ]);
 
   // Safely unwrap each settled result with a fallback
@@ -274,9 +280,12 @@ router.get("/profile/me", requireAuth, async (req, res) => {
   const stepSourceRows     = stepSourceResult.status   === "fulfilled" ? stepSourceResult.value   : [];
   const rankCountRows      = rankCountResult.status    === "fulfilled" ? rankCountResult.value    : [];
   const totalWinningCents  = totalWinningResult.status === "fulfilled" ? totalWinningResult.value : 0;
+  const challengeParticipation = challengeParticipationResult.status === "fulfilled"
+    ? challengeParticipationResult.value
+    : emptyChallengeParticipationBreakdown();
 
   // Log any query failures for debugging without crashing
-  [todayResult, allRaceResult, activeTitleResult, streakResult, coinBalResult, challengeHistResult, stepSourceResult, rankCountResult, totalWinningResult]
+  [todayResult, allRaceResult, activeTitleResult, streakResult, coinBalResult, challengeHistResult, stepSourceResult, rankCountResult, totalWinningResult, challengeParticipationResult]
     .forEach((r, i) => { if (r.status === "rejected") req.log.warn({ i, err: String(r.reason) }, "profile query partial failure"); });
 
   const w              = wallets[0];
@@ -348,6 +357,7 @@ router.get("/profile/me", requireAuth, async (req, res) => {
         coinsEarned:  coinBalRows[0]?.lifetimeEarned ?? 0,
         globalRank:   (rankCountRows[0]?.cnt ?? 0) + 1,
         totalWinning:  totalWinningCents / 100,
+        challengeParticipationBreakdown: challengeParticipation,
       },
       wallet: {
         availableBalance:    (w?.availableBalanceCents    ?? 0) / 100,
@@ -589,7 +599,7 @@ router.get("/profile/public/:username", async (req, res) => {
   // long an account has existed. The all-time total is aggregated in SQL rather than by
   // transferring every daily row, and the streak scan is capped — a streak cannot extend past
   // the first gap, so PUBLIC_STREAK_SCAN_DAYS of history is always enough to compute it.
-  const [raceRows, pubStreakRows, [pubAllTimeRow], pubPrefs] = await Promise.all([
+  const [raceRows, pubStreakRows, [pubAllTimeRow], pubPrefs, challengeParticipation] = await Promise.all([
     db.select({
         rank: raceResultsTable.rank,
         prizeCents: raceResultsTable.prizeCents,
@@ -611,6 +621,8 @@ router.get("/profile/public/:username", async (req, res) => {
       .where(eq(userPreferencesTable.userId, p.id))
       .limit(1)
       .catch(() => []),
+    fetchChallengeParticipationBreakdown(db, p.id)
+      .catch(() => emptyChallengeParticipationBreakdown()),
   ]);
 
   const pubAllTime = Number(pubAllTimeRow?.total ?? 0);
@@ -640,6 +652,7 @@ router.get("/profile/public/:username", async (req, res) => {
         racesWon:        raceRows.filter(isRaceWinResult).length,
         top3Finishes:    raceRows.filter((r) => isRacePodiumRank(r.rank)).length,
         totalWinning:     pubTotalWinningCents / 100,
+        challengeParticipationBreakdown: challengeParticipation,
       },
     },
   });
@@ -669,7 +682,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
 
   if (!p) return res.status(404).json({ error: "User not found" });
 
-  const [raceRows, titleRow, friendRow, reqRow, coinRow, totalWinningCents] = await Promise.all([
+  const [raceRows, titleRow, friendRow, reqRow, coinRow, totalWinningCents, challengeParticipation] = await Promise.all([
     db.select({ rank: raceResultsTable.rank, eligibleForPrize: raceResultsTable.eligibleForPrize })
       .from(raceResultsTable)
       .where(eq(raceResultsTable.userId, targetId)),
@@ -701,6 +714,8 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
       .limit(1)
       .then((r) => r[0] ?? null),
     fetchTotalRaceWinningsCents(db, targetId).catch(() => 0),
+    fetchChallengeParticipationBreakdown(db, targetId)
+      .catch(() => emptyChallengeParticipationBreakdown()),
   ]);
 
   let friendStatus: "none" | "pending_sent" | "pending_received" | "friends" = "none";
@@ -734,6 +749,7 @@ router.get("/users/:userId/public-profile", requireAuth, async (req, res) => {
       racesPlayed:       raceRows.length,
       raceWins:          raceRows.filter(isRaceWinResult).length,
       currentStreakDays:  p.currentStreak ?? 0,
+      challengeParticipationBreakdown: challengeParticipation,
     },
   });
 });
