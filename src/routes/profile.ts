@@ -38,6 +38,7 @@ import {
   emptyChallengeParticipationBreakdown,
   fetchChallengeParticipationBreakdown,
 } from "../lib/challengeParticipation.js";
+import { sendAccountDeletionRequestEmail } from "../lib/accountDeletionEmail.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -57,6 +58,18 @@ const uploadLimiter: RequestHandler = config.features.rateLimitingEnabled
       failureMode: "closed",
       message: "Too many upload attempts — please try again later.",
       code: "UPLOAD_RATE_LIMITED",
+      key: rateLimitByActorOrIp,
+      dimensions: ["actor", "ip", "device", "token"],
+    })
+  : (_req, _res, next) => next();
+const accountDeletionRequestLimiter: RequestHandler = config.features.rateLimitingEnabled
+  ? createRedisRateLimit({
+      bucket: "account-deletion-request",
+      windowMs: 60 * 60 * 1000,
+      max: 3,
+      failureMode: "closed",
+      message: "Too many account deletion requests — please try again later.",
+      code: "DELETION_REQUEST_RATE_LIMITED",
       key: rateLimitByActorOrIp,
       dimensions: ["actor", "ip", "device", "token"],
     })
@@ -804,6 +817,98 @@ router.post("/me/step-source", requireAuth, async (req, res) => {
 
   req.log.info({ userId, platform, permission_status }, "step source upserted");
   return res.json({ success: true });
+});
+
+const publicAccountDeletionRequestSchema = z.object({
+  email: z.string().trim().email().max(254),
+  username: z.string().trim().max(64).optional(),
+  website: z.string().max(200).optional(),
+});
+
+// ── POST /api/account-deletion-request ───────────────────────────────────────
+// Public counterpart for www.miragaming.com/walkchamp/delete-account. It does not look up or mutate an account;
+// support verifies ownership before using the authenticated deletion procedure.
+router.post("/account-deletion-request", accountDeletionRequestLimiter, async (req, res) => {
+  const parsed = publicAccountDeletionRequestSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: "Enter a valid account email and username.", code: "INVALID_REQUEST" });
+  }
+
+  // Honeypot: acknowledge bot submissions without sending email.
+  if (parsed.data.website?.trim()) return res.status(202).json({ success: true });
+
+  try {
+    const provider = await sendAccountDeletionRequestEmail({
+      source: "public_web_form",
+      email: parsed.data.email,
+      username: parsed.data.username || null,
+      requestedAt: new Date(),
+    });
+
+    req.log.info({ provider }, "public account deletion request emailed to admin");
+    return res.status(202).json({
+      success: true,
+      message: "Your account deletion request was sent to the WalkChamp team.",
+    });
+  } catch (err) {
+    req.log.error({ err }, "public account deletion request email failed");
+    return res.status(502).json({
+      error: "We couldn't send your deletion request. Please try again.",
+      code: "DELETION_EMAIL_FAILED",
+    });
+  }
+});
+
+// ── POST /api/me/account/deletion-request ────────────────────────────────────
+// The app uses this reviewed deletion flow: an authenticated request is emailed to the admin
+// mailbox, then the user sees a success popup. Identity comes from the session/database rather
+// than client-supplied fields so another person's account cannot be named in the request.
+router.post("/me/account/deletion-request", requireAuth, accountDeletionRequestLimiter, async (req, res) => {
+  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const [profile] = await db
+    .select({
+      email: profilesTable.email,
+      username: profilesTable.username,
+      fullName: profilesTable.fullName,
+    })
+    .from(profilesTable)
+    .where(eq(profilesTable.id, userId))
+    .limit(1);
+
+  if (!profile) return res.status(404).json({ error: "Profile not found.", code: "PROFILE_NOT_FOUND" });
+
+  try {
+    const provider = await sendAccountDeletionRequestEmail({
+      source: "authenticated_app",
+      userId,
+      email: profile.email,
+      username: profile.username,
+      fullName: profile.fullName,
+      requestedAt: new Date(),
+    });
+
+    void writeAuditLog({
+      actorUserId: userId,
+      actorType: "user",
+      action: "account_deletion_requested",
+      entityType: "profile",
+      entityId: userId,
+      reason: "self_service_email_request",
+      metadata: { provider },
+    });
+
+    req.log.info({ userId, provider }, "account deletion request emailed to admin");
+    return res.status(202).json({
+      success: true,
+      message: "Your account deletion request was sent to the WalkChamp team.",
+    });
+  } catch (err) {
+    req.log.error({ err, userId }, "account deletion request email failed");
+    return res.status(502).json({
+      error: "We couldn't send your deletion request. Please try again.",
+      code: "DELETION_EMAIL_FAILED",
+    });
+  }
 });
 
 // ── DELETE /api/me/account ────────────────────────────────────────────────────

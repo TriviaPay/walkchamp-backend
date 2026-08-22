@@ -56,3 +56,38 @@ describe("DELETE /api/me/account", () => {
     expect(handler).toContain('action: "account_deleted"');
   });
 });
+
+describe("POST /api/me/account/deletion-request", () => {
+  const source = readFileSync("src/routes/profile.ts", "utf8");
+  const handler = source.slice(
+    source.indexOf('router.post("/me/account/deletion-request"'),
+    source.indexOf('// ── DELETE /api/me/account'),
+  );
+
+  it("requires auth, rate limits requests, and emails server-owned profile identity", () => {
+    expect(handler.startsWith('router.post("/me/account/deletion-request", requireAuth, accountDeletionRequestLimiter')).toBe(true);
+    expect(handler).toContain("profilesTable.email");
+    expect(handler).toContain("profilesTable.username");
+    expect(handler).toContain("sendAccountDeletionRequestEmail");
+    expect(handler).toContain('action: "account_deletion_requested"');
+    expect(handler).toContain("res.status(202)");
+  });
+});
+
+describe("POST /api/account-deletion-request", () => {
+  const source = readFileSync("src/routes/profile.ts", "utf8");
+  const handler = source.slice(
+    source.indexOf('router.post("/account-deletion-request"'),
+    source.indexOf('// ── POST /api/me/account/deletion-request'),
+  );
+
+  it("rate limits the public form, validates its input, and emails without mutating an account", () => {
+    expect(handler.startsWith('router.post("/account-deletion-request", accountDeletionRequestLimiter')).toBe(true);
+    expect(handler).toContain("publicAccountDeletionRequestSchema.safeParse");
+    expect(handler).toContain('source: "public_web_form"');
+    expect(handler).toContain("sendAccountDeletionRequestEmail");
+    expect(handler).toContain("res.status(202)");
+    expect(handler).not.toContain("db.update");
+    expect(handler).not.toContain("db.delete");
+  });
+});
