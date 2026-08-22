@@ -8,6 +8,7 @@ export type AccountDeletionEmailInput = {
   username?: string | null;
   email: string;
   fullName?: string | null;
+  notes?: string | null;
   requestedAt: Date;
 };
 
@@ -30,6 +31,7 @@ function accountDeletionMessage(input: AccountDeletionEmailInput): string {
     `Username: ${input.username || "Not provided"}`,
     `Registered email: ${input.email}`,
     `User ID: ${input.userId || "Not available"}`,
+    `Notes: ${input.notes || "Not provided"}`,
     `Requested at: ${input.requestedAt.toISOString()}`,
     "",
     "Please review and process this request according to the account-deletion procedure.",

@@ -84,6 +84,7 @@ describe("POST /api/account-deletion-request", () => {
   it("rate limits the public form, validates its input, and emails without mutating an account", () => {
     expect(handler.startsWith('router.post("/account-deletion-request", accountDeletionRequestLimiter')).toBe(true);
     expect(handler).toContain("publicAccountDeletionRequestSchema.safeParse");
+    expect(handler).toContain("notes: parsed.data.notes || null");
     expect(handler).toContain('source: "public_web_form"');
     expect(handler).toContain("sendAccountDeletionRequestEmail");
     expect(handler).toContain("res.status(202)");

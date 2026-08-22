@@ -822,6 +822,7 @@ router.post("/me/step-source", requireAuth, async (req, res) => {
 const publicAccountDeletionRequestSchema = z.object({
   email: z.string().trim().email().max(254),
   username: z.string().trim().max(64).optional(),
+  notes: z.string().trim().max(2000).optional(),
   website: z.string().max(200).optional(),
 });
 
@@ -842,6 +843,7 @@ router.post("/account-deletion-request", accountDeletionRequestLimiter, async (r
       source: "public_web_form",
       email: parsed.data.email,
       username: parsed.data.username || null,
+      notes: parsed.data.notes || null,
       requestedAt: new Date(),
     });
 

@@ -7,6 +7,7 @@ const request = {
   username: "walker123",
   email: "walker@example.com",
   fullName: "Test Walker",
+  notes: "Please remove my account and associated profile data.",
   requestedAt: new Date("2026-08-22T12:00:00.000Z"),
 };
 
@@ -30,6 +31,7 @@ describe("account deletion request email", () => {
     expect(body.to).toEqual(["admin@miragaming.com"]);
     expect(body.reply_to).toBe("walker@example.com");
     expect(body.text).toContain("Username: walker123");
+    expect(body.text).toContain("Notes: Please remove my account and associated profile data.");
     expect(body.text).not.toContain("password");
   });
 
