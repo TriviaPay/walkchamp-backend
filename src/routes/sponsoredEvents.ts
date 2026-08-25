@@ -15,10 +15,8 @@ import { triggerEvent } from "../lib/pusher.js";
 import { getCoinBalance, recordCoinLedgerEntry } from "../lib/coinsService.js";
 import { logger } from "../lib/logger.js";
 import { joinOrReviveParticipant, lockRaceRoom, lockScheduledRegistration, registerOrReviveScheduledRegistration } from "../lib/raceIntegrity.js";
-import { markRaceActive } from "../lib/raceRegistry.js";
-import { resolveLiveStateModeForNewRace, initializeRaceLiveState } from "../lib/raceLiveHydration.js";
 import { notifyPromotionalSponsoredEvent } from "../lib/pushNotificationService.js";
-import { autoCompleteRace } from "./races.js";
+import { activateRoomAndStart, autoCompleteRace } from "./races.js";
 import { enqueueOutboxEvent, insertOutboxEventTx } from "../lib/outbox.js";
 import {
   getSponsoredAwardedWinnerCount,
@@ -30,6 +28,7 @@ import {
   SPONSORED_EVENT_PRIZE_PER_WINNER_CENTS,
   SPONSORED_EVENT_TARGET_STEPS,
 } from "../lib/sponsoredEventRules.js";
+import { currentProtectedPolicySnapshot } from "../lib/protectedRacePolicy.js";
 
 const router = Router();
 
@@ -146,6 +145,11 @@ export async function autoFillSchedule(): Promise<void> {
       type: "sponsored",
       entryType: "free",
       entryAmountCents: 0,
+      protectedRace: true,
+      protectionPolicyVersion: currentProtectedPolicySnapshot().policyVersion,
+      protectedDurationMinutes: 180,
+      protectedPolicySnapshot: currentProtectedPolicySnapshot(),
+      adjudicationStatus: "pending_verification",
       targetSteps: TARGET_STEPS,
       maxPlayers: MAX_SLOTS,
       status: "scheduled",
@@ -243,7 +247,7 @@ export async function processSponsuredEvents(onlyRoomId?: string) {
         .where(
           and(
             eq(scheduledRoomRegistrationsTable.raceRoomId, room.id),
-            eq(scheduledRoomRegistrationsTable.status, "registered"),
+            inArray(scheduledRoomRegistrationsTable.status, ["registered", "activated"]),
           ),
         );
 
@@ -258,87 +262,20 @@ export async function processSponsuredEvents(onlyRoomId?: string) {
         continue;
       }
 
-      logger.info({ roomId: room.id, count: paidUserIds.length }, "[SponsoredEventsJob] event started");
-      await db.transaction(async (tx) => {
-        const lockedRoom = await lockRaceRoom(tx, room.id);
-        if (!lockedRoom || lockedRoom.status !== "scheduled") return;
-
-        await tx
-          .update(raceRoomsTable)
-          .set({
-            status: "in_progress",
-            startedAt: now,
-            updatedAt: now,
-            registeredCount: paidUserIds.length,
-            liveStateMode: resolveLiveStateModeForNewRace(),
-          })
-          .where(eq(raceRoomsTable.id, room.id));
-
-        if (paidUserIds.length === 0) {
-          await tx
-            .update(raceRoomsTable)
-            .set({ currentPlayers: 0, updatedAt: now })
-            .where(eq(raceRoomsTable.id, room.id));
-          return;
-        }
-
-        await tx
-          .update(scheduledRoomRegistrationsTable)
-          .set({ status: "active", activatedAt: now })
-          .where(
-            and(
-              eq(scheduledRoomRegistrationsTable.raceRoomId, room.id),
-              inArray(scheduledRoomRegistrationsTable.userId, paidUserIds),
-            ),
-          );
-
-        let insertedCount = 0;
-        for (const uid of paidUserIds) {
-          const [existingActive] = await tx
-            .select({ id: raceParticipantsTable.id })
-            .from(raceParticipantsTable)
-            .innerJoin(raceRoomsTable, eq(raceRoomsTable.id, raceParticipantsTable.raceRoomId))
-            .where(
-              and(
-                eq(raceParticipantsTable.userId, uid),
-                inArray(raceParticipantsTable.status, ["joined", "active"]),
-                inArray(raceRoomsTable.status, ["open", "full", "in_progress"]),
-                ne(raceRoomsTable.id, room.id),
-              ),
-            )
-            .limit(1);
-
-          if (existingActive) {
-            logger.info({ roomId: room.id, uid }, "[SponsoredEventsJob] skip user — already in active race");
-            continue;
-          }
-
-          const lockedReg = await lockScheduledRegistration(tx, room.id, uid);
-          if (!lockedReg || (lockedReg.status !== "active" && lockedReg.status !== "registered")) {
-            continue;
-          }
-
-          const participantResult = await joinOrReviveParticipant(tx, {
-            raceRoomId: room.id,
-            userId: uid,
-            currentSteps: 0,
-            raceBaselineSteps: 0,
-          });
-          if (participantResult.changed) {
-            insertedCount += 1;
-          }
-        }
-
-        await tx
-          .update(raceRoomsTable)
-          .set({ currentPlayers: insertedCount, updatedAt: now })
-          .where(eq(raceRoomsTable.id, room.id));
+      const activation = await activateRoomAndStart(room.id, {
+        fromStatuses: ["scheduled"],
+        materializeRegistrations: true,
       });
-
-      // Register the live sponsored race (3h window) so the idle-gated cleanup considers it.
-      void markRaceActive(room.id, now.getTime() + 3 * 60 * 60_000);
-      // Seed redis-live if this race started in redis mode (no-op otherwise).
-      void initializeRaceLiveState(room.id);
+      if (!activation.ok) {
+        logger.warn({ roomId: room.id, body: activation.body }, "[SponsoredEventsJob] protected event start deferred");
+        continue;
+      }
+      logger.info({ roomId: room.id, count: paidUserIds.length }, "[SponsoredEventsJob] event started");
+      await db.update(scheduledRoomRegistrationsTable).set({ status: "active", activatedAt: now })
+        .where(and(
+          eq(scheduledRoomRegistrationsTable.raceRoomId, room.id),
+          inArray(scheduledRoomRegistrationsTable.status, ["activated", "registered"]),
+        ));
 
       triggerEvent(PUSHER_CHANNEL, "sponsored_event.started", {
         room_id: room.id,
@@ -573,6 +510,10 @@ export async function getSponsoredEventsForUser(
       scheduledStartAt: r.scheduledStartAt?.toISOString() ?? null,
       startedAt: r.startedAt?.toISOString() ?? null,
       endsAt: endsAtDate?.toISOString() ?? null,
+      protectedRace: r.protectedRace,
+      protectionPolicyVersion: r.protectionPolicyVersion,
+      protectedDurationMinutes: r.protectedDurationMinutes,
+      adjudicationStatus: r.adjudicationStatus,
       targetSteps: TARGET_STEPS,
       maxSlots: r.maxPlayers,
       registeredCount: r.registeredCount,
@@ -677,6 +618,11 @@ router.post("/sponsored-events/generate-weekend", requireAuth, requireAdminKey, 
         type: "sponsored",
         entryType: "free",
         entryAmountCents: 0,
+        protectedRace: true,
+        protectionPolicyVersion: currentProtectedPolicySnapshot().policyVersion,
+        protectedDurationMinutes: 180,
+        protectedPolicySnapshot: currentProtectedPolicySnapshot(),
+        adjudicationStatus: "pending_verification",
         targetSteps: TARGET_STEPS,
         maxPlayers: MAX_SLOTS,
         status: "scheduled",
@@ -851,6 +797,10 @@ router.post("/sponsored-events/:roomId/register", requireAuth, async (req, res) 
         return { status: 409 as const, body: { error: "You are already registered for this event." } };
       }
 
+      if (room.protectedRace) {
+        await joinOrReviveParticipant(tx, { raceRoomId: roomId, userId, currentSteps: 0, raceBaselineSteps: 0 });
+      }
+
       const newCount = room.registeredCount + 1;
       await tx
         .update(raceRoomsTable)
@@ -951,6 +901,10 @@ router.post("/sponsored-events/:roomId/cancel-registration", requireAuth, async 
         .update(scheduledRoomRegistrationsTable)
         .set({ status: "cancelled", cancelledAt: now })
         .where(eq(scheduledRoomRegistrationsTable.id, reg.id));
+      if (room.protectedRace) {
+        await tx.update(raceParticipantsTable).set({ status: "left", completedAt: now })
+          .where(and(eq(raceParticipantsTable.raceRoomId, roomId), eq(raceParticipantsTable.userId, userId)));
+      }
       await tx
         .update(raceRoomsTable)
         .set({ registeredCount: newCount, updatedAt: new Date() })

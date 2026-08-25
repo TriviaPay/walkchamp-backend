@@ -33,6 +33,7 @@ export const raceStatusEnum = pgEnum("race_status", [
   // Spec waiting/ready/active map to existing open/full/in_progress.
   "starting",
   "expired",
+  "voided",
 ]);
 
 export const participantStatusEnum = pgEnum("participant_status", [
@@ -140,6 +141,19 @@ export const raceRoomsTable = pgTable("race_rooms", {
   // Hybrid settlement lifecycle (nullable; only set for hybrid races): awaiting_verification |
   // partially_verified | review_required | ready_to_finalize | finalizing | finalized | payout_pending | paid
   settlementStatus: text("settlement_status"),
+  // Protected prize-race policy is snapshotted when the room is created. Never derive the
+  // rules for an in-flight race from the current environment after a deploy.
+  protectedRace: boolean("protected_race").notNull().default(false),
+  protectionPolicyVersion: text("protection_policy_version"),
+  protectedDurationMinutes: integer("protected_duration_minutes"),
+  protectedPolicySnapshot: jsonb("protected_policy_snapshot").$type<Record<string, number | string | boolean>>(),
+  serverEndAt: timestamp("server_end_at", { withTimezone: true }),
+  // pending_verification | reconciling | review_required | finalized | voided
+  adjudicationStatus: text("adjudication_status"),
+  adjudicationReasonCodes: jsonb("adjudication_reason_codes").$type<string[]>(),
+  adjudicationFinalizedAt: timestamp("adjudication_finalized_at", { withTimezone: true }),
+  voidedAt: timestamp("voided_at", { withTimezone: true }),
+  voidReason: text("void_reason"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
@@ -193,6 +207,7 @@ export const raceParticipantsTable = pgTable("race_participants", {
   reconciliationStatus: reconciliationStatusEnum("reconciliation_status").notNull().default("pending"),
   reconciledAt: timestamp("reconciled_at", { withTimezone: true }),
   reconciliationReasonCodes: jsonb("reconciliation_reason_codes").$type<string[]>(),
+  protectedTieGroup: text("protected_tie_group"),
 });
 
 export const insertRaceRoomSchema = createInsertSchema(raceRoomsTable).omit({

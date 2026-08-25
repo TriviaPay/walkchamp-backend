@@ -21,3 +21,4 @@
 
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "step_sessions_ingest_session_key_idx" ON "step_sessions" ("ingest_session_key");
 CREATE INDEX CONCURRENTLY IF NOT EXISTS "race_participants_user_room_idx" ON "race_participants" ("user_id", "race_room_id");
+CREATE INDEX CONCURRENTLY IF NOT EXISTS "race_rooms_protected_adjudication_idx" ON "race_rooms" ("adjudication_status", "server_end_at") WHERE "protected_race" = true;

@@ -27,5 +27,6 @@ export * from "./sponsoredGiftCards.js";
 export * from "./hardening.js";
 export * from "./referrals.js";
 export * from "./authSessions.js";
+export * from "./protectedRace.js";
 
 export * from "./unlimitedChallenge.js";

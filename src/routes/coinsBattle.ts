@@ -17,6 +17,8 @@ import { requireFeatureEnabled } from "../middleware/requireFeatureEnabled.js";
 import { deriveOpenRoomStatus, joinOrReviveParticipant, lockRaceRoom } from "../lib/raceIntegrity.js";
 import { setUserDefaultTrackTheme, validateThemeOwnership } from "./trackThemes.js";
 import { acquireOneChallengeLock, getUnlimitedBlockingMembership } from "../lib/challengeMembership.js";
+import { config } from "../lib/config.js";
+import { currentProtectedPolicySnapshot, validateProtectedDuration } from "../lib/protectedRacePolicy.js";
 
 const router = Router();
 
@@ -79,6 +81,8 @@ const hostSchema = z.object({
   }),
   maxPlayers: z.number().int().min(2).max(10),
   targetSteps: z.number().int().min(50).max(1_000_000),
+  /** Fixed server-controlled duration for this protected prize race. */
+  durationMinutes: z.number().int().min(1).max(10_080).optional(),
   trackLayout: z.enum(VALID_TRACK_LAYOUTS).default("bg"),
   isPrivate: z.boolean().default(false),
 });
@@ -92,6 +96,16 @@ router.post("/coins-battle/host", requireAuth, async (req, res) => {
   }
 
   const { coinEntryAmount, maxPlayers, targetSteps, trackLayout, isPrivate } = parsed.data;
+  const protectedDurationMinutes = parsed.data.durationMinutes ?? config.protectedRace.minimumDurationMinutes;
+  const durationValidation = validateProtectedDuration(protectedDurationMinutes);
+  if (!durationValidation.ok) {
+    return res.status(400).json({
+      error: `Protected prize races must run for at least ${durationValidation.minimumMinutes} minutes.`,
+      code: durationValidation.code,
+      minimumDurationMinutes: durationValidation.minimumMinutes,
+    });
+  }
+  const protectedPolicy = currentProtectedPolicySnapshot();
 
   const ownsLayout = await validateThemeOwnership(userId, trackLayout);
   if (!ownsLayout) {
@@ -158,6 +172,11 @@ router.post("/coins-battle/host", requireAuth, async (req, res) => {
         entryAmountCents: 0,
         coinEntryAmount,
         coinPrizePool: 0,       // pool grows when coins are charged at race start
+        protectedRace: true,
+        protectionPolicyVersion: protectedPolicy.policyVersion,
+        protectedDurationMinutes,
+        protectedPolicySnapshot: protectedPolicy,
+        adjudicationStatus: "pending_verification",
         targetSteps,
         maxPlayers,
         currentPlayers: 1,

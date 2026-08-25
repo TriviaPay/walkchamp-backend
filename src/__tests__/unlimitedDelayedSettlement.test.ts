@@ -114,7 +114,8 @@ describe("§5–§9 results status lifecycle", () => {
   it("steps_validation_in_progress once all windows close but days remain unverified", async () => {
     stubSelects(
       [{ registered: 3, finished: 3, latestEnd: california.endAtUtc, unresolved: 0 }],
-      [{ participantId: "p-1", pending: 2 }],
+      [{ durationDays: 7 }],
+      [{ participantId: "p-1", total: 7, terminal: 5, pending: 2 }],
     );
     const s = await deriveResultsState(base, california.endAtUtc);
     expect(s.resultsStatus).toBe("steps_validation_in_progress");
@@ -125,7 +126,8 @@ describe("§5–§9 results status lifecycle", () => {
   it("does NOT reach results_ready from the clock alone — settlement owns that", async () => {
     stubSelects(
       [{ registered: 3, finished: 3, latestEnd: california.endAtUtc, unresolved: 0 }],
-      [], // every day terminal
+      [{ durationDays: 7 }],
+      [{ participantId: "p-1", total: 7, terminal: 7, pending: 0 }],
     );
     const s = await deriveResultsState(base, new Date("2026-09-01T00:00:00Z"));
     // All windows closed AND all days terminal — still not ready, because no payout is committed.
@@ -146,18 +148,38 @@ describe("§22 terminal day vocabulary", () => {
   });
 
   it("counts unverified days across the settlement population", async () => {
-    stubSelects([{ participantId: "p-1", pending: 3 }, { participantId: "p-2", pending: 1 }]);
+    stubSelects(
+      [{ durationDays: 7 }],
+      [
+        { participantId: "p-1", total: 7, terminal: 4, pending: 3 },
+        { participantId: "p-2", total: 7, terminal: 6, pending: 1 },
+      ],
+    );
     const v = await areAllRequiredDaysTerminal("ch-1");
     expect(v.allDaysTerminal).toBe(false);
     expect(v.pendingDayCount).toBe(4);
     expect(v.participantsAwaitingValidation).toBe(2);
   });
 
-  it("is satisfied when nothing is pending", async () => {
-    stubSelects([]);
+  it("is satisfied only when every required row exists and is terminal", async () => {
+    stubSelects(
+      [{ durationDays: 7 }],
+      [{ participantId: "p-1", total: 7, terminal: 7, pending: 0 }],
+    );
     const v = await areAllRequiredDaysTerminal("ch-1");
     expect(v.allDaysTerminal).toBe(true);
     expect(v.pendingDayCount).toBe(0);
+  });
+
+  it("does not treat a missing day row as successfully verified", async () => {
+    stubSelects(
+      [{ durationDays: 7 }],
+      [{ participantId: "p-1", total: 6, terminal: 6, pending: 0 }],
+    );
+    const v = await areAllRequiredDaysTerminal("ch-1");
+    expect(v.allDaysTerminal).toBe(false);
+    expect(v.incompleteParticipantCount).toBe(1);
+    expect(v.missingDayCount).toBe(1);
   });
 });
 
@@ -260,6 +282,8 @@ describe("§11/§18 eligibility is per-day, never a step total", () => {
 
 describe("settlement is gated on the delayed-global rule", () => {
   const settle = read("src/lib/unlimitedChallengeSettlement.ts");
+  const finalVerification = read("src/lib/unlimitedFinalVerification.ts");
+  const jobs = read("src/lib/unlimitedChallengeJobs.ts");
 
   it("never finalizes from a host-derived end", () => {
     expect(settle).toContain("areAllParticipantWindowsClosed(challengeId)");
@@ -268,13 +292,13 @@ describe("settlement is gated on the delayed-global rule", () => {
     expect(settle).not.toContain("hostEndAt");
   });
 
-  it("publishes results_ready only after payouts commit", () => {
-    const readyAt = settle.indexOf("markResultsReady");
+  it("commits results_ready atomically with payouts and queues a durable announcement", () => {
+    const readyAt = settle.lastIndexOf('resultsStatus: "results_ready"');
     const creditAt = settle.indexOf("creditCashChallengePrizes");
     expect(readyAt).toBeGreaterThan(-1);
-    expect(creditAt).toBeLessThan(settle.lastIndexOf("markResultsReady"));
-    // Every terminal branch publishes: split, refund-all, and manual-review.
-    expect(settle.split("markResultsReady(").length - 1).toBe(3);
+    expect(creditAt).toBeLessThan(readyAt);
+    expect(settle).toContain('eventType: "unlimited.announce"');
+    expect(settle).toContain("insertOutboxEventTx(tx");
   });
 
   it("records explicit eligibility for every membership before splitting", () => {
@@ -286,7 +310,28 @@ describe("settlement is gated on the delayed-global rule", () => {
   });
 
   it("refreshes the result status when it defers", () => {
-    expect(settle.split("refreshUnlimitedResultsStatus(challengeId)").length - 1).toBe(2);
+    expect(settle.split("refreshUnlimitedResultsStatus(challengeId)").length - 1).toBe(3);
+  });
+
+  it("requires a fresh provider read after the latest participant boundary", () => {
+    expect(finalVerification).toContain("areAllParticipantWindowsClosed(input.challengeId, now)");
+    expect(finalVerification).toContain("measuredAt.getTime() < closure.latestParticipantEndAtUtc.getTime()");
+    expect(finalVerification).toContain("isRaceVerificationSource(source)");
+    expect(finalVerification).toContain("verification_window_mismatch");
+    expect(finalVerification).toContain("submittedStart.getTime() !== day.windowStartUtc.getTime()");
+    expect(finalVerification).toContain("submittedEnd.getTime() !== day.windowEndUtc.getTime()");
+  });
+
+  it("never timer-finalizes the participant's final day", () => {
+    expect(jobs).toContain("d.dayNumber === challengeDuration.durationDays");
+    expect(jobs).toContain('status: "pending_verification"');
+    expect(jobs).toContain("post-boundary HealthKit/Health Connect range submission");
+  });
+
+  it("publishes only from the durable announcement consumer", () => {
+    expect(settle).toContain("export async function announceUnlimitedChallengeResults");
+    expect(settle).toContain("challenge.resultsAnnouncedAt");
+    expect(settle).toContain("await sendNotification");
   });
 });
 
@@ -301,18 +346,19 @@ describe("results status is driven and frozen correctly", () => {
 
   it("transitions are compare-and-set so a duplicate tick cannot double-emit", () => {
     expect(results).toContain("eq(unlimitedChallengesTable.resultsStatus, challenge.resultsStatus)");
-    expect(results).toContain('ne(unlimitedChallengesTable.resultsStatus, "results_ready")');
-    expect(results).toContain("if (!changed) return false; // already published");
+    expect(results).toContain("if (!changed) return state; // another worker transitioned it first");
   });
 
   it("never walks a published result backwards", () => {
     expect(results).toContain('if (challenge.resultsStatus === "results_ready") return null');
-    expect(results).toContain('if (state.resultsStatus === "results_ready") return state; // owned by markResultsReady');
+    expect(results).toContain('if (state.resultsStatus === "results_ready") return state; // owned by settlement');
   });
 
   it("§2 freezes the settlement population at start, excluding leavers", () => {
     expect(jobs).toContain("captureSettlementPopulation(challengeId)");
-    expect(results).toContain('eq(unlimitedChallengeParticipantsTable.qualificationStatus, "left")');
+    expect(results).toContain('["left", "forfeited", "withdrawn", "quit"].includes(row.qualificationStatus)');
+    expect(results).toContain("departedBeforeStart");
+    expect(results).toContain("row.leftAt.getTime() < challenge.startedAtUtc.getTime()");
     expect(results).toContain("settlementPopulationSize: population");
     // Ghost host has no participant row at all, so it can never enter the population.
     expect(results).toContain("Ghost hosts never appear here");
@@ -337,9 +383,10 @@ describe("§19/§20 losing eligibility does not stop history or settle early", (
 
   it("an early loss never publishes the challenge result", () => {
     const settle = read("src/lib/unlimitedChallengeSettlement.ts");
-    // markResultsReady is only reachable after both gates.
-    expect(settle.indexOf("areAllParticipantWindowsClosed")).toBeLessThan(settle.indexOf("markResultsReady"));
-    expect(settle.indexOf("areAllRequiredDaysTerminal")).toBeLessThan(settle.indexOf("markResultsReady"));
+    const readyWrite = settle.lastIndexOf('resultsStatus: "results_ready"');
+    expect(settle.indexOf("areAllParticipantWindowsClosed")).toBeLessThan(readyWrite);
+    expect(settle.indexOf("areAllFinalParticipantVerificationsComplete")).toBeLessThan(readyWrite);
+    expect(settle.indexOf("areAllRequiredDaysTerminal")).toBeLessThan(readyWrite);
   });
 });
 
@@ -375,13 +422,13 @@ describe("§12/§15 daily history API", () => {
     expect(history).toContain("passedDays: days.filter");
     expect(history).toContain("const failedDays = days.filter");
     expect(history).toContain("failedDays,");
-    expect(history).toContain("prizePoolEligibilityStatus: participant.prizePoolEligibilityStatus");
+    expect(history).toContain('prizePoolEligibilityStatus: viewerResultsReady ? participant.prizePoolEligibilityStatus : "pending"');
   });
-  it("marks the viewer's broken streak result ready without changing global resultsStatus", () => {
+  it("keeps an individual loss embargoed until global resultsStatus is ready", () => {
     expect(history).toContain("resultsStatus: challenge.resultsStatus");
-    expect(history).toContain('viewerResultsStatus = viewerStreakBroken ? "results_ready" : challenge.resultsStatus');
+    expect(history).toContain("const viewerResultsStatus = challenge.resultsStatus");
     expect(history).toContain("viewerResultsReady");
-    expect(history).toContain('viewerResultReasonCode: viewerStreakBroken ? "daily_goal_missed" : null');
+    expect(history).toContain('viewerResultReasonCode: viewerResultsReady && viewerStreakBroken ? "daily_goal_missed" : null');
   });
 });
 

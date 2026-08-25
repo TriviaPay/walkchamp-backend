@@ -100,6 +100,7 @@ import {
 import { grantReferralBonusForCashChallenge } from "../lib/referralBonusService.js";
 import {
   markRaceActive,
+  markRaceInactive,
   activeRaceCount,
   listActiveRaces,
   reconcileActive,
@@ -132,6 +133,19 @@ import { computeCanStart, terminateWaitingRoom, enqueueWaitingRoomLifecycleJobs 
 import { getUnlimitedBlockingMembership } from "../lib/challengeMembership.js";
 import { UNLIMITED_NON_ACTIVE_STATUSES } from "../lib/unlimitedChallengeStatuses.js";
 import { leaveUnlimitedChallenge } from "../lib/unlimitedChallengeService.js";
+import {
+  currentProtectedPolicySnapshot,
+  isProtectedPrizeCandidate,
+  validateProtectedDuration,
+} from "../lib/protectedRacePolicy.js";
+import {
+  ProtectedRaceError,
+  assertProtectedRaceReadyToStart,
+  attemptProtectedRaceAdjudication,
+  bindProtectedSessionsToRaceWindow,
+  recordProtectedHeartbeat,
+  scheduleProtectedAdjudicationRetries,
+} from "../lib/protectedRaceAdjudication.js";
 
 const router = Router();
 const RACE_ROSTER_EXCLUDED_STATUSES = ["left", "forfeited", "disqualified"] as const;
@@ -1113,6 +1127,10 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
   const reEnteringForSettlement = room.status === "completed" && isSettlementPending(room.settlementStatus);
   if (room.status !== "in_progress" && !reEnteringForSettlement) return;
 
+  // Protected prize races are fixed-duration. Goal crossings and winner-slot events remain useful
+  // live UI signals, but can never shorten the server-authoritative evidence window.
+  if (room.protectedRace && (!room.serverEndAt || Date.now() < room.serverEndAt.getTime())) return;
+
   const durationCompletion = canAutoCompleteDurationChallenge(room, endedReason);
   if (!durationCompletion.allowed) {
     logger.warn(
@@ -1143,6 +1161,29 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
     }
   }
 
+
+  if (room.protectedRace) {
+    const adjudication = await attemptProtectedRaceAdjudication(raceId);
+    if (!adjudication.ready) {
+      if (room.status === "in_progress" && adjudication.status !== "live") {
+        const protectedUsers = await db.select({ userId: raceParticipantsTable.userId })
+          .from(raceParticipantsTable).where(eq(raceParticipantsTable.raceRoomId, raceId));
+        if (room.liveStateMode === "redis") {
+          await setRaceState(raceId, LIVE_RACE_STATE.FINALIZED).catch(() => {});
+          void clearRaceLiveState(raceId, [...new Set(protectedUsers.map((participant) => participant.userId))]);
+        }
+        void markRaceInactive(raceId);
+        void triggerEvent(`public-live-race-${raceId}`, "race:completed", {
+          raceId,
+          settlementPending: adjudication.status !== "voided",
+          adjudicationStatus: adjudication.status,
+        });
+      }
+      logger.info({ raceId, adjudication }, "autoCompleteRace: protected payout remains blocked");
+      return;
+    }
+  }
+
   const participants = await db
     .select({
       id: raceParticipantsTable.id,
@@ -1159,6 +1200,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
       reconciliationStatus: raceParticipantsTable.reconciliationStatus,
       verifiedCumulativeSteps: raceParticipantsTable.verifiedCumulativeSteps,
       reconciliationReasonCodes: raceParticipantsTable.reconciliationReasonCodes,
+      protectedTieGroup: raceParticipantsTable.protectedTieGroup,
     })
     .from(raceParticipantsTable)
     .innerJoin(profilesTable, eq(raceParticipantsTable.userId, profilesTable.id))
@@ -1203,7 +1245,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
     reconciledSteps: number | null;
     reconciliationStatus: string | null;
   }): number => {
-    if (useHybrid && p.reconciliationStatus === "finalized" && p.reconciledSteps != null) {
+    if ((room.protectedRace || useHybrid) && p.reconciliationStatus === "finalized" && p.reconciledSteps != null) {
       return p.reconciledSteps;
     }
     return p.currentSteps;
@@ -1233,7 +1275,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
   const strictRace = useHybrid && room.entryAmountCents > 0;
   // Participants held (review_required) on a strict race — used for selective payout below.
   const heldUserIds = new Set<string>();
-  if (useHybrid && isPrizedRace) {
+  if (!room.protectedRace && useHybrid && isPrizedRace) {
     const anyVerificationInUse = participants.some(
       (p) => p.verifiedCumulativeSteps != null || (p.reconciliationReasonCodes ?? []).includes("session_conflict"),
     );
@@ -1393,7 +1435,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
   // For paid_usd: completion order wins (first to finish = 1st place).
   // For all other types: steps DESC, tiebreak by finish time.
   const uniqueParticipants = [...seenUsers.values()].sort((a, b) => {
-    if (isPaidUsd) {
+    if (isPaidUsd && !room.protectedRace) {
       // Both completed goal → earlier timestamp wins
       if (a.finishedAt && b.finishedAt) return a.finishedAt.getTime() - b.finishedAt.getTime();
       // Completer beats non-completer
@@ -1411,7 +1453,10 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
   });
 
   const isSponsored = room.type === "sponsored";
-  const sponsoredPlayerCount = uniqueParticipants.length;
+  const settlementPoolParticipantCount = room.protectedRace
+    ? (room.startingParticipantCount ?? uniqueParticipants.length)
+    : uniqueParticipants.length;
+  const sponsoredPlayerCount = isSponsored ? settlementPoolParticipantCount : uniqueParticipants.length;
   const sponsoredPrizeCents = isSponsored ? getSponsoredPrizePoolCents(sponsoredPlayerCount) : 0;
 
   // ── New completion-gated settlement (spec: WINNER SELECTION AND FORFEIT LOGIC) ──
@@ -1431,7 +1476,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
     totalPoolCents: number;
     awardedCashCents: number;
   } | null = null;
-  if (useNewSettlement) {
+  if (useNewSettlement && !room.protectedRace) {
     const startCount = room.startingParticipantCount ?? 0;
     const winnerSlotCount = room.winnerSlotCount ?? getWinnerSlotCount(startCount);
     const completers: Completer[] = uniqueParticipants
@@ -1492,7 +1537,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
     ? { winners: sponsoredPrizeCents, total: sponsoredPrizeCents }
     : newSettlement
       ? { winners: newSettlement.winnersPoolCents, total: newSettlement.totalPoolCents }
-      : calcPrizePool(room.entryAmountCents, uniqueParticipants.length);
+      : calcPrizePool(room.entryAmountCents, settlementPoolParticipantCount);
   const platformFeeCentsVal = isSponsored
     ? 0
     : newSettlement
@@ -1502,7 +1547,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
 
   // ── Sponsored events: only finishers (reached goal) win prizes ──────────────
   // If nobody finished 10k steps the prize goes unclaimed (no award).
-  const sponsoredFinishers = isSponsored
+  const sponsoredFinishers = isSponsored && !room.protectedRace
     ? uniqueParticipants.filter((p) => p.finishedAt !== null)
     : uniqueParticipants;
 
@@ -1511,7 +1556,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
     ? buildSponsoredPrizeSlots(sponsoredPlayerCount, sponsoredFinishers.length)
     : newSettlement
       ? buildRewardSplitCents(room.entryAmountCents, room.startingParticipantCount ?? 0)
-      : buildRewardSplitCents(room.entryAmountCents, uniqueParticipants.length);
+      : buildRewardSplitCents(room.entryAmountCents, settlementPoolParticipantCount);
 
   // ── Tie-aware payout assignment ──────────────────────────────────────────────
   const tieParticipants: TieParticipant[] = uniqueParticipants.map((p) => ({
@@ -1523,17 +1568,35 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
     finishedAt: p.finishedAt ?? null,
   }));
 
+  // Clean close results have already been grouped by adjudication. Feed a shared synthetic score
+  // into the existing tie splitter while preserving each user's real qualifying total in results.
+  const protectedGroupScore = new Map<string, number>();
+  if (room.protectedRace) {
+    for (const participant of uniqueParticipants) {
+      if (!participant.protectedTieGroup) continue;
+      protectedGroupScore.set(
+        participant.protectedTieGroup,
+        Math.max(protectedGroupScore.get(participant.protectedTieGroup) ?? 0, authoritativeSteps(participant)),
+      );
+    }
+  }
+  const payoutTieParticipants = tieParticipants.map((participant) => {
+    const row = uniqueParticipants.find((candidate) => candidate.userId === participant.userId);
+    const groupedScore = row?.protectedTieGroup ? protectedGroupScore.get(row.protectedTieGroup) : null;
+    return groupedScore == null ? participant : { ...participant, finalSteps: groupedScore, finishedAt: null };
+  });
+
   logger.info(
     { raceId, rewardSlots, eligibleCount: tieParticipants.length },
     "[TiePayout] race_id: %s reward_split: %j eligible participants: %d",
     raceId, rewardSlots, tieParticipants.length,
   );
 
-  const payouts = isSponsored
+  const payouts = isSponsored && !room.protectedRace
     ? assignSponsoredGiftCardPayouts(tieParticipants, sponsoredPlayerCount)
     : newSettlement
       ? assignNewSettlementPayouts(uniqueParticipants, newSettlement.positionByUser, newSettlement.cashByUser)
-      : assignPayoutsWithTies(tieParticipants, rewardSlots);
+      : assignPayoutsWithTies(payoutTieParticipants, rewardSlots);
 
   // Log tie groups
   const stepGroupMap = new Map<number, string[]>();
@@ -1586,9 +1649,9 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
       );
     } else {
       // buildCoinRewardSlots uses getCoinPrizeSplits (70/30 for 3p, 50/30/20 for 4+)
-      const coinSlots = buildCoinRewardSlots(coinWinnersPool, uniqueParticipants.length);
+      const coinSlots = buildCoinRewardSlots(coinWinnersPool, settlementPoolParticipantCount);
       // Reuse assignPayoutsWithTies — "amountCents" field = coin amounts here
-      const coinPayouts = assignPayoutsWithTies(tieParticipants, coinSlots);
+      const coinPayouts = assignPayoutsWithTies(payoutTieParticipants, coinSlots);
       for (const cp of coinPayouts) {
         if (cp.eligibleForPrize && cp.prizeCents > 0) {
           coinPrizeMap.set(cp.userId, cp.prizeCents);
@@ -1659,12 +1722,12 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
       status: isSimulatedUser ? "disqualified_simulation" : (isHeld ? "review_required" : "verified"),
       // Denormalized reconciliation mirror (§4). Null when the hybrid flag is off → flag-off writes
       // are unchanged. authoritativeStepSource records whether `steps` came from live or reconciled.
-      reconciliationStatus: useHybrid ? (participant?.reconciliationStatus ?? null) : null,
-      authoritativeStepSource: useHybrid
+      reconciliationStatus: (room.protectedRace || useHybrid) ? (participant?.reconciliationStatus ?? null) : null,
+      authoritativeStepSource: (room.protectedRace || useHybrid)
         && participant?.reconciliationStatus === "finalized"
         && participant?.reconciledSteps != null
         ? "reconciled"
-        : (useHybrid ? "live" : null),
+        : ((room.protectedRace || useHybrid) ? "live" : null),
     };
   });
   const actualWinnerCount = isSponsored
@@ -1675,7 +1738,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
 
   const rewardSplitForRoom = buildRewardSplit(
     room.entryAmountCents,
-    newSettlement ? (room.startingParticipantCount ?? 0) : uniqueParticipants.length,
+    newSettlement ? (room.startingParticipantCount ?? 0) : settlementPoolParticipantCount,
   );
 
   // ── Selective payout hold (strict funded races, § race-level behavior) ──────
@@ -1734,6 +1797,9 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
               ${raceRoomsTable.scheduledStartAt} + (${raceRoomsTable.challengeDurationDays} * interval '1 day')
             ) <= now()
           )`;
+      const protectedCompletionAllowedSql = room.protectedRace
+        ? sql`${raceRoomsTable.serverEndAt} <= now()`
+        : completionAllowedSql;
       const updated = await tx
         .update(raceRoomsTable)
         .set({
@@ -1746,7 +1812,7 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
           updatedAt: payoutFinalizedAt,
           // Always clear the pending marker on the settling pass, not just under the hybrid
           // flag — a re-entering race is settled by definition once this CAS matches.
-          ...((useHybrid || reEnteringForSettlement) && { settlementStatus: "paid" }),
+          ...((room.protectedRace || useHybrid || reEnteringForSettlement) && { settlementStatus: "paid" }),
           ...(!isSponsored && { prizePoolCents: totalPoolCents }),
           winnersPoolCents,
           platformFeeCents: platformFeeCentsVal,
@@ -1774,12 +1840,27 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
               inArray(raceRoomsTable.settlementStatus, [...PENDING_SETTLEMENT_STATUSES]),
             ),
           ),
-          completionAllowedSql,
+          protectedCompletionAllowedSql,
         ))
         .returning({ id: raceRoomsTable.id });
 
       if (updated.length === 0) return;
       markedCompleted = true;
+
+      // Results, room settlement, and every financially meaningful award commit together. A
+      // protected race must never reach paid without its immutable final standings.
+      if (room.protectedRace && resultRows.length > 0) {
+        await tx.insert(raceResultsTable).values(resultRows).onConflictDoUpdate({
+          target: [raceResultsTable.raceRoomId, raceResultsTable.userId],
+          set: {
+            rank: sql`excluded.rank`, displayRank: sql`excluded.display_rank`, steps: sql`excluded.steps`,
+            prizeCents: sql`excluded.prize_cents`, isTied: sql`excluded.is_tied`,
+            tieGroupId: sql`excluded.tie_group_id`, tieGroupSize: sql`excluded.tie_group_size`,
+            eligibleForPrize: sql`excluded.eligible_for_prize`, prizeCoins: sql`excluded.prize_coins`,
+            winnerPosition: sql`excluded.winner_position`, status: sql`excluded.status`,
+          },
+        });
+      }
 
       // Persist the Coins Battle payout atomically with settlement (audit 2026-08-17 M2). The
       // fire-and-forget grant later is the fast path; this durable outbox row is the backstop so a
@@ -1871,32 +1952,22 @@ export async function autoCompleteRace(raceId: string, endedReason = "time_expir
   }
   void invalidateLeaderboardSnapshots("race", "coin").catch(() => {});
 
-  // ── Step 2: Insert result rows (best-effort — race is already closed above) ──
-  // Failures here are logged but do not un-complete the race.
-  if (resultRows.length > 0) {
+  // Preserve the legacy repairable result-write behavior for ordinary races. Protected races
+  // wrote these rows atomically with settlement above because their audit record is payout-critical.
+  if (!room.protectedRace && resultRows.length > 0) {
     try {
-      await db
-        .insert(raceResultsTable)
-        .values(resultRows)
-        .onConflictDoUpdate({
-          target: [raceResultsTable.raceRoomId, raceResultsTable.userId],
-          set: {
-            rank: sql`excluded.rank`,
-            displayRank: sql`excluded.display_rank`,
-            steps: sql`excluded.steps`,
-            prizeCents: sql`excluded.prize_cents`,
-            isTied: sql`excluded.is_tied`,
-            tieGroupId: sql`excluded.tie_group_id`,
-            tieGroupSize: sql`excluded.tie_group_size`,
-            eligibleForPrize: sql`excluded.eligible_for_prize`,
-            prizeCoins: sql`excluded.prize_coins`,
-            winnerPosition: sql`excluded.winner_position`,
-            status: sql`excluded.status`,
-          },
-        });
+      await db.insert(raceResultsTable).values(resultRows).onConflictDoUpdate({
+        target: [raceResultsTable.raceRoomId, raceResultsTable.userId],
+        set: {
+          rank: sql`excluded.rank`, displayRank: sql`excluded.display_rank`, steps: sql`excluded.steps`,
+          prizeCents: sql`excluded.prize_cents`, isTied: sql`excluded.is_tied`,
+          tieGroupId: sql`excluded.tie_group_id`, tieGroupSize: sql`excluded.tie_group_size`,
+          eligibleForPrize: sql`excluded.eligible_for_prize`, prizeCoins: sql`excluded.prize_coins`,
+          winnerPosition: sql`excluded.winner_position`, status: sql`excluded.status`,
+        },
+      });
     } catch (err) {
       logger.error({ raceId, err }, "autoCompleteRace: race_results insert failed (race still completed)");
-      // Do NOT rethrow — the race is marked completed; results can be reconciled separately
     }
   }
 
@@ -3281,6 +3352,9 @@ router.post("/rooms/:roomId/register", requireAuth, async (req, res) => {
     }
 
     const registrationResult = await registerOrReviveScheduledRegistration(tx, roomId, userId);
+    if (room.protectedRace) {
+      await joinOrReviveParticipant(tx, { raceRoomId: roomId, userId, currentSteps: 0, raceBaselineSteps: 0 });
+    }
     registeredCount = room.registeredCount + (registrationResult.changed ? 1 : 0);
 
     if (registrationResult.changed) {
@@ -3350,6 +3424,10 @@ router.post("/rooms/:roomId/cancel-registration", requireAuth, async (req, res) 
     // releases the seat itself, so the app's follow-up call here lands on an idempotent no-op.
     registeredCount = release.registeredCount;
     changed = release.changed;
+    if (changed && room.protectedRace) {
+      await tx.update(raceParticipantsTable).set({ status: "left", completedAt: new Date() })
+        .where(and(eq(raceParticipantsTable.raceRoomId, roomId), eq(raceParticipantsTable.userId, userId)));
+    }
   });
 
   if (errorStatus !== null && errorBody) {
@@ -3621,6 +3699,8 @@ const hostRaceSchema = z.object({
   scheduledStartAtIso: z.string().optional(),
   challengeEndAtIso: z.string().optional(),
   challengeDurationDays: z.number().int().min(0).max(30).optional().default(0),
+  /** Fixed server-controlled duration for protected prize races. */
+  durationMinutes: z.number().int().min(1).max(10080).optional(),
   timezone: z.string().max(100).optional(),
 });
 
@@ -3692,6 +3772,23 @@ router.post("/races/host", requireAuth, async (req, res) => {
     }
     amountCents = customEntryAmountCents;
   }
+
+  const protectedRace = (challengeDurationDays ?? 0) === 0
+    && isProtectedPrizeCandidate({ entryAmountCents: amountCents, entryType, type: isCountryVs ? "country_battle" : isPrivate ? "friends" : "quick" });
+  const protectedDurationMinutes = protectedRace
+    ? (parsed.data.durationMinutes ?? config.protectedRace.minimumDurationMinutes)
+    : null;
+  if (protectedRace) {
+    const durationValidation = validateProtectedDuration(protectedDurationMinutes!);
+    if (!durationValidation.ok) {
+      return res.status(400).json({
+        error: `Protected prize races must run for at least ${durationValidation.minimumMinutes} minutes.`,
+        code: durationValidation.code,
+        minimumDurationMinutes: durationValidation.minimumMinutes,
+      });
+    }
+  }
+  const protectedPolicy = protectedRace ? currentProtectedPolicySnapshot() : null;
 
   // Validate challenge duration (must be 1, 7, or 30 days if provided)
   if (challengeDurationDays > 0 && !VALID_DURATION_DAYS.has(challengeDurationDays)) {
@@ -3839,6 +3936,13 @@ router.post("/races/host", requireAuth, async (req, res) => {
         type: roomType,
         entryType,
         entryAmountCents: amountCents,
+        protectedRace,
+        ...(protectedRace ? {
+          protectionPolicyVersion: protectedPolicy!.policyVersion,
+          protectedDurationMinutes,
+          protectedPolicySnapshot: protectedPolicy,
+          adjudicationStatus: "pending_verification",
+        } : {}),
         goalType: goalType ?? "daily",
         ...(entryType === "coins_battle" && coinEntryAmount > 0 ? { coinEntryAmount } : {}),
         targetSteps,
@@ -3874,6 +3978,11 @@ router.post("/races/host", requireAuth, async (req, res) => {
       await tx
         .insert(scheduledRoomRegistrationsTable)
         .values({ raceRoomId: room.id, userId, status: "registered" });
+      if (protectedRace) {
+        participant = await joinOrReviveParticipant(tx, {
+          raceRoomId: room.id, userId, currentSteps: 0, raceBaselineSteps: 0,
+        }).then((joined) => joined.participant);
+      }
     }
 
     return { room, participant };
@@ -4018,21 +4127,23 @@ export async function activateRoomAndStart(
           eq(scheduledRoomRegistrationsTable.raceRoomId, raceId),
           eq(scheduledRoomRegistrationsTable.status, "registered"),
         ));
-      let activated = 0;
       for (const reg of regs) {
-        const r = await joinOrReviveParticipant(tx, { raceRoomId: raceId, userId: reg.userId, currentSteps: 0, raceBaselineSteps: 0 });
-        if (r.changed) activated += 1;
+        await joinOrReviveParticipant(tx, { raceRoomId: raceId, userId: reg.userId, currentSteps: 0, raceBaselineSteps: 0 });
       }
-      await tx
-        .update(scheduledRoomRegistrationsTable)
-        .set({ status: "activated", activatedAt: new Date() })
-        .where(and(
-          eq(scheduledRoomRegistrationsTable.raceRoomId, raceId),
-          eq(scheduledRoomRegistrationsTable.status, "registered"),
-        ));
-      if (activated > 0) {
-        await tx.update(raceRoomsTable).set({ currentPlayers: activated, updatedAt: new Date() }).where(eq(raceRoomsTable.id, raceId));
+      if (!lockedRoom.protectedRace) {
+        await tx
+          .update(scheduledRoomRegistrationsTable)
+          .set({ status: "activated", activatedAt: new Date() })
+          .where(and(
+            eq(scheduledRoomRegistrationsTable.raceRoomId, raceId),
+            eq(scheduledRoomRegistrationsTable.status, "registered"),
+          ));
       }
+      const [{ participantCount }] = await tx
+        .select({ participantCount: sql<number>`count(distinct ${raceParticipantsTable.userId})::int` })
+        .from(raceParticipantsTable)
+        .where(and(eq(raceParticipantsTable.raceRoomId, raceId), inArray(raceParticipantsTable.status, ["joined", "active"])));
+      await tx.update(raceRoomsTable).set({ currentPlayers: participantCount ?? 0, updatedAt: new Date() }).where(eq(raceRoomsTable.id, raceId));
     });
   }
 
@@ -4054,6 +4165,34 @@ export async function activateRoomAndStart(
       .set({ status: opts.fromStatuses.includes("scheduled") ? "scheduled" : deriveOpenRoomStatus(room.currentPlayers, room.maxPlayers), updatedAt: new Date() })
       .where(and(eq(raceRoomsTable.id, raceId), eq(raceRoomsTable.status, "starting")));
   };
+
+  if (room.protectedRace) {
+    const duration = validateProtectedDuration(room.protectedDurationMinutes ?? 0);
+    if (!duration.ok) {
+      await revertClaim();
+      return {
+        ok: false,
+        httpStatus: 409,
+        body: {
+          error: `Protected prize races must run for at least ${duration.minimumMinutes} minutes.`,
+          code: duration.code,
+          minimumDurationMinutes: duration.minimumMinutes,
+        },
+      };
+    }
+  }
+
+  // Prize-bearing protected races fail closed before any entry is charged. Every participant is
+  // already bound to a single authenticated installation and has passed provider attestation.
+  try {
+    await assertProtectedRaceReadyToStart(raceId);
+  } catch (error) {
+    await revertClaim();
+    if (error instanceof ProtectedRaceError) {
+      return { ok: false, httpStatus: error.status, body: { error: error.message, code: error.code } };
+    }
+    throw error;
+  }
 
   // Charge any joined participants who have not yet paid (legacy / scheduled flows).
   if (room.entryAmountCents > 0) {
@@ -4272,8 +4411,9 @@ export async function activateRoomAndStart(
   const startedAt = new Date();
   // Sponsored: 3h. Multi-day rooms: calendar challengeEndAt. Classic fixed free/coins/cash
   // (durationDays 0 or legacy daily=1): startedAt + 24h unless winners finish sooner.
-  const challengeEndAt =
-    room.type === "sponsored"
+  const challengeEndAt = room.protectedRace
+    ? new Date(startedAt.getTime() + (room.protectedDurationMinutes ?? config.protectedRace.minimumDurationMinutes) * 60_000)
+    : room.type === "sponsored"
       ? new Date(startedAt.getTime() + SPONSORED_EVENT_DURATION_MS)
       : isDurationChallengeRoom(room)
         ? deriveChallengeEndAt({ ...room, startedAt })
@@ -4296,6 +4436,16 @@ export async function activateRoomAndStart(
     ? getSponsoredWinnerCount(startingParticipantCount ?? 0)
     : getWinnerSlotCount(startingParticipantCount ?? 0);
 
+  if (room.protectedRace) {
+    try {
+      await bindProtectedSessionsToRaceWindow(raceId, startedAt, challengeEndAt!);
+    } catch (error) {
+      logger.error({ error, raceId }, "protected verification window binding failed — reverting start claim");
+      await revertClaim();
+      return { ok: false, httpStatus: 503, body: { error: "Protected verification could not be initialized.", code: "PROTECTED_WINDOW_BIND_FAILED" } };
+    }
+  }
+
   // Compare-and-set: only the caller holding the "starting" claim commits the activation.
   const [updated] = await db
     .update(raceRoomsTable)
@@ -4303,6 +4453,11 @@ export async function activateRoomAndStart(
       status: "in_progress",
       startedAt,
       ...(challengeEndAt ? { challengeEndAt } : {}),
+      ...(room.protectedRace ? {
+        serverEndAt: challengeEndAt,
+        adjudicationStatus: "pending_verification",
+        settlementStatus: "awaiting_verification",
+      } : {}),
       liveStateMode: resolveLiveStateModeForNewRace(),
       startingParticipantCount: startingParticipantCount ?? 0,
       winnerSlotCount,
@@ -4311,7 +4466,18 @@ export async function activateRoomAndStart(
     .where(and(eq(raceRoomsTable.id, raceId), eq(raceRoomsTable.status, "starting")))
     .returning();
   if (!updated) {
+    await revertClaim();
     return { ok: false, httpStatus: 409, body: { error: "Race cannot be started in its current state." } };
+  }
+
+  if (opts.materializeRegistrations) {
+    await db.update(scheduledRoomRegistrationsTable).set({ status: "activated", activatedAt: startedAt })
+      .where(and(eq(scheduledRoomRegistrationsTable.raceRoomId, raceId), eq(scheduledRoomRegistrationsTable.status, "registered")));
+  }
+  if (room.protectedRace) {
+    await scheduleProtectedAdjudicationRetries(raceId, challengeEndAt!).catch((error) => {
+      logger.error({ error, raceId }, "protected adjudication retry scheduling failed; recurring reconciliation remains active");
+    });
   }
 
   logger.info(
@@ -6861,15 +7027,19 @@ async function sendRedisProgressResponse(
 //   stepSource      — "healthkit" | "health_connect" | "simulation"
 //   deviceTime      — ISO-8601 UTC timestamp from the device at sync time.
 router.post("/races/:id/progress", requireAuth, async (req, res) => {
-  const userId = (req as AuthenticatedRequest).descopeUserId;
+  const authRequest = req as AuthenticatedRequest;
+  const userId = authRequest.descopeUserId;
   const raceId = String(req.params.id);
-  const { steps, sequenceId, deviceTotalSteps, stepSource, deviceTime, sessionId } = req.body as {
+  const { steps, sequenceId, deviceTotalSteps, stepSource, deviceTime, sessionId,
+    protectedVerificationSessionId, healthPermissionStatus } = req.body as {
     steps?: unknown;
     sequenceId?: unknown;
     deviceTotalSteps?: unknown;
     stepSource?: unknown;
     deviceTime?: unknown;
     sessionId?: unknown;
+    protectedVerificationSessionId?: unknown;
+    healthPermissionStatus?: unknown;
   };
 
   if (typeof steps !== "number" || !Number.isFinite(steps) || steps < 0) {
@@ -6900,6 +7070,17 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
     : null;
   // Normalized provisional live source for the live_source enum column (audit `srcLabel` is kept raw).
   const liveSource = config.features.hybridReconciliationEnabled ? toLiveStepSource(srcLabel) : null;
+
+  await recordProtectedHeartbeat({
+    raceId,
+    userId,
+    verificationSessionId: typeof protectedVerificationSessionId === "string" ? protectedVerificationSessionId : null,
+    authSessionId: authRequest.sessionId,
+    registeredDeviceId: authRequest.deviceInfo?.deviceId,
+    // Live sensor provenance is intentionally separate from the approved qualifying HC/HK source.
+    approvedSource: null,
+    permissionStatus: typeof healthPermissionStatus === "string" ? healthPermissionStatus : null,
+  });
 
   // Redis-live canary: for redis-mode races, handle the tick entirely off redis-live (zero
   // SQL). Falls through to the legacy Postgres path for postgres-mode races or if unavailable.

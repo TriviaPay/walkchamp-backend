@@ -112,7 +112,10 @@ export async function materializeParticipantSchedule(
       ),
     );
 
-  if ((existing?.count ?? 0) > 0 && existing?.minStart && existing?.maxEnd) {
+  // Preserve only a COMPLETE schedule. Treating one surviving row as the whole schedule can move
+  // participantEndAtUtc to day 1 and let settlement bypass the missing final days after a partial
+  // write or legacy migration.
+  if ((existing?.count ?? 0) === input.challenge.durationDays && existing?.minStart && existing?.maxEnd) {
     const startAtUtc = existing.minStart instanceof Date ? existing.minStart : new Date(existing.minStart);
     const endAtUtc = existing.maxEnd instanceof Date ? existing.maxEnd : new Date(existing.maxEnd);
     await exec
@@ -122,7 +125,7 @@ export async function materializeParticipantSchedule(
     return { startAtUtc, endAtUtc, dayCount: existing.count, preserved: true };
   }
 
-  const { startAtUtc, endAtUtc, windows } = participantScheduleFor(input.challenge, input.timezone);
+  const { windows } = participantScheduleFor(input.challenge, input.timezone);
 
   await exec
     .insert(unlimitedChallengeDaysTable)
@@ -141,12 +144,31 @@ export async function materializeParticipantSchedule(
     )
     .onConflictDoNothing();
 
+  const [materialized] = await exec
+    .select({
+      count: sql<number>`count(*)::int`,
+      minStart: sql<Date | null>`min(${unlimitedChallengeDaysTable.windowStartUtc})`,
+      maxEnd: sql<Date | null>`max(${unlimitedChallengeDaysTable.windowEndUtc})`,
+    })
+    .from(unlimitedChallengeDaysTable)
+    .where(and(
+      eq(unlimitedChallengeDaysTable.challengeId, input.challenge.id),
+      eq(unlimitedChallengeDaysTable.participantId, input.participantId),
+    ));
+  if (materialized?.count !== input.challenge.durationDays || !materialized.minStart || !materialized.maxEnd) {
+    throw new Error(
+      `Incomplete participant schedule for ${input.participantId}: expected ${input.challenge.durationDays}, found ${materialized?.count ?? 0}`,
+    );
+  }
+  const persistedStart = materialized.minStart instanceof Date ? materialized.minStart : new Date(materialized.minStart);
+  const persistedEnd = materialized.maxEnd instanceof Date ? materialized.maxEnd : new Date(materialized.maxEnd);
+
   await exec
     .update(unlimitedChallengeParticipantsTable)
-    .set({ participantStartAtUtc: startAtUtc, participantEndAtUtc: endAtUtc, updatedAt: new Date() })
+    .set({ participantStartAtUtc: persistedStart, participantEndAtUtc: persistedEnd, updatedAt: new Date() })
     .where(eq(unlimitedChallengeParticipantsTable.id, input.participantId));
 
-  return { startAtUtc, endAtUtc, dayCount: windows.length, preserved: false };
+  return { startAtUtc: persistedStart, endAtUtc: persistedEnd, dayCount: materialized.count, preserved: false };
 }
 
 /**

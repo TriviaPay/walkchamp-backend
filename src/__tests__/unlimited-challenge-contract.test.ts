@@ -230,16 +230,16 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
     expect(detail).not.toContain("challenge: {");
   });
 
-  it("viewer schedule exposes immediate result readiness when this viewer's streak breaks", () => {
+  it("viewer schedule embargoes an individual loss until global results are ready", () => {
     const viewerFn = router.slice(
       router.indexOf("async function buildViewerSchedule"),
       router.indexOf("// ── POST /unlimited-challenges/host"),
     );
     expect(viewerFn).toContain("const viewerStreakBroken");
-    expect(viewerFn).toContain('viewerResultsStatus = viewerStreakBroken ? "results_ready" : challenge.resultsStatus');
+    expect(viewerFn).toContain("const viewerResultsStatus = challenge.resultsStatus");
     expect(viewerFn).toContain("viewerResultsReady");
     expect(viewerFn).toContain("viewerResultFinal: viewerResultsReady");
-    expect(viewerFn).toContain('viewerResultReasonCode: viewerStreakBroken ? "daily_goal_missed" : null');
+    expect(viewerFn).toContain('viewerResultReasonCode: viewerResultsReady && viewerStreakBroken ? "daily_goal_missed" : null');
   });
 });
 

@@ -11,6 +11,7 @@ import {
   unlimitedChallengeDaysTable,
 } from "../../db/src/schema/unlimitedChallenge.js";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
+import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
 import { config } from "../lib/config.js";
 import { computeTotalChargeCents } from "../lib/unlimitedChallengeMoney.js";
 import {
@@ -42,6 +43,10 @@ import {
 import { emitUnlimitedRealtime } from "../lib/unlimitedRealtime.js";
 import { isProvisionalLiveSource, normalizeSource } from "../lib/stepSources.js";
 import { stepDailyTotalsTable } from "../../db/src/schema/steps.js";
+import {
+  submitUnlimitedFinalVerification,
+  UnlimitedFinalVerificationError,
+} from "../lib/unlimitedFinalVerification.js";
 
 const router: Router = Router();
 
@@ -337,8 +342,10 @@ async function loadActiveChallengeCardPlayers(
       currentSteps: displayedFromLanes(verifiedSteps, provisional),
       rank: Number(row.roster_rank) || 1,
       isHost: row.is_host,
-      status: row.qualification_status,
-      qualificationStatus: row.qualification_status,
+      // Live challenge cards must not expose an internal disqualification as an announced loss.
+      // Final qualification is returned only by the completed/results_ready loader below.
+      status: "active",
+      qualificationStatus: "active",
     };
     const list = out.get(row.challenge_id) ?? [];
     list.push(player);
@@ -530,6 +537,11 @@ async function buildViewerSchedule(
       prizePoolEligibilityStatus: unlimitedChallengeParticipantsTable.prizePoolEligibilityStatus,
       eligibilityReasonCode: unlimitedChallengeParticipantsTable.eligibilityReasonCode,
       inSettlementPopulation: unlimitedChallengeParticipantsTable.inSettlementPopulation,
+      finalVerificationStatus: unlimitedChallengeParticipantsTable.finalVerificationStatus,
+      finalVerificationRequestedAt: unlimitedChallengeParticipantsTable.finalVerificationRequestedAt,
+      finalVerificationSubmittedAt: unlimitedChallengeParticipantsTable.finalVerificationSubmittedAt,
+      finalVerificationCompletedAt: unlimitedChallengeParticipantsTable.finalVerificationCompletedAt,
+      finalVerificationSource: unlimitedChallengeParticipantsTable.finalVerificationSource,
     })
     .from(unlimitedChallengeParticipantsTable)
     .where(and(
@@ -565,9 +577,8 @@ async function buildViewerSchedule(
   const viewerStreakBroken =
     state.failedDays > 0 ||
     participant?.eligibilityReasonCode === "daily_goal_missed";
-  const viewerResultsReady =
-    viewerStreakBroken || challenge.resultsStatus === "results_ready";
-  const viewerResultsStatus = viewerStreakBroken ? "results_ready" : challenge.resultsStatus;
+  const viewerResultsReady = challenge.resultsStatus === "results_ready";
+  const viewerResultsStatus = challenge.resultsStatus;
 
   return {
     startLocalDate: resolveChallengeStartLocalDate(challenge),
@@ -578,15 +589,22 @@ async function buildViewerSchedule(
     participantsPendingCount: closure.participantsPendingCount,
     latestParticipantEndAtUtc: isoOrNull(closure.latestParticipantEndAtUtc),
     // §10 — the viewer's own eligibility, explicit rather than inferred from day rows.
-    prizePoolEligibilityStatus: participant?.prizePoolEligibilityStatus ?? null,
-    eligibilityReasonCode: participant?.eligibilityReasonCode ?? null,
+    prizePoolEligibilityStatus: viewerResultsReady ? (participant?.prizePoolEligibilityStatus ?? null) : "pending",
+    eligibilityReasonCode: viewerResultsReady ? (participant?.eligibilityReasonCode ?? null) : null,
     inSettlementPopulation: participant?.inSettlementPopulation ?? null,
-    // The challenge-level resultsStatus still waits for settlement, but a viewer's own failed
-    // streak is final as soon as a day fails. Clients can show that result immediately.
+    finalVerificationStatus: participant?.finalVerificationStatus ?? null,
+    finalVerificationRequired: participant?.inSettlementPopulation === true
+      && participant?.finalVerificationStatus === "requested",
+    finalVerificationRequestedAt: isoOrNull(participant?.finalVerificationRequestedAt),
+    finalVerificationSubmittedAt: isoOrNull(participant?.finalVerificationSubmittedAt),
+    finalVerificationCompletedAt: isoOrNull(participant?.finalVerificationCompletedAt),
+    finalVerificationSource: participant?.finalVerificationSource ?? null,
+    // Global embargo: a missed day may be recorded internally, but no winner/loser result is final
+    // or publishable until the race-wide settlement is ready.
     viewerResultsStatus,
     viewerResultsReady,
     viewerResultFinal: viewerResultsReady,
-    viewerResultReasonCode: viewerStreakBroken ? "daily_goal_missed" : null,
+    viewerResultReasonCode: viewerResultsReady && viewerStreakBroken ? "daily_goal_missed" : null,
     viewerStatus: state.viewerStatus,
     viewerTimezone: state.viewerTimezone,
     viewerTimezoneLockedAt: isoOrNull(participant?.timezoneLockedAt),
@@ -1059,6 +1077,11 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
       prizePoolEligibilityStatus: unlimitedChallengeParticipantsTable.prizePoolEligibilityStatus,
       eligibilityReasonCode: unlimitedChallengeParticipantsTable.eligibilityReasonCode,
       inSettlementPopulation: unlimitedChallengeParticipantsTable.inSettlementPopulation,
+      finalVerificationStatus: unlimitedChallengeParticipantsTable.finalVerificationStatus,
+      finalVerificationRequestedAt: unlimitedChallengeParticipantsTable.finalVerificationRequestedAt,
+      finalVerificationSubmittedAt: unlimitedChallengeParticipantsTable.finalVerificationSubmittedAt,
+      finalVerificationCompletedAt: unlimitedChallengeParticipantsTable.finalVerificationCompletedAt,
+      finalVerificationSource: unlimitedChallengeParticipantsTable.finalVerificationSource,
     })
     .from(unlimitedChallengeParticipantsTable)
     .where(and(
@@ -1119,9 +1142,8 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
   const viewerStreakBroken =
     failedDays > 0 ||
     participant.eligibilityReasonCode === "daily_goal_missed";
-  const viewerResultsReady =
-    viewerStreakBroken || challenge.resultsStatus === "results_ready";
-  const viewerResultsStatus = viewerStreakBroken ? "results_ready" : challenge.resultsStatus;
+  const viewerResultsReady = challenge.resultsStatus === "results_ready";
+  const viewerResultsStatus = challenge.resultsStatus;
 
   return res.json({
     challengeId,
@@ -1137,10 +1159,18 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     viewerResultsStatus,
     viewerResultsReady,
     viewerResultFinal: viewerResultsReady,
-    viewerResultReasonCode: viewerStreakBroken ? "daily_goal_missed" : null,
-    prizePoolEligibilityStatus: participant.prizePoolEligibilityStatus,
-    eligibilityReasonCode: participant.eligibilityReasonCode,
+    viewerResultReasonCode: viewerResultsReady && viewerStreakBroken ? "daily_goal_missed" : null,
+    // Do not publish final winner/loser eligibility through history before global settlement.
+    prizePoolEligibilityStatus: viewerResultsReady ? participant.prizePoolEligibilityStatus : "pending",
+    eligibilityReasonCode: viewerResultsReady ? participant.eligibilityReasonCode : null,
     inSettlementPopulation: participant.inSettlementPopulation,
+    finalVerificationStatus: participant.finalVerificationStatus,
+    finalVerificationRequired: participant.inSettlementPopulation
+      && participant.finalVerificationStatus === "requested",
+    finalVerificationRequestedAt: participant.finalVerificationRequestedAt,
+    finalVerificationSubmittedAt: participant.finalVerificationSubmittedAt,
+    finalVerificationCompletedAt: participant.finalVerificationCompletedAt,
+    finalVerificationSource: participant.finalVerificationSource,
     // §20 — history is never erased when eligibility is lost: a participant who failed day 4 still
     // accumulates days 5..N, so the record can show "passed 6, failed 1, not eligible".
     passedDays: days.filter((d) => d.dayStatus === "passed").length,
@@ -1149,6 +1179,41 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     days,
   });
 });
+
+const finalVerificationSubmissionSchema = z.object({
+  source: z.enum(["health_connect", "healthkit", "android_health_connect", "ios_healthkit"]),
+  dayNumber: z.number().int().min(1).max(90),
+  intervalStartUtc: z.string().datetime(),
+  intervalEndUtc: z.string().datetime(),
+  verifiedSteps: z.number().int().min(0).max(200_000),
+  measuredAtUtc: z.string().datetime(),
+});
+
+// The client reads the exact server-owned final-day interval from Health Connect / HealthKit only
+// after the latest participant deadline. A race cannot settle until every frozen participant has
+// completed this handshake (and manual production review, when configured).
+router.post(
+  "/unlimited-challenges/:id/final-verification",
+  requireAuth,
+  requireActiveAccount,
+  async (req, res) => {
+    const parsed = finalVerificationSubmissionSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: "Invalid final verification payload.", details: parsed.error.issues });
+    try {
+      const result = await submitUnlimitedFinalVerification({
+        challengeId: String(req.params.id),
+        userId: (req as AuthenticatedRequest).descopeUserId,
+        ...parsed.data,
+      });
+      return res.json(result);
+    } catch (error) {
+      if (error instanceof UnlimitedFinalVerificationError) {
+        return res.status(error.status).json({ error: error.message, code: error.code });
+      }
+      throw error;
+    }
+  },
+);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // Chat: comments + reactions
@@ -1323,6 +1388,13 @@ router.get("/unlimited-challenges/:id/leaderboard", requireAuth, async (req, res
   // Live Board may paginate the full roster (100+/page). Cap keeps abuse bounded.
   const limit = Math.min(Math.max(Number(req.query.limit) || 25, 1), 500);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const [challengeResult] = await db
+    .select({ resultsStatus: unlimitedChallengesTable.resultsStatus })
+    .from(unlimitedChallengesTable)
+    .where(eq(unlimitedChallengesTable.id, challengeId))
+    .limit(1);
+  if (!challengeResult) return res.status(404).json({ error: "Challenge not found." });
+  const resultsReady = challengeResult.resultsStatus === "results_ready";
 
   // Bounded, paginated. Ranking is informational only (never affects payout): eligible first,
   // then more completed (passed) days, then total verified steps.
@@ -1383,9 +1455,10 @@ router.get("/unlimited-challenges/:id/leaderboard", requireAuth, async (req, res
         username: r.username ?? displayName,
         fullName: r.fullName ?? null,
         displayName,
-        qualificationStatus: r.qualificationStatus,
-        prizePoolEligibilityStatus: r.prizePoolEligibilityStatus,
-        eligibilityReason: publicEligibilityReason(r.eligibilityReasonCode),
+        // Live progress remains visible, but final winner/loser fields are embargoed race-wide.
+        qualificationStatus: resultsReady ? r.qualificationStatus : "active",
+        prizePoolEligibilityStatus: resultsReady ? r.prizePoolEligibilityStatus : "pending",
+        eligibilityReason: resultsReady ? publicEligibilityReason(r.eligibilityReasonCode) : null,
         completedDays: r.completedDays,
         totalChallengeSteps: r.totalSteps + verifiedToday,
         currentSteps,

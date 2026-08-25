@@ -14,7 +14,9 @@ import {
 import {
   captureSettlementPopulation,
   refreshUnlimitedResultsStatus,
+  requestFinalParticipantVerifications,
 } from "./unlimitedResults.js";
+import { completeParticipantFinalVerificationAfterReview } from "./unlimitedFinalVerification.js";
 import { settleUnlimitedChallenge } from "./unlimitedChallengeSettlement.js";
 import { enqueueJob } from "./queue.js";
 import { triggerEvent } from "./pusher.js";
@@ -47,7 +49,9 @@ export async function startUnlimitedChallenge(challengeId: string): Promise<void
   if (pre.status === "waiting") {
     const [claimed] = await db
       .update(unlimitedChallengesTable)
-      .set({ status: "starting", updatedAt: new Date() })
+      // Freeze the authoritative race-start instant with the claim. A crash before population
+      // capture can then still distinguish a pre-start withdrawal from a post-start forfeit.
+      .set({ status: "starting", startedAtUtc: pre.startedAtUtc ?? new Date(), updatedAt: new Date() })
       .where(and(eq(unlimitedChallengesTable.id, challengeId), eq(unlimitedChallengesTable.status, "waiting")))
       .returning({ id: unlimitedChallengesTable.id });
     if (!claimed) return; // another worker won
@@ -77,7 +81,11 @@ export async function startUnlimitedChallenge(challengeId: string): Promise<void
 
   await db
     .update(unlimitedChallengesTable)
-    .set({ status: "active", startedAtUtc: pre.startedAtUtc ?? new Date(), updatedAt: new Date() })
+    .set({
+      status: "active",
+      startedAtUtc: sql`COALESCE(${unlimitedChallengesTable.startedAtUtc}, ${new Date()})`,
+      updatedAt: new Date(),
+    })
     .where(and(eq(unlimitedChallengesTable.id, challengeId), eq(unlimitedChallengesTable.status, "starting")));
 
   await enqueueJob("scheduled-jobs", "unlimited.settle", { challengeId }, {
@@ -138,9 +146,10 @@ export async function notifyDueParticipantStarts(now: Date = new Date()): Promis
 
 /**
  * Finalize participant-days whose window has closed. Within the grace period the day is marked
- * `pending_verification` (late verified syncs still count); after `windowEnd + grace` it is finalized
- * `passed`/`failed` from the verified daily total for that locked-tz local date. A `failed` day
- * permanently disqualifies the participant. Idempotent via status guards.
+ * `pending_verification` (late verified syncs still count); after `windowEnd + grace`, non-final
+ * days are finalized from their verified daily total. The final day remains pending for the
+ * post-boundary provider reconciliation. A `failed` day permanently disqualifies the participant.
+ * Idempotent via status guards.
  */
 export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<void> {
   const graceMs = config.unlimitedGoal.graceMs;
@@ -178,6 +187,7 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
       participantId: unlimitedChallengeDaysTable.participantId,
       userId: unlimitedChallengeDaysTable.userId,
       localDate: unlimitedChallengeDaysTable.localDate,
+      dayNumber: unlimitedChallengeDaysTable.dayNumber,
       goalSteps: unlimitedChallengeDaysTable.goalSteps,
       creditedSteps: unlimitedChallengeDaysTable.verifiedSteps,
     })
@@ -189,6 +199,23 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
     .limit(500);
 
   for (const d of due) {
+    const [challengeDuration] = await db
+      .select({ durationDays: unlimitedChallengesTable.durationDays })
+      .from(unlimitedChallengesTable)
+      .where(eq(unlimitedChallengesTable.id, d.challengeId))
+      .limit(1);
+    // The final day is never decided from a grace timer. It stays pending until the exact
+    // post-boundary HealthKit/Health Connect range submission is processed.
+    if (challengeDuration && d.dayNumber === challengeDuration.durationDays) {
+      await db
+        .update(unlimitedChallengeDaysTable)
+        .set({ status: "pending_verification", updatedAt: now })
+        .where(and(
+          eq(unlimitedChallengeDaysTable.id, d.id),
+          inArray(unlimitedChallengeDaysTable.status, ["pending", "in_progress", "pending_verification"]),
+        ));
+      continue;
+    }
     if (config.unlimitedGoal.verificationMode === "manual") {
       // A mobile-supplied `source: health_connect|healthkit` label is provenance, not attestation.
       // In production-funded challenges the automatic worker may snapshot that claim for ops, but
@@ -234,15 +261,8 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
           eq(unlimitedChallengeParticipantsTable.id, d.participantId),
           inArray(unlimitedChallengeParticipantsTable.qualificationStatus, ["active", "goal_completed_today", "pending_verification"]),
         ));
-      void emitUnlimitedRealtime(
-        d.challengeId,
-        "participant_eligibility_updated",
-        { challengeId: d.challengeId, userId: d.userId, prizePoolEligibilityStatus: "not_eligible", eligibilityReason: "daily_goal_missed" },
-        {
-          event: "race:participant-eligibility-updated",
-          payload: { raceId: d.challengeId, userId: d.userId, prizePoolEligibilityStatus: "not_eligible", eligibilityReason: "daily_goal_missed" },
-        },
-      );
+      // Internal eligibility may be decided early, but no winner/loser realtime event is emitted
+      // before the challenge-level results_ready transition.
     }
   }
 }
@@ -255,6 +275,9 @@ export type UnlimitedDayVerificationResolution = {
   authoritativeSteps?: number;
   userId?: string;
   challengeId?: string;
+  participantId?: string;
+  dayNumber?: number;
+  finalVerificationCompleted?: boolean;
 };
 
 /**
@@ -269,6 +292,7 @@ export async function resolveUnlimitedDayVerification(input: {
   dayId: string;
   decision: "approve" | "reject";
   authoritativeSteps?: number;
+  verificationSource?: "health_connect" | "healthkit";
   now?: Date;
 }): Promise<UnlimitedDayVerificationResolution> {
   const now = input.now ?? new Date();
@@ -279,6 +303,7 @@ export async function resolveUnlimitedDayVerification(input: {
         challengeId: unlimitedChallengeDaysTable.challengeId,
         participantId: unlimitedChallengeDaysTable.participantId,
         userId: unlimitedChallengeDaysTable.userId,
+        dayNumber: unlimitedChallengeDaysTable.dayNumber,
         goalSteps: unlimitedChallengeDaysTable.goalSteps,
         status: unlimitedChallengeDaysTable.status,
         verifiedSteps: unlimitedChallengeDaysTable.verifiedSteps,
@@ -301,10 +326,12 @@ export async function resolveUnlimitedDayVerification(input: {
         authoritativeSteps: day.verifiedSteps,
         userId: day.userId,
         challengeId: day.challengeId,
+        participantId: day.participantId,
+        dayNumber: day.dayNumber,
       };
     }
     if (day.status !== "pending_verification") {
-      return { found: true, resolved: false, status: day.status, userId: day.userId, challengeId: day.challengeId };
+      return { found: true, resolved: false, status: day.status, userId: day.userId, challengeId: day.challengeId, participantId: day.participantId, dayNumber: day.dayNumber };
     }
 
     const authoritativeSteps = input.decision === "approve"
@@ -344,24 +371,35 @@ export async function resolveUnlimitedDayVerification(input: {
       authoritativeSteps,
       userId: day.userId,
       challengeId: day.challengeId,
+      participantId: day.participantId,
+      dayNumber: day.dayNumber,
     } as UnlimitedDayVerificationResolution;
   });
 
-  if (result.resolved && result.userId && result.challengeId) {
+  if (result.found && result.userId && result.challengeId && result.participantId && result.dayNumber) {
+    result.finalVerificationCompleted = await completeParticipantFinalVerificationAfterReview({
+      challengeId: result.challengeId,
+      participantId: result.participantId,
+      dayNumber: result.dayNumber,
+      now,
+      source: input.verificationSource,
+    });
+  }
+  if (result.finalVerificationCompleted && result.userId && result.challengeId) {
     void emitUnlimitedRealtime(
       result.challengeId,
-      "participant_eligibility_updated",
+      "final_verification_updated",
       {
         challengeId: result.challengeId,
         userId: result.userId,
-        verificationStatus: result.status,
+        finalVerificationStatus: "completed",
       },
       {
-        event: "race:participant-eligibility-updated",
+        event: "race:final-verification-updated",
         payload: {
           raceId: result.challengeId,
           userId: result.userId,
-          verificationStatus: result.status,
+          finalVerificationStatus: "completed",
         },
       },
     );
@@ -426,6 +464,20 @@ export async function reconcileUnlimitedChallenges(now: Date = new Date()): Prom
 
     await finalizeUnlimitedDays(now);
 
+    // Only after the race-wide latest local end do clients receive the final provider-read request.
+    const finalVerificationCandidates = await db
+      .select({ id: unlimitedChallengesTable.id })
+      .from(unlimitedChallengesTable)
+      .where(and(
+        inArray(unlimitedChallengesTable.status, ["active", "settling"]),
+        ne(unlimitedChallengesTable.resultsStatus, "results_ready"),
+      ));
+    for (const c of finalVerificationCandidates) {
+      await requestFinalParticipantVerifications(c.id, now).catch((err) =>
+        logger.error({ err, challengeId: c.id }, "[Unlimited] final verification request failed"),
+      );
+    }
+
     // Result lifecycle (in_progress → waiting_for_participants → steps_validation_in_progress).
     // Driven every tick, not only at settlement time, so a participant who finishes days before
     // the rest sees "waiting for the others" instead of a stuck in-progress board.
@@ -447,6 +499,19 @@ export async function reconcileUnlimitedChallenges(now: Date = new Date()): Prom
       .from(unlimitedChallengesTable)
       .where(and(inArray(unlimitedChallengesTable.status, ["active", "settling"]), lte(unlimitedChallengesTable.settlementNotBeforeUtc, now)));
     for (const c of dueSettle) await settleUnlimitedChallenge(c.id);
+
+    // Recover a crash after the atomic payout/results commit but before result events were queued.
+    const completedNeedingPublication = await db
+      .select({ id: unlimitedChallengesTable.id })
+      .from(unlimitedChallengesTable)
+      .where(and(
+        eq(unlimitedChallengesTable.status, "completed"),
+        or(
+          ne(unlimitedChallengesTable.resultsStatus, "results_ready"),
+          sql`${unlimitedChallengesTable.resultsAnnouncedAt} is null`,
+        ),
+      ));
+    for (const c of completedNeedingPublication) await settleUnlimitedChallenge(c.id);
   } catch (err) {
     logger.error({ err }, "[Unlimited] reconcile tick failed");
   }

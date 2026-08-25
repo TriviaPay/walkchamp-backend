@@ -62,9 +62,24 @@ const uploadLimiter: RequestHandler = config.features.rateLimitingEnabled
       dimensions: ["actor", "ip", "device", "token"],
     })
   : (_req, _res, next) => next();
-const accountDeletionRequestLimiter: RequestHandler = config.features.rateLimitingEnabled
+const publicAccountDeletionRequestLimiter: RequestHandler = config.features.rateLimitingEnabled
   ? createRedisRateLimit({
-      bucket: "account-deletion-request",
+      // Versioned separately from the original shared bucket so legitimate website users are not
+      // locked out by earlier app requests or deployment smoke tests.
+      bucket: "public-account-deletion-request-v2",
+      windowMs: 15 * 60 * 1000,
+      max: 10,
+      failureMode: "closed",
+      message: "Too many account deletion requests — please try again later.",
+      code: "DELETION_REQUEST_RATE_LIMITED",
+      key: rateLimitByActorOrIp,
+      dimensions: ["ip", "target"],
+      target: (req) => typeof req.body?.email === "string" ? req.body.email : null,
+    })
+  : (_req, _res, next) => next();
+const authenticatedAccountDeletionRequestLimiter: RequestHandler = config.features.rateLimitingEnabled
+  ? createRedisRateLimit({
+      bucket: "authenticated-account-deletion-request",
       windowMs: 60 * 60 * 1000,
       max: 3,
       failureMode: "closed",
@@ -829,7 +844,7 @@ const publicAccountDeletionRequestSchema = z.object({
 // ── POST /api/account-deletion-request ───────────────────────────────────────
 // Public counterpart for www.miragaming.com/walkchamp/delete-account. It does not look up or mutate an account;
 // support verifies ownership before using the authenticated deletion procedure.
-router.post("/account-deletion-request", accountDeletionRequestLimiter, async (req, res) => {
+router.post("/account-deletion-request", publicAccountDeletionRequestLimiter, async (req, res) => {
   const parsed = publicAccountDeletionRequestSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: "Enter a valid account email and username.", code: "INVALID_REQUEST" });
@@ -865,7 +880,7 @@ router.post("/account-deletion-request", accountDeletionRequestLimiter, async (r
 // The app uses this reviewed deletion flow: an authenticated request is emailed to the admin
 // mailbox, then the user sees a success popup. Identity comes from the session/database rather
 // than client-supplied fields so another person's account cannot be named in the request.
-router.post("/me/account/deletion-request", requireAuth, accountDeletionRequestLimiter, async (req, res) => {
+router.post("/me/account/deletion-request", requireAuth, authenticatedAccountDeletionRequestLimiter, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const [profile] = await db
     .select({

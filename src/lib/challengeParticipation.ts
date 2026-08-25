@@ -65,13 +65,31 @@ export function emptyChallengeParticipationBreakdown(): ChallengeParticipationBr
   });
 }
 
-function isConfiguredExcludedUser(userId: string): boolean {
+export function participationExcludedUserIds(): Set<string> {
   const configured = [process.env.ADMIN_USER_IDS, process.env.PARTICIPATION_EXCLUDED_USER_IDS]
     .filter(Boolean)
     .flatMap((value) => String(value).split(","))
     .map((value) => value.trim())
     .filter(Boolean);
-  return configured.includes(userId);
+  return new Set(configured);
+}
+
+export function isConfiguredParticipationExcludedUser(userId: string): boolean {
+  return participationExcludedUserIds().has(userId);
+}
+
+/** Same reserved-identity rule used by both participation reporting and Streak settlement. */
+export function isReservedParticipationIdentity(input: {
+  username?: string | null;
+  email?: string | null;
+}): boolean {
+  const reserved = /^(admin|ghost|system|test)([._+0-9-].*)?$/i;
+  const username = input.username?.trim() ?? "";
+  const email = input.email?.trim().toLowerCase() ?? "";
+  const [local = "", domain = ""] = email.split("@");
+  return reserved.test(username)
+    || reserved.test(local)
+    || ["example.com", "example.test", "test", "invalid"].includes(domain);
 }
 
 /**
@@ -90,7 +108,7 @@ export async function fetchChallengeParticipationBreakdown(
   executor: SqlExecutor,
   userId: string,
 ): Promise<ChallengeParticipationBreakdown> {
-  if (isConfiguredExcludedUser(userId)) return emptyChallengeParticipationBreakdown();
+  if (isConfiguredParticipationExcludedUser(userId)) return emptyChallengeParticipationBreakdown();
 
   const result = await executor.execute(sql`
     WITH eligible_user AS (

@@ -100,7 +100,8 @@ describe("activation follows the earliest participant, not the host", () => {
     expect(sched).toContain("preserved: true");
     expect(sched).toContain("healMissingParticipantSchedules");
     // Existing day rows are the authority for a participant already mid-run.
-    expect(sched).toContain("if ((existing?.count ?? 0) > 0");
+    expect(sched).toContain("if ((existing?.count ?? 0) === input.challenge.durationDays");
+    expect(sched).toContain("Incomplete participant schedule");
   });
 });
 
@@ -128,7 +129,8 @@ describe("settlement waits for the last participant on earth", () => {
     expect(settle).toContain("areAllRequiredDaysTerminal(challengeId)");
     expect(settle).toContain("if (!validation.allDaysTerminal)");
     expect(settle).toContain("settlement deferred — days not finalized");
-    expect(results).toContain("inArray(unlimitedChallengeDaysTable.status, [...NON_TERMINAL_DAY_STATUSES])");
+    expect(results).toContain("r.total !== challenge.durationDays");
+    expect(results).toContain("r.terminal === challenge.durationDays");
   });
 
   it("qualification and the equal split are unchanged", () => {

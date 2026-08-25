@@ -40,10 +40,50 @@ import {
   switchWalkAuthorityToPostgres,
   syncWalkIngestControlFromPostgres,
 } from "../lib/walkRedisIngest.js";
+import {
+  ProtectedRaceError,
+  getProtectedRaceReview,
+  resolveProtectedRaceAdmin,
+} from "../lib/protectedRaceAdjudication.js";
 
 const router = Router();
 
 router.use("/admin", requireAuth, requireAdminRole);
+
+router.get("/admin/races/:raceId/adjudication", async (req, res) => {
+  const detail = await getProtectedRaceReview(String(req.params.raceId));
+  if (!detail.room?.protectedRace) return res.status(404).json({ error: "Protected race not found." });
+  return res.json(detail);
+});
+
+const protectedAdjudicationActionSchema = z.object({
+  action: z.enum(["VERIFY", "DISQUALIFY", "VOID", "MARK_TIE", "RESTORE_ENTRY"]),
+  reason: z.string().trim().min(3).max(500),
+  evidenceReference: z.string().trim().min(1).max(1000).optional(),
+  participantId: z.string().uuid().optional(),
+  qualifyingSteps: z.number().int().min(0).max(500_000).optional(),
+  tieUserIds: z.array(z.string().min(1).max(200)).min(2).max(20).optional(),
+});
+
+router.post("/admin/races/:raceId/adjudication", async (req, res) => {
+  const parsed = protectedAdjudicationActionSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid adjudication action.", details: parsed.error.issues });
+  try {
+    const result = await resolveProtectedRaceAdmin({
+      ...parsed.data,
+      raceId: String(req.params.raceId),
+      adminUserId: (req as unknown as AuthenticatedRequest).descopeUserId,
+    });
+    if ("adjudication" in result && result.adjudication?.ready) {
+      const { autoCompleteRace } = await import("./races.js");
+      await autoCompleteRace(String(req.params.raceId), "protected_admin_resolved");
+    }
+    return res.json(result);
+  } catch (error) {
+    if (error instanceof ProtectedRaceError) return res.status(error.status).json({ error: error.message, code: error.code });
+    throw error;
+  }
+});
 
 const walkAuthorityReasonSchema = z.object({ reason: z.string().trim().min(3).max(500) });
 const walkSeedSchema = z.object({
@@ -89,6 +129,7 @@ const unlimitedDayVerificationSchema = z.discriminatedUnion("decision", [
     decision: z.literal("approve"),
     authoritativeSteps: z.number().int().min(0).max(200_000),
     reason: z.string().trim().min(3).max(500),
+    source: z.enum(["health_connect", "healthkit"]).optional(),
   }),
   z.object({
     decision: z.literal("reject"),
@@ -109,6 +150,7 @@ router.post("/admin/unlimited-challenges/:challengeId/days/:dayId/verification-r
     dayId: String(req.params.dayId),
     decision: parsed.data.decision,
     authoritativeSteps: parsed.data.decision === "approve" ? parsed.data.authoritativeSteps : undefined,
+    verificationSource: parsed.data.decision === "approve" ? parsed.data.source : undefined,
   });
   if (!result.found) return res.status(404).json({ error: "Unlimited challenge day not found" });
   if (!result.resolved && result.status !== "passed" && result.status !== "failed") {

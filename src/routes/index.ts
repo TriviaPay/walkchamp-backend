@@ -28,6 +28,7 @@ import pushRouter from "./push.js";
 import referralRouter from "./referral.js";
 import storeNotificationsRouter from "./storeNotifications.js";
 import adminRouter from "./admin.js";
+import protectedRaceRouter from "./protectedRace.js";
 
 const router: IRouter = Router();
 
@@ -36,6 +37,7 @@ router.use(authRouter);
 router.use(profileRouter);
 router.use(walletRouter);
 router.use(racesRouter);
+router.use(protectedRaceRouter);
 router.use(leaderboardRouter);
 router.use(paymentsRouter);
 router.use(walkRouter);

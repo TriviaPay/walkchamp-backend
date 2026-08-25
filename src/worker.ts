@@ -13,7 +13,7 @@ import { processDepositWebhookEvent } from "./lib/depositWebhookProcessor.js";
 import { evaluateScheduledStart, expireOpenWindow, sendScheduledReminder } from "./lib/waitingRoomJobs.js";
 import { grantVariableCoinReward } from "./lib/coinRewardService.js";
 import { startUnlimitedChallenge } from "./lib/unlimitedChallengeJobs.js";
-import { settleUnlimitedChallenge } from "./lib/unlimitedChallengeSettlement.js";
+import { announceUnlimitedChallengeResults, settleUnlimitedChallenge } from "./lib/unlimitedChallengeSettlement.js";
 import { processSponsuredEvents } from "./routes/sponsoredEvents.js";
 import { autoCompleteRace } from "./routes/races.js";
 
@@ -131,11 +131,17 @@ async function main() {
         case "unlimited.settle":
           if (challengeId) await settleUnlimitedChallenge(challengeId);
           break;
+        case "unlimited.announce":
+          if (challengeId) await announceUnlimitedChallengeResults(challengeId);
+          break;
         case "sponsored.start":
           if (roomId) await processSponsuredEvents(roomId);
           break;
         case "race.settlement_retry":
           if (raceId) await autoCompleteRace(raceId, "settlement_retry");
+          break;
+        case "race.protected_adjudication_retry":
+          if (raceId) await autoCompleteRace(raceId, "protected_adjudication_retry");
           break;
         default:
           break;

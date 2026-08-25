@@ -19,8 +19,14 @@ import {
   unlimitedChallengeDaysTable,
   type UnlimitedChallenge,
 } from "../../db/src/schema/unlimitedChallenge.js";
+import { profilesTable } from "../../db/src/schema/profiles.js";
 import { emitUnlimitedRealtime } from "./unlimitedRealtime.js";
 import { logger } from "./logger.js";
+import { sendNotification } from "../routes/notifications.js";
+import {
+  isConfiguredParticipationExcludedUser,
+  isReservedParticipationIdentity,
+} from "./challengeParticipation.js";
 
 // ── Status vocabularies ───────────────────────────────────────────────────────
 
@@ -140,6 +146,9 @@ export interface ValidationState {
   pendingDayCount: number;
   /** Participants who still hold at least one non-terminal day. */
   participantsAwaitingValidation: number;
+  /** Required rows absent (or extra) across the frozen population. */
+  incompleteParticipantCount: number;
+  missingDayCount: number;
 }
 
 /**
@@ -149,28 +158,137 @@ export interface ValidationState {
  * they cannot qualify, so an unverified day of theirs must not hold everyone else's result.
  */
 export async function areAllRequiredDaysTerminal(challengeId: string): Promise<ValidationState> {
+  const [challenge] = await db
+    .select({ durationDays: unlimitedChallengesTable.durationDays })
+    .from(unlimitedChallengesTable)
+    .where(eq(unlimitedChallengesTable.id, challengeId))
+    .limit(1);
+  if (!challenge) {
+    return {
+      allDaysTerminal: false,
+      pendingDayCount: 0,
+      participantsAwaitingValidation: 0,
+      incompleteParticipantCount: 0,
+      missingDayCount: 0,
+    };
+  }
+
   const rows = await db
     .select({
-      participantId: unlimitedChallengeDaysTable.participantId,
-      pending: sql<number>`count(*)::int`,
+      participantId: unlimitedChallengeParticipantsTable.id,
+      total: sql<number>`count(${unlimitedChallengeDaysTable.id})::int`,
+      terminal: sql<number>`count(${unlimitedChallengeDaysTable.id}) filter (
+        where ${unlimitedChallengeDaysTable.status} in ('passed', 'failed')
+      )::int`,
+      pending: sql<number>`count(${unlimitedChallengeDaysTable.id}) filter (
+        where ${unlimitedChallengeDaysTable.status} in ('pending', 'in_progress', 'pending_verification')
+      )::int`,
     })
-    .from(unlimitedChallengeDaysTable)
-    .innerJoin(
-      unlimitedChallengeParticipantsTable,
+    .from(unlimitedChallengeParticipantsTable)
+    .leftJoin(
+      unlimitedChallengeDaysTable,
       eq(unlimitedChallengeParticipantsTable.id, unlimitedChallengeDaysTable.participantId),
     )
     .where(and(
-      eq(unlimitedChallengeDaysTable.challengeId, challengeId),
+      eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
       eq(unlimitedChallengeParticipantsTable.inSettlementPopulation, true),
-      inArray(unlimitedChallengeDaysTable.status, [...NON_TERMINAL_DAY_STATUSES]),
     ))
-    .groupBy(unlimitedChallengeDaysTable.participantId);
+    .groupBy(unlimitedChallengeParticipantsTable.id);
 
   const pendingDayCount = rows.reduce((sum, r) => sum + r.pending, 0);
+  const incomplete = rows.filter((r) => r.total !== challenge.durationDays);
+  const missingDayCount = incomplete.reduce(
+    (sum, r) => sum + Math.max(0, challenge.durationDays - r.total),
+    0,
+  );
   return {
-    allDaysTerminal: pendingDayCount === 0,
+    allDaysTerminal:
+      rows.length > 0
+      && incomplete.length === 0
+      && rows.every((r) => r.terminal === challenge.durationDays),
     pendingDayCount,
-    participantsAwaitingValidation: rows.length,
+    participantsAwaitingValidation: rows.filter((r) => r.pending > 0 || r.terminal !== challenge.durationDays).length,
+    incompleteParticipantCount: incomplete.length,
+    missingDayCount,
+  };
+}
+
+export interface FinalVerificationState {
+  allCompleted: boolean;
+  participantCount: number;
+  pendingParticipantCount: number;
+}
+
+/** Request one post-boundary provider reconciliation from every frozen participant. */
+export async function requestFinalParticipantVerifications(
+  challengeId: string,
+  now: Date = new Date(),
+): Promise<FinalVerificationState> {
+  const closure = await areAllParticipantWindowsClosed(challengeId, now);
+  if (!closure.allClosed) {
+    return { allCompleted: false, participantCount: closure.registeredParticipantCount, pendingParticipantCount: closure.registeredParticipantCount };
+  }
+
+  const requested = await db
+    .update(unlimitedChallengeParticipantsTable)
+    .set({
+      finalVerificationStatus: "requested",
+      finalVerificationRequestedAt: now,
+      updatedAt: now,
+    })
+    .where(and(
+      eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
+      eq(unlimitedChallengeParticipantsTable.inSettlementPopulation, true),
+      eq(unlimitedChallengeParticipantsTable.finalVerificationStatus, "pending"),
+    ))
+    .returning({
+      id: unlimitedChallengeParticipantsTable.id,
+      userId: unlimitedChallengeParticipantsTable.userId,
+    });
+
+  if (requested.length > 0) {
+    emitUnlimitedRealtime(challengeId, "final_verification_requested", {
+      challengeId,
+      participantCount: closure.registeredParticipantCount,
+      requestedAt: now.toISOString(),
+    }, {
+      event: "race:final-verification-requested",
+      payload: { raceId: challengeId, challengeType: "unlimited_goal" },
+    });
+    for (const participant of requested) {
+      void sendNotification(
+        participant.userId,
+        "race_verification_pending",
+        "Final results are being verified",
+        "Open WalkChamp so we can confirm your final challenge day with your health app.",
+        { challengeId, dedupeKey: `unlimited_final_verification:${challengeId}:${participant.userId}` },
+      ).catch(() => {});
+    }
+  }
+  return areAllFinalParticipantVerificationsComplete(challengeId);
+}
+
+export async function areAllFinalParticipantVerificationsComplete(
+  challengeId: string,
+): Promise<FinalVerificationState> {
+  const [row] = await db
+    .select({
+      participants: sql<number>`count(*)::int`,
+      pending: sql<number>`count(*) filter (
+        where ${unlimitedChallengeParticipantsTable.finalVerificationStatus} <> 'completed'
+      )::int`,
+    })
+    .from(unlimitedChallengeParticipantsTable)
+    .where(and(
+      eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
+      eq(unlimitedChallengeParticipantsTable.inSettlementPopulation, true),
+    ));
+  const participantCount = row?.participants ?? 0;
+  const pendingParticipantCount = row?.pending ?? participantCount;
+  return {
+    allCompleted: participantCount > 0 && pendingParticipantCount === 0,
+    participantCount,
+    pendingParticipantCount,
   };
 }
 
@@ -230,8 +348,8 @@ export async function deriveResultsState(
  * Recompute and persist a challenge's results status, emitting on every transition.
  *
  * Idempotent: the UPDATE is a compare-and-set on the previous value, so concurrent reconciler
- * ticks cannot emit the same transition twice. results_ready is written only by
- * markResultsReady() after settlement commits — this function never promotes into it.
+ * ticks cannot emit the same transition twice. results_ready is written only by the settlement
+ * transaction after all gates pass — this function never promotes into it.
  */
 export async function refreshUnlimitedResultsStatus(
   challengeId: string,
@@ -253,7 +371,7 @@ export async function refreshUnlimitedResultsStatus(
 
   const state = await deriveResultsState(challenge, now);
   if (state.resultsStatus === challenge.resultsStatus) return state;
-  if (state.resultsStatus === "results_ready") return state; // owned by markResultsReady
+  if (state.resultsStatus === "results_ready") return state; // owned by settlement
 
   const [changed] = await db
     .update(unlimitedChallengesTable)
@@ -289,36 +407,6 @@ export async function refreshUnlimitedResultsStatus(
   return state;
 }
 
-/**
- * §9 — publish the final result. Called by settlement AFTER payouts are committed, so every
- * precondition (windows closed, days terminal, eligibility computed, split persisted) already
- * holds by construction.
- */
-export async function markResultsReady(
-  challengeId: string,
-  summary: { qualifiedParticipantCount: number; prizePoolCents: number; settlementStatus: string | null },
-  now: Date = new Date(),
-): Promise<boolean> {
-  const [changed] = await db
-    .update(unlimitedChallengesTable)
-    .set({ resultsStatus: "results_ready", resultsReadyAt: now, updatedAt: now })
-    .where(and(
-      eq(unlimitedChallengesTable.id, challengeId),
-      ne(unlimitedChallengesTable.resultsStatus, "results_ready"),
-    ))
-    .returning({ id: unlimitedChallengesTable.id });
-  if (!changed) return false; // already published — do not double-emit
-
-  logger.info({ challengeId, ...summary }, "[Unlimited] results ready");
-  emitUnlimitedRealtime(
-    challengeId,
-    "results_ready",
-    { challengeId, resultsStatus: "results_ready", ...summary, readyAt: now.toISOString() },
-    { event: "race:results_ready", payload: { raceId: challengeId, challengeType: "unlimited_goal", ...summary } },
-  );
-  return true;
-}
-
 // ── §2 Settlement population ─────────────────────────────────────────────────
 
 /**
@@ -332,13 +420,49 @@ export async function markResultsReady(
  * The size is stored on the challenge so the result denominator is fixed at the same instant.
  */
 export async function captureSettlementPopulation(challengeId: string): Promise<number> {
-  await db
-    .update(unlimitedChallengeParticipantsTable)
-    .set({ inSettlementPopulation: false, updatedAt: new Date() })
-    .where(and(
-      eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
-      eq(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
-    ));
+  const [challenge] = await db
+    .select({
+      settlementPopulationSize: unlimitedChallengesTable.settlementPopulationSize,
+      startedAtUtc: unlimitedChallengesTable.startedAtUtc,
+    })
+    .from(unlimitedChallengesTable)
+    .where(eq(unlimitedChallengesTable.id, challengeId))
+    .limit(1);
+  if (!challenge) return 0;
+  // Once captured, never recompute from later membership status changes.
+  if (challenge.settlementPopulationSize != null) return challenge.settlementPopulationSize;
+
+  const identities = await db
+    .select({
+      participantId: unlimitedChallengeParticipantsTable.id,
+      userId: unlimitedChallengeParticipantsTable.userId,
+      username: profilesTable.username,
+      email: profilesTable.email,
+      qualificationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
+      leftAt: unlimitedChallengeParticipantsTable.leftAt,
+    })
+    .from(unlimitedChallengeParticipantsTable)
+    .leftJoin(profilesTable, eq(profilesTable.id, unlimitedChallengeParticipantsTable.userId))
+    .where(eq(unlimitedChallengeParticipantsTable.challengeId, challengeId));
+  const excludedIds = identities
+    .filter((row) => {
+      const inactive = ["left", "forfeited", "withdrawn", "quit"].includes(row.qualificationStatus);
+      const departedBeforeStart = inactive && (
+        !challenge.startedAtUtc
+        || !row.leftAt
+        || row.leftAt.getTime() < challenge.startedAtUtc.getTime()
+      );
+      return departedBeforeStart
+        || isConfiguredParticipationExcludedUser(row.userId)
+        || isReservedParticipationIdentity({ username: row.username, email: row.email });
+    })
+    .map((row) => row.participantId);
+  if (excludedIds.length > 0) {
+    await db
+      .update(unlimitedChallengeParticipantsTable)
+      .set({ inSettlementPopulation: false, updatedAt: new Date() })
+      .where(inArray(unlimitedChallengeParticipantsTable.id, excludedIds));
+  }
 
   const [row] = await db
     .select({ population: sql<number>`count(*)::int` })

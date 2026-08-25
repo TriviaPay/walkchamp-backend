@@ -57,6 +57,10 @@ export const unlimitedChallengesTable = pgTable(
     //   results_ready              → settled and committed
     resultsStatus: text("results_status").notNull().default("in_progress"),
     resultsReadyAt: timestamp("results_ready_at", { withTimezone: true }),
+    // Durable publication claim. Settlement and wallet credit commit with results_ready; the
+    // follow-up realtime/push announcement claims this timestamp so a crash can safely retry
+    // without announcing twice.
+    resultsAnnouncedAt: timestamp("results_announced_at", { withTimezone: true }),
     // Size of the settlement population captured at start, so the denominator of the result can
     // never drift as rows change afterwards.
     settlementPopulationSize: integer("settlement_population_size"),
@@ -110,6 +114,15 @@ export const unlimitedChallengeParticipantsTable = pgTable(
     // finished?" and toward the settlement denominator. Never recomputed afterwards, so the
     // result population cannot change unpredictably mid-challenge.
     inSettlementPopulation: boolean("in_settlement_population").notNull().default(true),
+    // A race-wide final verification is requested only after the latest participant end. The
+    // participant then submits an exact HealthKit/Health Connect total for their final-day window;
+    // production/manual mode holds it for review before moving to completed.
+    // pending | requested | submitted | completed
+    finalVerificationStatus: text("final_verification_status").notNull().default("pending"),
+    finalVerificationRequestedAt: timestamp("final_verification_requested_at", { withTimezone: true }),
+    finalVerificationSubmittedAt: timestamp("final_verification_submitted_at", { withTimezone: true }),
+    finalVerificationCompletedAt: timestamp("final_verification_completed_at", { withTimezone: true }),
+    finalVerificationSource: text("final_verification_source"),
     entryContributionCents: integer("entry_contribution_cents").notNull(),
     platformFeeCents: integer("platform_fee_cents").notNull().default(50),
     paymentReference: text("payment_reference"),

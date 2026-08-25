@@ -56,6 +56,17 @@ const envSchema = z
     ABSENT_VERIFICATION_POLICY: z.enum(["strict_hold", "pragmatic_fallback", "strict_cash_only"]).optional(),
     HYBRID_VERIFICATION_GRACE_HOURS: z.string().optional(),   // 2–6h sync grace before review
     HYBRID_REVIEW_WINDOW_HOURS: z.string().optional(),        // 24–72h ops SLA (informational)
+    MIN_PROTECTED_RACE_DURATION_MINUTES: z.coerce.number().int().min(60).max(10080).default(60),
+    CLOSE_RESULT_ABS_STEPS: z.coerce.number().int().min(0).max(10000).default(100),
+    CLOSE_RESULT_PERCENT: z.coerce.number().min(0).max(1).default(0.01),
+    HYBRID_RECON_PERCENT_TOLERANCE: z.coerce.number().min(0).max(1).default(0.02),
+    MAX_CONTINUOUS_OFFLINE_MINUTES: z.coerce.number().int().min(1).max(120).default(10),
+    MAX_OFFLINE_RACE_PERCENT: z.coerce.number().min(0).max(100).default(20),
+    FINAL_EVIDENCE_UPLOAD_GRACE_MINUTES: z.coerce.number().int().min(1).max(240).default(15),
+    PROTECTED_INTEGRITY_CHALLENGE_MINUTES: z.coerce.number().int().min(1).max(30).default(5),
+    PROTECTED_HEARTBEAT_INTERVAL_SECONDS: z.coerce.number().int().min(10).max(300).default(60),
+    APPLE_APP_ATTEST_TEAM_ID: z.string().optional(),
+    APPLE_APP_ATTEST_BUNDLE_ID: z.string().optional(),
     BLOOM_GUARDS_MODE: z.enum(["off", "monitor", "enforce"]).optional(),
     TRUST_PROXY_HOPS: z.coerce.number().int().min(1).optional(),
     TRUST_PROXY_CIDRS: z.string().optional(),
@@ -400,9 +411,9 @@ if (configErrors.length > 0) {
 // Backend-authoritative; never hardcoded in clients. openWindowMinutes drives the
 // open-window (non-scheduled) 30-minute expiry; minimumParticipants is the minimum
 // valid players required to start any non-sponsored room (frozen onto the room at creation).
-const parseIntWithFallback = (raw: unknown, fallback: number, min: number): number => {
+const parseIntWithFallback = (raw: unknown, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER): number => {
   const value = Number(raw);
-  return Number.isInteger(value) && value >= min ? value : fallback;
+  return Number.isInteger(value) && value >= min && value <= max ? value : fallback;
 };
 const waitingRoomOpenWindowMinutes = parseIntWithFallback(rawEnv.ROOM_OPEN_WINDOW_MINUTES, 30, 1);
 const waitingRoomMinimumParticipants = parseIntWithFallback(rawEnv.MINIMUM_ROOM_PARTICIPANTS, 2, 2);
@@ -425,8 +436,8 @@ const hybridAbsoluteToleranceSteps = parseIntWithFallback(rawEnv.HYBRID_RECON_AB
 // Strict-verification workflow windows (participant-funded races). Grace = health-sync grace
 // before a missing verification becomes reviewable; review window = the ops SLA (informational —
 // the race stays held until an ops decision, it is never auto-paid from live).
-const hybridVerificationGraceHours = parseIntWithFallback(rawEnv.HYBRID_VERIFICATION_GRACE_HOURS, 4, 1);
-const hybridReviewWindowHours = parseIntWithFallback(rawEnv.HYBRID_REVIEW_WINDOW_HOURS, 48, 1);
+const hybridVerificationGraceHours = parseIntWithFallback(rawEnv.HYBRID_VERIFICATION_GRACE_HOURS, 4, 2, 6);
+const hybridReviewWindowHours = parseIntWithFallback(rawEnv.HYBRID_REVIEW_WINDOW_HOURS, 48, 24, 72);
 // Server-controlled absent-verification policy. Explicit ABSENT_VERIFICATION_POLICY wins; otherwise
 // derive from the legacy boolean switches so existing deployments keep working.
 const absentVerificationPolicy: "strict_hold" | "pragmatic_fallback" | "strict_cash_only" = (() => {
@@ -501,6 +512,27 @@ export const config = {
     strictEnabled: absentVerificationPolicy !== "pragmatic_fallback",
     graceMs: hybridVerificationGraceHours * 60 * 60_000,
     reviewWindowMs: hybridReviewWindowHours * 60 * 60_000,
+  },
+  protectedRace: {
+    policyVersion: "protected-prize-v1",
+    minimumDurationMinutes: rawEnv.MIN_PROTECTED_RACE_DURATION_MINUTES,
+    closeResultAbsoluteSteps: rawEnv.CLOSE_RESULT_ABS_STEPS,
+    closeResultPercent: rawEnv.CLOSE_RESULT_PERCENT,
+    reconciliationAbsoluteSteps: hybridAbsoluteToleranceSteps,
+    reconciliationPercent: rawEnv.HYBRID_RECON_PERCENT_TOLERANCE,
+    verificationGraceMs: hybridVerificationGraceHours * 60 * 60_000,
+    reviewWindowMs: hybridReviewWindowHours * 60 * 60_000,
+    maxContinuousOfflineMs: rawEnv.MAX_CONTINUOUS_OFFLINE_MINUTES * 60_000,
+    maxOfflineRaceFraction: rawEnv.MAX_OFFLINE_RACE_PERCENT / 100,
+    finalEvidenceUploadGraceMs: rawEnv.FINAL_EVIDENCE_UPLOAD_GRACE_MINUTES * 60_000,
+    challengeTtlMs: rawEnv.PROTECTED_INTEGRITY_CHALLENGE_MINUTES * 60_000,
+    heartbeatIntervalMs: rawEnv.PROTECTED_HEARTBEAT_INTERVAL_SECONDS * 1000,
+    googlePackageName: rawEnv.GOOGLE_PLAY_PACKAGE_NAME?.trim() ?? null,
+    googleServiceAccountJson: rawEnv.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON?.trim() ?? null,
+    googleClientEmail: rawEnv.GOOGLE_PLAY_CLIENT_EMAIL?.trim() ?? null,
+    googlePrivateKey: rawEnv.GOOGLE_PLAY_PRIVATE_KEY?.replace(/\\n/g, "\n").trim() ?? null,
+    appleTeamId: rawEnv.APPLE_APP_ATTEST_TEAM_ID?.trim() ?? null,
+    appleBundleId: rawEnv.APPLE_APP_ATTEST_BUNDLE_ID?.trim() ?? rawEnv.APPLE_BUNDLE_ID?.trim() ?? null,
   },
   runtime: {
     requestTimeoutMs: 15_000,

@@ -29,6 +29,7 @@ import {
   type DbTx,
 } from "./raceIntegrity.js";
 import { logger } from "./logger.js";
+import { recordCoinLedgerEntry } from "./coinsService.js";
 import {
   CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY,
   CASH_CHALLENGES_UNSUPPORTED_FOR_CURRENCY_MESSAGE,
@@ -871,6 +872,96 @@ export async function createRefundBatchForRaceCancellation(input: {
   });
 
   return batch;
+}
+
+/**
+ * Fail-closed refund for a protected race that could not be adjudicated. This is deliberately
+ * available after start and is idempotent across the adjudication retry schedule and admin calls.
+ * Cash entries are restored through the normal wallet refund ledger; coin-entry debits are
+ * reversed through the coin ledger with stable keys.
+ */
+export async function createProtectedRaceVoidRefund(input: { raceId: string; reasonCode: string }) {
+  return db.transaction(async (tx) => {
+    const room = await lockRaceRoom(tx, input.raceId);
+    if (!room) throw new Error("RACE_NOT_FOUND");
+    if (!room.protectedRace) throw new Error("RACE_NOT_PROTECTED");
+
+    if (room.status === "voided") {
+      const [existingBatch] = await tx.select().from(refundBatchesTable)
+        .where(and(eq(refundBatchesTable.raceRoomId, input.raceId), eq(refundBatchesTable.sourceType, "protected_race_void")))
+        .orderBy(desc(refundBatchesTable.createdAt)).limit(1);
+      if (existingBatch) return existingBatch;
+    }
+    if (room.settlementStatus === "paid" || room.payoutFinalizedAt) throw new Error("RACE_ALREADY_SETTLED");
+
+    const participants = await tx.select({ userId: raceParticipantsTable.userId })
+      .from(raceParticipantsTable)
+      .where(and(eq(raceParticipantsTable.raceRoomId, input.raceId), ne(raceParticipantsTable.status, "left")));
+    const userIds = [...new Set(participants.map((p) => p.userId))];
+    const [batch] = await tx.insert(refundBatchesTable).values({
+      sourceType: "protected_race_void",
+      raceRoomId: input.raceId,
+      status: "processing",
+      totalItems: userIds.length,
+      metadata: { reasonCode: sanitizeReason(input.reasonCode) },
+    }).returning();
+
+    const coinCharges = await tx.select({
+      id: coinTransactionsTable.id,
+      userId: coinTransactionsTable.userId,
+      amount: coinTransactionsTable.amount,
+      source: coinTransactionsTable.source,
+    }).from(coinTransactionsTable).where(and(
+      eq(coinTransactionsTable.sourceId, input.raceId),
+      eq(coinTransactionsTable.transactionType, "spend"),
+      inArray(coinTransactionsTable.source, ["coins_battle_entry", "sponsored_event_entry"]),
+    ));
+
+    let succeededItems = 0;
+    for (const userId of userIds) {
+      if (room.entryAmountCents > 0) {
+        await createRefundForRaceParticipantTx(tx, {
+          raceId: input.raceId,
+          userId,
+          reasonCode: input.reasonCode,
+          requestSource: "protected_race_void",
+          idempotencyKey: `protected-race-void:${input.raceId}:${userId}`,
+        });
+      }
+      for (const charge of coinCharges.filter((entry) => entry.userId === userId)) {
+        await recordCoinLedgerEntry(tx, {
+          userId,
+          amount: Math.abs(charge.amount),
+          transactionType: "refund",
+          source: "protected_race_void_refund",
+          sourceId: input.raceId,
+          rewardCode: null,
+          reasonCode: sanitizeReason(input.reasonCode),
+          idempotencyKey: `protected-race-coin-refund:${charge.id}`,
+          description: "Protected race entry refunded because the result could not be adjudicated",
+          metadata: { raceId: input.raceId, originalCoinTransactionId: charge.id, originalSource: charge.source },
+        });
+      }
+      succeededItems += 1;
+    }
+
+    const now = new Date();
+    await tx.update(raceRoomsTable).set({
+      status: "voided",
+      settlementStatus: "refunded",
+      adjudicationStatus: "voided",
+      adjudicationReasonCodes: [sanitizeReason(input.reasonCode)],
+      voidedAt: now,
+      voidReason: sanitizeReason(input.reasonCode),
+      completedAt: sql`coalesce(${raceRoomsTable.completedAt}, ${now})`,
+      updatedAt: now,
+    }).where(eq(raceRoomsTable.id, input.raceId));
+
+    const [updatedBatch] = await tx.update(refundBatchesTable).set({
+      status: "succeeded", succeededItems, failedItems: 0, updatedAt: now,
+    }).where(eq(refundBatchesTable.id, batch.id)).returning();
+    return updatedBatch;
+  });
 }
 
 export async function approveRefund(input: {

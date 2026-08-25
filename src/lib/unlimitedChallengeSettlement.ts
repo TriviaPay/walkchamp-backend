@@ -1,4 +1,4 @@
-import { and, eq, ne, inArray, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import {
   unlimitedChallengesTable,
@@ -10,16 +10,19 @@ import { creditCashChallengePrizes, creditEntryRefunds } from "./cashChallengePa
 import { computeEqualSplit } from "./unlimitedChallengeMoney.js";
 import {
   areAllParticipantWindowsClosed,
+  areAllFinalParticipantVerificationsComplete,
   areAllRequiredDaysTerminal,
   evaluateParticipantEligibility,
-  markResultsReady,
   persistEligibility,
   refreshUnlimitedResultsStatus,
+  requestFinalParticipantVerifications,
 } from "./unlimitedResults.js";
 import { emitUnlimitedRealtime } from "./unlimitedRealtime.js";
 import { sendNotification } from "../routes/notifications.js";
 import { writeAuditLog } from "./auditLog.js";
 import { logger } from "./logger.js";
+import { insertOutboxEventTx, enqueueOutboxEvent } from "./outbox.js";
+import { outboxEventsTable } from "../../db/src/schema/index.js";
 
 /**
  * Settle an Unlimited Challenge: equal split of the prize pool among qualified finishers (everyone
@@ -33,7 +36,20 @@ import { logger } from "./logger.js";
 export async function settleUnlimitedChallenge(challengeId: string): Promise<void> {
   const [pre] = await db.select().from(unlimitedChallengesTable).where(eq(unlimitedChallengesTable.id, challengeId)).limit(1);
   if (!pre) return;
-  if (pre.status === "completed" || pre.status === "cancelled_by_platform") return;
+  if (pre.status === "completed") {
+    // Crash recovery for a transaction that committed payouts/results_ready before its outbox job
+    // was delivered. The durable outbox normally drives this; this direct path is an extra repair.
+    if (pre.resultsStatus !== "results_ready") {
+      await db.update(unlimitedChallengesTable).set({
+        resultsStatus: "results_ready",
+        resultsReadyAt: pre.resultsReadyAt ?? pre.settledAt ?? new Date(),
+        updatedAt: new Date(),
+      }).where(eq(unlimitedChallengesTable.id, challengeId));
+    }
+    await announceUnlimitedChallengeResults(challengeId);
+    return;
+  }
+  if (pre.status === "cancelled_by_platform") return;
   if (pre.status !== "active" && pre.status !== "settling") return;
 
   // ── Gate 1 (§1, §3, §4, §21): every settlement participant's OWN local run must be over ──
@@ -57,13 +73,31 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
     return;
   }
 
-  // ── Gate 2 (§8, §22): every required day must be terminal (passed/failed) ──
+  // ── Gate 2: every frozen participant completed a fresh post-boundary provider read ──
+  await requestFinalParticipantVerifications(challengeId);
+  const finalVerification = await areAllFinalParticipantVerificationsComplete(challengeId);
+  if (!finalVerification.allCompleted) {
+    logger.info(
+      { challengeId, pendingParticipants: finalVerification.pendingParticipantCount },
+      "[Unlimited] settlement deferred — final Health verification incomplete",
+    );
+    await refreshUnlimitedResultsStatus(challengeId);
+    return;
+  }
+
+  // ── Gate 3 (§8, §22): every required day must exist and be terminal ──
   // Verification/reconciliation completeness on top of the clock check. Provisional sensor steps
   // never satisfy this — only the Health Connect / HealthKit authoritative value finalizes a day.
   const validation = await areAllRequiredDaysTerminal(challengeId);
   if (!validation.allDaysTerminal) {
     logger.info(
-      { challengeId, pendingDays: validation.pendingDayCount, participants: validation.participantsAwaitingValidation },
+      {
+        challengeId,
+        pendingDays: validation.pendingDayCount,
+        missingDays: validation.missingDayCount,
+        incompleteParticipants: validation.incompleteParticipantCount,
+        participants: validation.participantsAwaitingValidation,
+      },
       "[Unlimited] settlement deferred — days not finalized",
     );
     await refreshUnlimitedResultsStatus(challengeId);
@@ -88,8 +122,8 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
   const eligibility = await evaluateParticipantEligibility(challengeId, pre.durationDays);
   await persistEligibility(eligibility);
 
-  const participants = eligibility.map((e) => ({ id: e.participantId, userId: e.userId }));
   const qualified = eligibility.filter((e) => e.status === "eligible");
+  let announcementOutbox: typeof outboxEventsTable.$inferSelect | null = null;
 
   // ── Zero-winner policy ────────────────────────────────────────────────────
   if (qualified.length === 0) {
@@ -117,8 +151,18 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
           settlementStatus: "refunded",
           qualifiedParticipantCount: 0,
           settledAt: new Date(),
+          resultsStatus: "results_ready",
+          resultsReadyAt: new Date(),
           updatedAt: new Date(),
         }).where(eq(unlimitedChallengesTable.id, challengeId));
+        announcementOutbox = await insertOutboxEventTx(tx, {
+          topic: "scheduled-jobs",
+          eventType: "unlimited.announce",
+          aggregateType: "unlimited_challenge",
+          aggregateId: challengeId,
+          idempotencyKey: `unlimited_announce:${challengeId}`,
+          payload: { challengeId },
+        });
       });
       await writeAuditLog({
         actorType: "system",
@@ -129,20 +173,7 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
         metadata: { prizePoolCents: pre.prizePoolCents, policy, refundedUsers: refundUserIds.size },
       });
       logger.warn({ challengeId, policy, refundedUsers: refundUserIds.size, prizePoolCents: pre.prizePoolCents }, "[Unlimited] zero winners — entry contributions refunded");
-      await markResultsReady(challengeId, {
-        qualifiedParticipantCount: 0,
-        prizePoolCents: pre.prizePoolCents,
-        settlementStatus: "refunded",
-      });
-      emitUnlimitedRealtime(
-        challengeId,
-        "challenge_completed",
-        { challengeId, winners: 0, settlementStatus: "refunded" },
-        {
-          event: "race:completed",
-          payload: { raceId: challengeId, challengeType: "unlimited_goal", winners: 0 },
-        },
-      );
+      if (announcementOutbox) await enqueueOutboxEvent(announcementOutbox);
       return;
     }
 
@@ -153,8 +184,18 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
       settlementStatus: policy === "manual_review" ? "manual_review" : policy,
       qualifiedParticipantCount: 0,
       settledAt: new Date(),
+      resultsStatus: "results_ready",
+      resultsReadyAt: new Date(),
       updatedAt: new Date(),
     }).where(eq(unlimitedChallengesTable.id, challengeId));
+    await insertOutboxEventTx(db, {
+      topic: "scheduled-jobs",
+      eventType: "unlimited.announce",
+      aggregateType: "unlimited_challenge",
+      aggregateId: challengeId,
+      idempotencyKey: `unlimited_announce:${challengeId}`,
+      payload: { challengeId },
+    });
     await writeAuditLog({
       actorType: "system",
       action: "unlimited_challenge.zero_winner",
@@ -166,20 +207,7 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
     logger.warn({ challengeId, policy, prizePoolCents: pre.prizePoolCents }, "[Unlimited] zero winners — held for manual handling (no auto-credit)");
     // The RESULT is final (nobody qualified) even though the money is held for ops — clients must
     // stop showing "validating" for a challenge whose outcome is decided.
-    await markResultsReady(challengeId, {
-      qualifiedParticipantCount: 0,
-      prizePoolCents: pre.prizePoolCents,
-      settlementStatus: policy === "manual_review" ? "manual_review" : policy,
-    });
-    emitUnlimitedRealtime(
-      challengeId,
-      "challenge_completed",
-      { challengeId, winners: 0, settlementStatus: policy },
-      {
-        event: "race:completed",
-        payload: { raceId: challengeId, challengeType: "unlimited_goal", winners: 0 },
-      },
-    );
+    await announceUnlimitedChallengeResults(challengeId);
     return;
   }
 
@@ -207,33 +235,75 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
       settlementStatus: "completed",
       qualifiedParticipantCount: qualified.length,
       settledAt: new Date(),
+      resultsStatus: "results_ready",
+      resultsReadyAt: new Date(),
       updatedAt: new Date(),
     }).where(eq(unlimitedChallengesTable.id, challengeId));
+    announcementOutbox = await insertOutboxEventTx(tx, {
+      topic: "scheduled-jobs",
+      eventType: "unlimited.announce",
+      aggregateType: "unlimited_challenge",
+      aggregateId: challengeId,
+      idempotencyKey: `unlimited_announce:${challengeId}`,
+      payload: { challengeId },
+    });
   });
 
   logger.info({ challengeId, winners: qualified.length, prizePoolCents: pre.prizePoolCents }, "[Unlimited] settled — equal split credited");
-  // §9 — only now is the result publishable: every window closed, every day terminal, eligibility
-  // recorded for every membership, the split persisted and the wallets credited.
-  await markResultsReady(challengeId, {
-    qualifiedParticipantCount: qualified.length,
-    prizePoolCents: pre.prizePoolCents,
-    settlementStatus: "completed",
-  });
+  if (announcementOutbox) await enqueueOutboxEvent(announcementOutbox);
+}
+
+/** Durable outbox consumer: publishes result/reward notifications after the settlement commit. */
+export async function announceUnlimitedChallengeResults(challengeId: string): Promise<void> {
+  const [challenge] = await db
+    .select()
+    .from(unlimitedChallengesTable)
+    .where(eq(unlimitedChallengesTable.id, challengeId))
+    .limit(1);
+  if (!challenge || challenge.resultsStatus !== "results_ready" || challenge.resultsAnnouncedAt) return;
+
+  const payouts = await db
+    .select({ userId: unlimitedChallengePayoutsTable.userId, payoutCents: unlimitedChallengePayoutsTable.payoutCents })
+    .from(unlimitedChallengePayoutsTable)
+    .where(eq(unlimitedChallengePayoutsTable.challengeId, challengeId));
+  const winners = payouts.length;
+  emitUnlimitedRealtime(
+    challengeId,
+    "results_ready",
+    {
+      challengeId,
+      resultsStatus: "results_ready",
+      qualifiedParticipantCount: challenge.qualifiedParticipantCount ?? winners,
+      prizePoolCents: challenge.prizePoolCents,
+      settlementStatus: challenge.settlementStatus,
+      readyAt: challenge.resultsReadyAt?.toISOString() ?? new Date().toISOString(),
+    },
+    {
+      event: "race:results_ready",
+      payload: { raceId: challengeId, challengeType: "unlimited_goal", winners },
+    },
+  );
   emitUnlimitedRealtime(
     challengeId,
     "challenge_completed",
-    { challengeId, winners: qualified.length },
+    { challengeId, winners, settlementStatus: challenge.settlementStatus },
     {
       event: "race:completed",
-      payload: { raceId: challengeId, challengeType: "unlimited_goal", winners: qualified.length },
+      payload: { raceId: challengeId, challengeType: "unlimited_goal", winners },
     },
   );
-  for (const a of allocations) {
-    const uid = userIdByParticipant.get(a.participantId)!;
-    void sendNotification(uid, "race_won", "You won!", `You qualified and won $${(a.payoutCents / 100).toFixed(2)}.`, {
+  for (const payout of payouts) {
+    await sendNotification(payout.userId, "race_won", "You won!", `You qualified and won $${(payout.payoutCents / 100).toFixed(2)}.`, {
       challengeId,
-      payoutCents: a.payoutCents,
-      dedupeKey: `unlimited_payout:${challengeId}:${uid}`,
-    }).catch(() => {});
+      payoutCents: payout.payoutCents,
+      dedupeKey: `unlimited_payout:${challengeId}:${payout.userId}`,
+    });
   }
+  await db
+    .update(unlimitedChallengesTable)
+    .set({ resultsAnnouncedAt: new Date(), updatedAt: new Date() })
+    .where(and(
+      eq(unlimitedChallengesTable.id, challengeId),
+      eq(unlimitedChallengesTable.resultsStatus, "results_ready"),
+    ));
 }
