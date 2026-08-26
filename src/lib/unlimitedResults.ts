@@ -3,7 +3,7 @@
  *
  * THE RULE: an Unlimited challenge produces no final result until every participant in the
  * settlement population has passed their OWN local challenge end, and every required day has a
- * terminal verification state. Participants hold different locked timezones, so "the host
+ * terminal verification state. Participants hold different effective day timezones, so "the host
  * finished", "the first participant finished" and "the viewer finished" are all meaningless as
  * finalization triggers — only the LAST local end matters.
  *

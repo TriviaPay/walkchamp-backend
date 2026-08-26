@@ -13,7 +13,7 @@ import { creditEntryRefunds } from "./cashChallengePayments.js";
 import { computeIsAdult } from "./dateOfBirth.js";
 import { isCashChallengeUnsupportedForUser } from "./cashChallengeFees.js";
 import { allocateChallengeCode } from "./uniqueCodes.js";
-import { validateUnlimitedSchedule } from "./challengeDayWindow.js";
+import { isStrictIanaTimezone, validateUnlimitedSchedule } from "./challengeDayWindow.js";
 import { UNLIMITED_LEFT_STATUSES } from "./unlimitedChallengeStatuses.js";
 import {
   materializeParticipantSchedule,
@@ -117,9 +117,9 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
   // Resolve the challenge timezone: an explicit request value wins; otherwise fall back to the
   // host's saved timezone. The schedule is validated + normalized in this zone. hostTz stays the
   // host participant's own locked timezone (daily-window behavior unchanged).
-  const hostTz = await lockUserTimezone(userId);
   const requestedTz = input.challengeTimezone?.trim();
-  const timezone = requestedTz ? requestedTz : hostTz;
+  const hostTz = requestedTz || await lockUserTimezone(userId);
+  const timezone = hostTz;
 
   // Strict USD-Unlimited schedule validation (public + private parity): start must be local midnight
   // in the challenge timezone, tomorrow-or-later, with a supported duration; end is backend-computed
@@ -133,6 +133,12 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
   });
   if (!schedule.ok) return { ok: false, httpStatus: 400, body: { error: schedule.error } };
   const { startLocalDate, startAtUtc, challengeEndAtUtc } = schedule;
+  if (requestedTz) {
+    await db
+      .insert(userPreferencesTable)
+      .values({ userId, timezone: hostTz, updatedAt: new Date() })
+      .onConflictDoUpdate({ target: [userPreferencesTable.userId], set: { timezone: hostTz, updatedAt: new Date() } });
+  }
 
   const elig = await checkPaidEligibility(userId, true);
   if (!elig.ok) return elig;
@@ -239,9 +245,19 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
 }
 
 /** Join an open Unlimited Challenge before its start. Transactional + idempotent (no double charge/pool). */
-export async function joinUnlimitedChallenge(userId: string, challengeId: string, opts: { inviteCode?: string }): Promise<ServiceResult<{ challengeId: string }>> {
+export async function joinUnlimitedChallenge(userId: string, challengeId: string, opts: { inviteCode?: string; timezone?: string }): Promise<ServiceResult<{ challengeId: string }>> {
   const elig = await checkPaidEligibility(userId, false);
   if (!elig.ok) return elig;
+  const requestedTimezone = opts.timezone?.trim();
+  if (requestedTimezone && !isStrictIanaTimezone(requestedTimezone)) {
+    return { ok: false, httpStatus: 400, body: { error: "Use a valid IANA timezone such as America/Chicago.", code: "invalid_timezone" } };
+  }
+  if (requestedTimezone) {
+    await db
+      .insert(userPreferencesTable)
+      .values({ userId, timezone: requestedTimezone, updatedAt: new Date() })
+      .onConflictDoUpdate({ target: [userPreferencesTable.userId], set: { timezone: requestedTimezone, updatedAt: new Date() } });
+  }
 
   const result = await db.transaction(async (tx) => {
     await acquireOneChallengeLock(tx, userId);
@@ -252,7 +268,7 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
       .limit(1)
       .for("update");
     if (!challenge) return { ok: false as const, httpStatus: 404, body: { error: "Challenge not found." } };
-    const tz = await lockUserTimezone(userId, challenge.challengeTimezone);
+    const tz = requestedTimezone ?? await lockUserTimezone(userId, challenge.challengeTimezone);
 
     // Idempotent: if already a participant, succeed without re-charging.
     const [existing] = await tx
@@ -312,8 +328,8 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
       .values({
         challengeId,
         userId,
-        // Locked here and never recomputed: not on relogin, not on a device swap, not when the
-        // user travels. DST inside the zone is handled by IANA rules under the same identifier.
+        // Initial zone confirmed at join. A later confirmed travel change updates only future day
+        // rows; this membership value remains the original audit anchor.
         participantTimezone: tz,
         qualificationStatus: "active",
         entryContributionCents: challenge.entryFeeCents,

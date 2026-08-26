@@ -2,7 +2,7 @@
  * Per-participant scheduling for the Unlimited Daily Goal Challenge.
  *
  * The challenge stores a CALENDAR DATE. Each participant's real schedule is that date at 00:00 in
- * their own locked IANA timezone, so two participants in different zones legitimately start at
+ * their own initially confirmed IANA timezone, so two participants in different zones legitimately start at
  * different UTC instants and may be in different states at the same moment: India `active` while
  * Chicago is still `scheduled`.
  *
@@ -44,7 +44,7 @@ export function resolveChallengeStartLocalDate(challenge: ScheduleSourceChalleng
   return localDateInZone(challenge.startAtUtc, challenge.challengeTimezone || "UTC");
 }
 
-/** Build a participant's windows from the challenge's calendar date and their locked timezone. */
+/** Build a participant's initial windows from the challenge date and confirmed join timezone. */
 export function participantWindows(
   challenge: ScheduleSourceChallenge,
   timezone: string,
@@ -227,6 +227,7 @@ export interface ViewerScheduleState {
 export interface ViewerDayRow {
   dayNumber: number;
   localDate: string;
+  timezone?: string;
   windowStartUtc: Date;
   windowEndUtc: Date;
   status: string;
@@ -284,8 +285,12 @@ export function deriveViewerState(input: {
       ? input.challenge.durationDays
       : 0;
 
+  const nextDay = input.days.find((d) => d.windowStartUtc.getTime() > now.getTime()) ?? null;
+  const latestStartedDay = [...input.days].reverse().find((d) => d.windowStartUtc.getTime() <= now.getTime()) ?? null;
   const base = {
-    viewerTimezone: p.participantTimezone,
+    // Day rows, not the membership's initial zone, are authoritative after a confirmed travel
+    // change. While a day is open it always wins, so its deadline cannot move mid-day.
+    viewerTimezone: current?.timezone ?? nextDay?.timezone ?? latestStartedDay?.timezone ?? p.participantTimezone,
     viewerStartAt: startAt,
     viewerEndAt: endAt,
     verificationPending: now.getTime() >= endAt.getTime() && unfinalized.length > 0,
@@ -327,6 +332,7 @@ export async function loadViewerDays(
     .select({
       dayNumber: unlimitedChallengeDaysTable.dayNumber,
       localDate: unlimitedChallengeDaysTable.localDate,
+      timezone: unlimitedChallengeDaysTable.timezone,
       windowStartUtc: unlimitedChallengeDaysTable.windowStartUtc,
       windowEndUtc: unlimitedChallengeDaysTable.windowEndUtc,
       status: unlimitedChallengeDaysTable.status,

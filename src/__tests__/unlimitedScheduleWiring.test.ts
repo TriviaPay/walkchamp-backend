@@ -204,7 +204,7 @@ describe("APIs return viewer-personalized state", () => {
 
     expect(service).toContain("async function lockUserTimezone(userId: string, fallbackTimezone?: string | null)");
     expect(service).toContain("return resolveLockableTimezone(fallbackTimezone)");
-    expect(service).toContain("const tz = await lockUserTimezone(userId, challenge.challengeTimezone)");
+    expect(service).toContain("const tz = requestedTimezone ?? await lockUserTimezone(userId, challenge.challengeTimezone)");
 
     expect(resolver).toContain("resolveViewerTimezoneFromPreference(rawTimezone");
     expect(resolver).toContain("return resolveLockableTimezone(fallbackTimezone)");

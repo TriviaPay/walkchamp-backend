@@ -28,7 +28,7 @@ export const unlimitedChallengesTable = pgTable(
     durationDays: integer("duration_days").notNull(), // 7 | 10 | 30 | 60 | 90
     // ── THE semantic schedule ────────────────────────────────────────────────
     // The calendar date the host picked. EVERY participant starts at start_local_time on this
-    // date in their OWN locked timezone, which are deliberately different UTC instants. This —
+    // date in their OWN confirmed timezone, which are deliberately different UTC instants. This —
     // not start_at_utc — is the authority for participant day windows.
     // Nullable only for rows created before this column existed; backfilled in 0027.
     startLocalDate: date("start_local_date"),
@@ -85,9 +85,9 @@ export const unlimitedChallengeParticipantsTable = pgTable(
     id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
     challengeId: text("challenge_id").notNull(),
     userId: text("user_id").notNull(),
-    // Locked at join; used for ALL day-window calculations for the whole challenge. Belongs to the
-    // MEMBERSHIP, not the device session — a later login, device swap, account switch or trip does
-    // not change it. DST inside the zone is handled by IANA rules; the identifier stays put.
+    // Initial challenge timezone captured at join. Individual day rows are authoritative after a
+    // confirmed travel change: the current/closed day stays immutable and only future day rows are
+    // assigned the new zone. Keeping this value preserves the original membership audit anchor.
     participantTimezone: text("participant_timezone").notNull(),
     timezoneLockedAt: timestamp("timezone_locked_at", { withTimezone: true }).notNull().defaultNow(),
     // This participant's own schedule: 00:00 on the challenge's calendar date in participant_
@@ -177,6 +177,29 @@ export const unlimitedChallengeDaysTable = pgTable(
   ],
 );
 
+// ── Confirmed participant timezone changes ───────────────────────────────────
+export const unlimitedChallengeTimezoneChangesTable = pgTable(
+  "unlimited_challenge_timezone_changes",
+  {
+    id: text("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+    challengeId: text("challenge_id").notNull(),
+    participantId: text("participant_id").notNull(),
+    userId: text("user_id").notNull(),
+    previousTimezone: text("previous_timezone").notNull(),
+    newTimezone: text("new_timezone").notNull(),
+    confirmedAt: timestamp("confirmed_at", { withTimezone: true }).notNull().defaultNow(),
+    // 1..durationDays when applied to this challenge. durationDays + 1 means the final day was
+    // already locked, so the preference is recorded for future challenges only.
+    effectiveChallengeDay: integer("effective_challenge_day").notNull(),
+    appliesToChallenge: boolean("applies_to_challenge").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("unlimited_timezone_changes_challenge_participant_idx").on(t.challengeId, t.participantId),
+    index("unlimited_timezone_changes_user_confirmed_idx").on(t.userId, t.confirmedAt),
+  ],
+);
+
 // ── Immutable payout allocation (one per qualified participant per challenge) ──
 export const unlimitedChallengePayoutsTable = pgTable(
   "unlimited_challenge_payouts",
@@ -202,4 +225,5 @@ export const unlimitedChallengePayoutsTable = pgTable(
 export type UnlimitedChallenge = typeof unlimitedChallengesTable.$inferSelect;
 export type UnlimitedChallengeParticipant = typeof unlimitedChallengeParticipantsTable.$inferSelect;
 export type UnlimitedChallengeDay = typeof unlimitedChallengeDaysTable.$inferSelect;
+export type UnlimitedChallengeTimezoneChange = typeof unlimitedChallengeTimezoneChangesTable.$inferSelect;
 export type UnlimitedChallengePayout = typeof unlimitedChallengePayoutsTable.$inferSelect;

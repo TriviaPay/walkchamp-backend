@@ -9,6 +9,7 @@ import {
   unlimitedChallengesTable,
   unlimitedChallengeParticipantsTable,
   unlimitedChallengeDaysTable,
+  unlimitedChallengeTimezoneChangesTable,
 } from "../../db/src/schema/unlimitedChallenge.js";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
 import { requireActiveAccount } from "../middleware/requireActiveAccount.js";
@@ -47,6 +48,10 @@ import {
   submitUnlimitedFinalVerification,
   UnlimitedFinalVerificationError,
 } from "../lib/unlimitedFinalVerification.js";
+import {
+  changeUnlimitedParticipantTimezone,
+  UnlimitedTimezoneChangeError,
+} from "../lib/unlimitedTimezoneChange.js";
 
 const router: Router = Router();
 
@@ -552,6 +557,27 @@ async function buildViewerSchedule(
 
   const days = participant ? await loadViewerDays(challenge.id, participant.id) : [];
   const state = deriveViewerState({ challenge, participant: participant ?? null, days });
+  const [latestTimezoneChange, accountTimezone] = participant
+    ? await Promise.all([
+        db
+          .select({
+            previousTimezone: unlimitedChallengeTimezoneChangesTable.previousTimezone,
+            newTimezone: unlimitedChallengeTimezoneChangesTable.newTimezone,
+            confirmedAt: unlimitedChallengeTimezoneChangesTable.confirmedAt,
+            effectiveChallengeDay: unlimitedChallengeTimezoneChangesTable.effectiveChallengeDay,
+            appliesToChallenge: unlimitedChallengeTimezoneChangesTable.appliesToChallenge,
+          })
+          .from(unlimitedChallengeTimezoneChangesTable)
+          .where(and(
+            eq(unlimitedChallengeTimezoneChangesTable.challengeId, challenge.id),
+            eq(unlimitedChallengeTimezoneChangesTable.participantId, participant.id),
+          ))
+          .orderBy(desc(unlimitedChallengeTimezoneChangesTable.confirmedAt))
+          .limit(1)
+          .then((rows) => rows[0] ?? null),
+        loadViewerTimezonePreference(userId),
+      ])
+    : [null, await loadViewerTimezonePreference(userId)];
 
   // Live steps for the open day come from the day row the ingest path credits by window.
   const currentDay = state.currentDayIndex
@@ -608,6 +634,17 @@ async function buildViewerSchedule(
     viewerStatus: state.viewerStatus,
     viewerTimezone: state.viewerTimezone,
     viewerTimezoneLockedAt: isoOrNull(participant?.timezoneLockedAt),
+    accountTimezone,
+    pendingTimezone:
+      latestTimezoneChange?.appliesToChallenge === true
+      && latestTimezoneChange.newTimezone !== state.viewerTimezone
+        ? latestTimezoneChange.newTimezone
+        : null,
+    timezoneEffectiveDay: latestTimezoneChange?.effectiveChallengeDay ?? null,
+    timezoneChangeConfirmedAt: isoOrNull(latestTimezoneChange?.confirmedAt),
+    timezoneChangeConfirmedTimezone: latestTimezoneChange?.newTimezone ?? null,
+    timezoneChangeAppliesToChallenge: latestTimezoneChange?.appliesToChallenge ?? null,
+    finalDayTimezoneLocked: latestTimezoneChange?.appliesToChallenge === false,
     viewerStartAt: isoOrNull(state.viewerStartAt),
     viewerEndAt: isoOrNull(state.viewerEndAt),
     verificationPending: state.verificationPending,
@@ -655,9 +692,34 @@ router.post("/unlimited-challenges/host", requireAuth, async (req, res) => {
 router.post("/unlimited-challenges/:id/join", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const inviteCode = typeof req.body?.inviteCode === "string" ? req.body.inviteCode : undefined;
-  const result = await joinUnlimitedChallenge(userId, String(req.params.id), { inviteCode });
+  const timezone = typeof req.body?.timezone === "string" ? req.body.timezone : undefined;
+  const result = await joinUnlimitedChallenge(userId, String(req.params.id), { inviteCode, timezone });
   if (!result.ok) return res.status(result.httpStatus).json(result.body);
   return res.json({ success: true, ...result.data });
+});
+
+const timezoneChangeSchema = z.object({
+  timezone: z.string().min(1).max(64),
+});
+
+// Confirmation is server-authoritative: the active day stays byte-for-byte unchanged, the new
+// IANA zone is assigned only to not-yet-started day rows, and the account preference is retained.
+router.post("/unlimited-challenges/:id/timezone", requireAuth, requireActiveAccount, async (req, res) => {
+  const parsed = timezoneChangeSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "Invalid timezone change.", details: parsed.error.issues });
+  try {
+    const result = await changeUnlimitedParticipantTimezone({
+      challengeId: String(req.params.id),
+      userId: (req as AuthenticatedRequest).descopeUserId,
+      timezone: parsed.data.timezone,
+    });
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    if (error instanceof UnlimitedTimezoneChangeError) {
+      return res.status(error.status).json({ error: error.message, code: error.code });
+    }
+    throw error;
+  }
 });
 
 // ── POST /unlimited-challenges/:id/leave ──────────────────────────────────────
@@ -1049,7 +1111,7 @@ router.post("/unlimited-challenges/:id/live-progress", requireAuth, async (req, 
 
 // ── GET /unlimited-challenges/:id/daily-history ───────────────────────────────
 // §12/§15 — the complete, historically queryable day-by-day record: exactly durationDays rows
-// (7/10/30/60/90), each carrying the calendar date in the participant's locked timezone so a
+// (7/10/30/60/90), each carrying its frozen calendar date and assigned timezone so a
 // finished challenge can be rendered without re-deriving any timezone rules.
 //
 // ?userId= views another participant's history (the board is public within the challenge);
@@ -1091,8 +1153,8 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     .limit(1);
   if (!participant) return res.status(404).json({ error: "Participant not found in this challenge." });
 
-  const dayRows = await db
-    .select({
+  const [dayRows, timezoneHistory] = await Promise.all([
+    db.select({
       dayNumber: unlimitedChallengeDaysTable.dayNumber,
       localDate: unlimitedChallengeDaysTable.localDate,
       timezone: unlimitedChallengeDaysTable.timezone,
@@ -1111,7 +1173,22 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
       eq(unlimitedChallengeDaysTable.challengeId, challengeId),
       eq(unlimitedChallengeDaysTable.participantId, participant.id),
     ))
-    .orderBy(asc(unlimitedChallengeDaysTable.dayNumber));
+      .orderBy(asc(unlimitedChallengeDaysTable.dayNumber)),
+    db
+      .select({
+        previousTimezone: unlimitedChallengeTimezoneChangesTable.previousTimezone,
+        newTimezone: unlimitedChallengeTimezoneChangesTable.newTimezone,
+        confirmedAt: unlimitedChallengeTimezoneChangesTable.confirmedAt,
+        effectiveChallengeDay: unlimitedChallengeTimezoneChangesTable.effectiveChallengeDay,
+        appliesToChallenge: unlimitedChallengeTimezoneChangesTable.appliesToChallenge,
+      })
+      .from(unlimitedChallengeTimezoneChangesTable)
+      .where(and(
+        eq(unlimitedChallengeTimezoneChangesTable.challengeId, challengeId),
+        eq(unlimitedChallengeTimezoneChangesTable.participantId, participant.id),
+      ))
+      .orderBy(asc(unlimitedChallengeTimezoneChangesTable.confirmedAt)),
+  ]);
 
   const now = new Date();
   const days = dayRows.map((d) => ({
@@ -1144,6 +1221,10 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     participant.eligibilityReasonCode === "daily_goal_missed";
   const viewerResultsReady = challenge.resultsStatus === "results_ready";
   const viewerResultsStatus = challenge.resultsStatus;
+  const activeDay = dayRows.find((d) => d.windowStartUtc.getTime() <= now.getTime() && now.getTime() < d.windowEndUtc.getTime());
+  const nextDay = dayRows.find((d) => d.windowStartUtc.getTime() > now.getTime());
+  const latestStartedDay = [...dayRows].reverse().find((d) => d.windowStartUtc.getTime() <= now.getTime());
+  const effectiveParticipantTimezone = activeDay?.timezone ?? nextDay?.timezone ?? latestStartedDay?.timezone ?? participant.participantTimezone;
 
   return res.json({
     challengeId,
@@ -1152,7 +1233,8 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     durationDays: challenge.durationDays,
     dailyGoalSteps: challenge.dailyGoalSteps,
     startLocalDate: resolveChallengeStartLocalDate(challenge),
-    participantTimezone: participant.participantTimezone,
+    participantTimezone: effectiveParticipantTimezone,
+    initialParticipantTimezone: participant.participantTimezone,
     participantStartAtUtc: participant.participantStartAtUtc,
     participantEndAtUtc: participant.participantEndAtUtc,
     resultsStatus: challenge.resultsStatus,
@@ -1176,6 +1258,10 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     passedDays: days.filter((d) => d.dayStatus === "passed").length,
     failedDays,
     pendingDays,
+    timezoneHistory: timezoneHistory.map((change) => ({
+      ...change,
+      confirmedAt: change.confirmedAt.toISOString(),
+    })),
     days,
   });
 });
