@@ -77,8 +77,12 @@ router.get("/mic-pass/status", requireAuth, async (req, res) => {
 
 /** Non-consumable products → entitlement key */
 const NON_CONSUMABLE_MAP: Record<string, string> = {
+  mic_pass:          "mic_pass",
   mic_pass_lifetime: "mic_pass",
 };
+
+/** Current and legacy Mic Pass product IDs used by purchase-history responses. */
+const MIC_PASS_PRODUCT_IDS = new Set(["mic_pass", "mic_pass_lifetime"]);
 
 /** Consumable coin products → coin amount to credit */
 const COIN_PRODUCT_MAP: Record<string, number> = {
@@ -353,7 +357,7 @@ router.post("/purchases/verify", requireAuth, requireActiveAccount, async (req, 
     }
   }
 
-  // ── Non-consumable entitlement purchase (mic_pass_lifetime) ───────────────
+  // ── Non-consumable entitlement purchase (Mic Pass) ──────────────────────
   if (entitlementKey) {
     try {
       // Check if entitlement already active (idempotent)
@@ -516,6 +520,7 @@ router.get("/iap/history", requireAuth, async (req, res) => {
     coins_1200:        "1,200 Coins",
     coins_2500:        "2,500 Coins",
     coins_5000:        "5,000 Coins",
+    mic_pass:          "Mic Pass",
     mic_pass_lifetime: "Mic Pass",
   };
 
@@ -586,6 +591,7 @@ router.get("/purchases/summary", requireAuth, async (req, res) => {
       coins_1200:        "1,200 Coins",
       coins_2500:        "2,500 Coins",
       coins_5000:        "5,000 Coins",
+      mic_pass:          "Mic Pass",
       mic_pass_lifetime: "Mic Pass",
     };
 
@@ -614,7 +620,7 @@ router.get("/purchases/summary", requireAuth, async (req, res) => {
         platform:     r.platform,
         status:       r.status,
         coin_amount:  COIN_PRODUCT_MAP[r.productId] ?? null,
-        is_mic_pass:  r.productId === "mic_pass_lifetime",
+        is_mic_pass:  MIC_PASS_PRODUCT_IDS.has(r.productId),
         created_at:   r.createdAt.toISOString(),
       })),
     });

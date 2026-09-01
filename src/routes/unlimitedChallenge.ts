@@ -52,6 +52,7 @@ import {
   changeUnlimitedParticipantTimezone,
   UnlimitedTimezoneChangeError,
 } from "../lib/unlimitedTimezoneChange.js";
+import { resolveUnlimitedFinalFlow } from "../lib/unlimitedFinalFlow.js";
 
 const router: Router = Router();
 
@@ -149,6 +150,7 @@ function serializeChallenge(
   const registrationClosesAtUtc = isoOrNull(c.registrationClosesAtUtc);
   const challengeEndAtUtc = resolveChallengeEndAtIso(c);
   const resultsReadyAt = isoOrNull(c.resultsReadyAt);
+  const resultsAnnouncedAt = isoOrNull(c.resultsAnnouncedAt);
   const createdAt = isoOrNull(c.createdAt);
 
   return {
@@ -189,6 +191,7 @@ function serializeChallenge(
     // not final until results_ready.
     resultsStatus: c.resultsStatus,
     resultsReadyAt,
+    resultsAnnouncedAt,
     settlementPopulationSize: c.settlementPopulationSize,
     createdAt,
   };
@@ -478,10 +481,22 @@ async function overlayChallengeListCards(
     loadViewerTimezonePreference(userId),
   ]);
   const rowById = new Map(rows.map((row) => [row.id, row] as const));
+  const viewerByChallenge = new Map(
+    await Promise.all(
+      challenges
+        .filter((challenge) => challenge.participationStatus !== null)
+        .map(async (challenge) => {
+          const row = rowById.get(challenge.id)!;
+          const viewer = await buildViewerSchedule(row, userId);
+          return [challenge.id, trimViewerScheduleForList(viewer)] as const;
+        }),
+    ),
+  );
 
   return challenges.map((challenge) => {
     const players = playersByChallenge.get(challenge.id) ?? [];
     const row = rowById.get(challenge.id)!;
+    const viewer = viewerByChallenge.get(challenge.id);
     const prospectiveTimezone = resolveViewerTimezoneFromPreference(preferredTimezone, row.challengeTimezone);
     const prospectiveStartAtUtc = participantScheduleFor(row, prospectiveTimezone).startAtUtc;
     const canJoin =
@@ -496,6 +511,7 @@ async function overlayChallengeListCards(
       participantCount: participantCounts.get(challenge.id) ?? 0,
       players,
       participants: players,
+      ...(viewer ? { viewer } : {}),
     };
   });
 }
@@ -605,6 +621,14 @@ async function buildViewerSchedule(
     participant?.eligibilityReasonCode === "daily_goal_missed";
   const viewerResultsReady = challenge.resultsStatus === "results_ready";
   const viewerResultsStatus = challenge.resultsStatus;
+  const finalFlow = resolveUnlimitedFinalFlow({
+    challengeStatus: challenge.status,
+    resultsStatus: challenge.resultsStatus,
+    resultsAnnouncedAt: challenge.resultsAnnouncedAt,
+    viewerEndAt: state.viewerEndAt,
+    viewerStatus: state.viewerStatus,
+    verificationPending: state.verificationPending,
+  });
 
   return {
     startLocalDate: resolveChallengeStartLocalDate(challenge),
@@ -631,6 +655,8 @@ async function buildViewerSchedule(
     viewerResultsReady,
     viewerResultFinal: viewerResultsReady,
     viewerResultReasonCode: viewerResultsReady && viewerStreakBroken ? "daily_goal_missed" : null,
+    finalFlowStatus: finalFlow?.status ?? null,
+    finalFlow,
     viewerStatus: state.viewerStatus,
     viewerTimezone: state.viewerTimezone,
     viewerTimezoneLockedAt: isoOrNull(participant?.timezoneLockedAt),
@@ -671,6 +697,21 @@ async function buildViewerSchedule(
     unlimitedDailyMode: true,
     verifiedStepsEndpoint: "/api/walk/steps",
     provisionalStepsEndpoint: `/api/unlimited-challenges/${challenge.id}/live-progress`,
+  };
+}
+
+/** List cards only need the viewer's live lifecycle, not the full detail/tray payload. */
+function trimViewerScheduleForList(viewer: Awaited<ReturnType<typeof buildViewerSchedule>>) {
+  return {
+    viewerStatus: viewer.viewerStatus,
+    verificationPending: viewer.verificationPending,
+    viewerEndAt: viewer.viewerEndAt,
+    viewerTimezone: viewer.viewerTimezone,
+    viewerStartAt: viewer.viewerStartAt,
+    currentDayLocalDate: viewer.currentDayLocalDate,
+    completedDays: viewer.completedDays,
+    finalFlowStatus: viewer.finalFlowStatus,
+    finalFlow: viewer.finalFlow,
   };
 }
 
@@ -917,6 +958,8 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
     // instead of the host's.
     prospectiveStartAtUtc: membership ? null : wouldStartAt.toISOString(),
     prospectiveTimezone: membership ? null : viewerTimezone,
+    // Canonical viewer-scoped contract. Keep the flattened aliases below for older clients.
+    viewer,
     ...viewer,
     challengeDayKey,
     participantCount: players.length,
@@ -1225,6 +1268,21 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
   const nextDay = dayRows.find((d) => d.windowStartUtc.getTime() > now.getTime());
   const latestStartedDay = [...dayRows].reverse().find((d) => d.windowStartUtc.getTime() <= now.getTime());
   const effectiveParticipantTimezone = activeDay?.timezone ?? nextDay?.timezone ?? latestStartedDay?.timezone ?? participant.participantTimezone;
+  const viewerState = deriveViewerState({
+    challenge,
+    participant,
+    days: dayRows,
+    now,
+  });
+  const finalFlow = resolveUnlimitedFinalFlow({
+    challengeStatus: challenge.status,
+    resultsStatus: challenge.resultsStatus,
+    resultsAnnouncedAt: challenge.resultsAnnouncedAt,
+    viewerEndAt: viewerState.viewerEndAt,
+    viewerStatus: viewerState.viewerStatus,
+    verificationPending: viewerState.verificationPending,
+    now,
+  });
 
   return res.json({
     challengeId,
@@ -1242,6 +1300,8 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     viewerResultsReady,
     viewerResultFinal: viewerResultsReady,
     viewerResultReasonCode: viewerResultsReady && viewerStreakBroken ? "daily_goal_missed" : null,
+    finalFlowStatus: finalFlow?.status ?? null,
+    finalFlow,
     // Do not publish final winner/loser eligibility through history before global settlement.
     prizePoolEligibilityStatus: viewerResultsReady ? participant.prizePoolEligibilityStatus : "pending",
     eligibilityReasonCode: viewerResultsReady ? participant.eligibilityReasonCode : null,

@@ -173,6 +173,62 @@ describe("APIs return viewer-personalized state", () => {
     expect(route).toContain("const viewer = await buildViewerSchedule(r.challenge, userId)");
     expect(route).toContain("viewer,");
     expect(route).not.toContain("...(await buildViewerSchedule(r.challenge, userId))");
+
+    const detail = route.slice(
+      route.indexOf('router.get("/unlimited-challenges/:id"'),
+      route.indexOf("// ── POST /unlimited-challenges/:id/live-progress"),
+    );
+    expect(detail).toContain("// Canonical viewer-scoped contract");
+    expect(detail).toContain("viewer,\n    ...viewer,");
+  });
+
+  it("list and live cards attach a trimmed viewer block for participants", () => {
+    const listOverlay = route.slice(
+      route.indexOf("async function overlayChallengeListCards"),
+      route.indexOf("/** The timezone a not-yet-joined viewer would lock"),
+    );
+    const trimViewer = route.slice(
+      route.indexOf("function trimViewerScheduleForList"),
+      route.indexOf("// ── POST /unlimited-challenges/host"),
+    );
+
+    expect(listOverlay).toContain("challenge.participationStatus !== null");
+    expect(listOverlay).toContain("await buildViewerSchedule(row, userId)");
+    expect(listOverlay).toContain("trimViewerScheduleForList(viewer)");
+    expect(listOverlay).toContain("...(viewer ? { viewer } : {})");
+    for (const field of [
+      "viewerStatus", "verificationPending", "viewerEndAt", "viewerTimezone",
+      "viewerStartAt", "currentDayLocalDate", "completedDays", "finalFlowStatus", "finalFlow",
+    ]) {
+      expect(trimViewer).toContain(`${field}: viewer.${field}`);
+    }
+
+    const liveRoute = route.slice(
+      route.indexOf('router.get("/unlimited-challenges/live"'),
+      route.indexOf("// ── GET /unlimited-challenges/recently-finished"),
+    );
+    const listRoute = route.slice(
+      route.indexOf('router.get("/unlimited-challenges",'),
+      route.indexOf("// ── GET /unlimited-challenges/:id"),
+    );
+    expect(liveRoute).toContain("overlayChallengeListCards(rows, userId)");
+    expect(listRoute).toContain("overlayChallengeListCards(rows, userId)");
+  });
+
+  it("derives the five-stage final flow from backend-owned viewer and result state", () => {
+    const finalFlow = read("src/lib/unlimitedFinalFlow.ts");
+    expect(route).toContain("resolveUnlimitedFinalFlow({");
+    expect(route).toContain("resultsAnnouncedAt: challenge.resultsAnnouncedAt");
+    expect(route).toContain("viewerEndAt: state.viewerEndAt");
+    for (const status of [
+      "final_day_completed",
+      "final_results_pending",
+      "verifying_final_results",
+      "results_ready",
+      "challenge_completed",
+    ]) {
+      expect(finalFlow).toContain(status);
+    }
   });
 
   it("exposes the fields the Walk screen and the Android FGS need", () => {

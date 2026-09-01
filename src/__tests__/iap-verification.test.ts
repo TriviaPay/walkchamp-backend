@@ -317,7 +317,7 @@ describe("Apple App Store verification", () => {
 describe("Google Play verification", () => {
   const androidInput = {
     platform: "android" as const,
-    productId: "mic_pass_lifetime",
+    productId: "mic_pass",
     transactionId: "GPA.3311-0000-0000-00000",
     purchaseToken: "opaque-play-token",
     packageName: PACKAGE_NAME,
@@ -369,7 +369,9 @@ describe("Google Play verification", () => {
     expect(cryptoVerify("RSA-SHA256", Buffer.from(`${h}.${p}`), rsa.publicKey, Buffer.from(s, "base64url"))).toBe(true);
 
     // Play auto-refunds an unacknowledged non-consumable after 3 days.
+    expect(calls.some((c) => c.url.includes("/purchases/products/mic_pass/tokens/"))).toBe(true);
     expect(calls.some((c) => c.url.endsWith(":acknowledge"))).toBe(true);
+    expect(calls.some((c) => c.url.endsWith(":consume"))).toBe(false);
   });
 
   it("leaves consumables unacknowledged so the client's consume call still settles them", async () => {
@@ -479,6 +481,14 @@ describe("POST /api/purchases/verify wiring", () => {
 
   it("no longer blanket-rejects every purchase in production", () => {
     expect(verifyRoute).not.toContain('process.env.NODE_ENV === "production"');
+  });
+
+  it("accepts the current Mic Pass ID while preserving the legacy entitlement mapping", () => {
+    expect(route).toContain('mic_pass:          "mic_pass"');
+    expect(route).toContain('mic_pass_lifetime: "mic_pass"');
+    expect(route).toContain('new Set(["mic_pass", "mic_pass_lifetime"])');
+    expect(route).toContain('mic_pass:          "Mic Pass"');
+    expect(route).toContain("MIC_PASS_PRODUCT_IDS.has(r.productId)");
   });
 
   it("verifies with the store before any grant path is reached", () => {

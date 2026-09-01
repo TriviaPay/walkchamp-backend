@@ -212,7 +212,7 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
       router.indexOf('router.get("/unlimited-challenges/:id"'),
       router.indexOf("// ── POST /unlimited-challenges/:id/live-progress"),
     );
-    for (const field of ["startAtUtc", "registrationClosesAtUtc", "resultsReadyAt", "createdAt"]) {
+    for (const field of ["startAtUtc", "registrationClosesAtUtc", "resultsReadyAt", "resultsAnnouncedAt", "createdAt"]) {
       expect(router).toContain(`${field} = isoOrNull(c.${field})`);
     }
     expect(router).toContain("function resolveChallengeEndAtIso");
@@ -227,6 +227,8 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
     expect(myActive).not.toContain("...(await buildViewerSchedule(r.challenge, userId))");
     expect(myActive).toContain("return res.json({ challenge: challenges[0] ?? null, challenges, count: challenges.length })");
     expect(detail).toContain("challenge: serializeChallenge(challenge, { participantCount: players.length })");
+    expect(detail).toContain("// Canonical viewer-scoped contract");
+    expect(detail).toContain("viewer,\n    ...viewer,");
     expect(detail).not.toContain("challenge: {");
   });
 
