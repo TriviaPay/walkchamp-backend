@@ -33,6 +33,7 @@ import { triggerEvent } from "./pusher.js";
 import { emitUnlimitedRealtime } from "./unlimitedRealtime.js";
 import { sendNotification } from "../routes/notifications.js";
 import { config } from "./config.js";
+import { STREAK_CHALLENGE_KIND } from "./streakChallengeContract.js";
 import { logger } from "./logger.js";
 import { invalidateSchedulerGate } from "./idleGate.js";
 
@@ -104,7 +105,7 @@ export interface CreateInput {
 }
 
 /**
- * Create an Unlimited Challenge. The host is charged and auto-joined as a paid participant in the
+ * Create a Streak Challenge. The host is charged and auto-joined as a paid participant in the
  * same transaction (no host is created without paying). Schedule is backend-authoritative.
  */
 export async function createUnlimitedChallenge(userId: string, input: CreateInput): Promise<ServiceResult<UnlimitedChallenge>> {
@@ -148,7 +149,7 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
   // +26h is the exact worst-case spread between the earliest local midnight (UTC+14) and the
   // latest (UTC-12) for the same calendar date, so the timer can never fire before the last
   // participant on earth could still be walking.
-  const settlementNotBeforeUtc = new Date(challengeEndAtUtc.getTime() + config.unlimitedGoal.graceMs + 26 * 60 * 60_000);
+  const settlementNotBeforeUtc = new Date(challengeEndAtUtc.getTime() + config.streakChallenge.graceMs + 26 * 60 * 60_000);
   // 6-char code, allocated against the unique index (see allocateChallengeCode).
   const inviteCode = input.visibility === "private" ? await allocateChallengeCode() : null;
 
@@ -161,7 +162,7 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
       .insert(unlimitedChallengesTable)
       .values({
         hostUserId: userId,
-        title: input.title?.trim() || "Unlimited Challenge",
+        title: input.title?.trim() || "Streak Challenge",
         visibility: input.visibility,
         inviteCode,
         status: "waiting",
@@ -178,7 +179,7 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
         registrationClosesAtUtc: startAtUtc,
         challengeEndAtUtc,
         settlementNotBeforeUtc,
-        zeroWinnerPolicy: config.unlimitedGoal.zeroWinnerPolicy,
+        zeroWinnerPolicy: config.streakChallenge.zeroWinnerPolicy,
       })
       .returning();
 
@@ -189,7 +190,7 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
       entryFeeCents: input.entryFeeCents,
       debitAmountCents: computeTotalChargeCents(input.entryFeeCents),
       idempotencyKey: `unlimited_entry:${challenge.id}:${userId}`,
-      description: `Unlimited Challenge entry: ${challenge.title}`,
+      description: `Streak Challenge entry: ${challenge.title}`,
       metadata: { entryFeeCents: input.entryFeeCents, platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS, refundableAmountCents: input.entryFeeCents },
     });
     if (!charge.ok) return { ok: false as const, kind: "charge" as const, error: charge.error };
@@ -244,7 +245,7 @@ export async function createUnlimitedChallenge(userId: string, input: CreateInpu
   return { ok: true, data: result.challenge };
 }
 
-/** Join an open Unlimited Challenge before its start. Transactional + idempotent (no double charge/pool). */
+/** Join an open Streak Challenge before its start. Transactional + idempotent (no double charge/pool). */
 export async function joinUnlimitedChallenge(userId: string, challengeId: string, opts: { inviteCode?: string; timezone?: string }): Promise<ServiceResult<{ challengeId: string }>> {
   const elig = await checkPaidEligibility(userId, false);
   if (!elig.ok) return elig;
@@ -318,7 +319,7 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
       entryFeeCents: challenge.entryFeeCents,
       debitAmountCents: computeTotalChargeCents(challenge.entryFeeCents),
       idempotencyKey: `unlimited_entry:${challengeId}:${userId}`,
-      description: `Unlimited Challenge entry: ${challenge.title}`,
+      description: `Streak Challenge entry: ${challenge.title}`,
       metadata: { entryFeeCents: challenge.entryFeeCents, platformFeeCents: UNLIMITED_PLATFORM_FEE_CENTS, refundableAmountCents: challenge.entryFeeCents },
     });
     if (!charge.ok) return { ok: false as const, httpStatus: 402, body: { error: charge.error ?? "Entry fee could not be charged.", code: "entry_charge_failed" } };
@@ -520,7 +521,7 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
 }
 
 /**
- * Platform cancel for a single Unlimited Challenge: mark cancelled_by_platform, refund entry
+ * Platform cancel for a single Streak Challenge: mark cancelled_by_platform, refund entry
  * contributions for every non-left participant (platform fee kept), release memberships.
  * Idempotent when already cancelled/completed.
  *
@@ -640,7 +641,7 @@ export async function cancelUnlimitedChallengeByPlatform(
     { challengeId, reason },
     {
       event: "race:cancelled",
-      payload: { raceId: challengeId, reason, challengeType: "unlimited_goal" },
+      payload: { raceId: challengeId, reason, challengeType: "unlimited_goal", challengeKind: STREAK_CHALLENGE_KIND },
     },
   );
 
@@ -649,7 +650,7 @@ export async function cancelUnlimitedChallengeByPlatform(
       userId,
       "race_cancelled",
       "Challenge cancelled",
-      "This Unlimited Challenge was cancelled by the platform. Your entry fee has been refunded.",
+      "This Streak Challenge was cancelled by the platform. Your entry fee has been refunded.",
       {
         challengeId,
         dedupeKey: `unlimited_platform_cancel_notify:${challengeId}:${userId}`,
@@ -671,7 +672,7 @@ export async function cancelUnlimitedChallengeByPlatform(
   return { ok: true, challengeId, refundedUserIds, failedRefundUserIds };
 }
 
-/** Cancel every open Unlimited Challenge (waiting/starting/active/settling) with refunds. */
+/** Cancel every open Streak Challenge (waiting/starting/active/settling) with refunds. */
 export async function cancelAllOpenUnlimitedChallenges(opts?: {
   reason?: string;
   actorUserId?: string | null;

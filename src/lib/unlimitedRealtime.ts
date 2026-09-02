@@ -1,5 +1,5 @@
 /**
- * Unlimited Challenge realtime fan-out.
+ * Streak Challenge realtime fan-out.
  *
  * Canonical channel: `unlimited-challenge-{id}` (native unlimited events).
  * Compatibility: also emit on `public-live-race-{id}` with classic race event

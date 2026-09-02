@@ -310,7 +310,16 @@ describe("settlement is gated on the delayed-global rule", () => {
   });
 
   it("refreshes the result status when it defers", () => {
-    expect(settle.split("refreshUnlimitedResultsStatus(challengeId)").length - 1).toBe(3);
+    expect(settle.split("refreshUnlimitedResultsStatus(challengeId)").length - 1).toBe(4);
+  });
+
+  it("does not settle before four hours from the actual last participant end", () => {
+    expect(settle).toContain("closure.latestParticipantEndAtUtc");
+    expect(settle).toContain("config.streakChallenge.graceMs");
+    expect(settle).toContain("Date.now() < settlementEligibleAt.getTime()");
+    expect(settle.indexOf("Date.now() < settlementEligibleAt.getTime()")).toBeLessThan(
+      settle.indexOf("areAllRequiredDaysTerminal(challengeId)"),
+    );
   });
 
   it("requires a fresh provider read after the latest participant boundary", () => {
@@ -393,7 +402,7 @@ describe("§19/§20 losing eligibility does not stop history or settle early", (
 describe("§12/§15 daily history API", () => {
   const route = read("src/routes/unlimitedChallenge.ts");
   const history = route.slice(
-    route.indexOf('router.get("/unlimited-challenges/:id/daily-history"'),
+    route.indexOf('router.get("/streak-challenges/:id/daily-history"'),
     route.indexOf("// Chat: comments + reactions"),
   );
 

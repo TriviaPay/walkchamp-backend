@@ -45,7 +45,7 @@ are both on and refuses to boot otherwise.
 | `/api/races` coins-battle entry | `raceId` | coin balance debited under row lock; non-payers disqualified, never admitted free | `requireAuth` |
 | `/api/referral` / `/api/referral/apply` | own profile | caller sets own `referredBy`; self-referral excluded | `requireAuth` |
 | referral bonus (service-side) | referrer + referred wallets | fires only on referred user's first completed cash entry; unique award per referred user; per-referrer rolling-24h velocity cap | internal (race join transaction) |
-| `/api/unlimited-challenge/*` | own membership | caller must be the registered member; steps server-reconciled | `requireAuth` + `FEATURE_UNLIMITED_GOAL` |
+| `/api/streak-challenges/*` | own membership | caller must be the registered member; steps server-reconciled | `requireAuth` + `FEATURE_STREAK_CHALLENGE` |
 | waiting-room lifecycle (`/api/races` rooms) | `raceRoomId` | host-only start/cancel; refunds deduped per `race_cancel:{raceId}:{uid}` in a locked transaction | `requireAuth` |
 | `/api/sponsored-events/*` | `eventId` | registration requires own account; winner finalization is admin/service-side | `requireAuth` |
 | `/api/admin/withdrawals/*` | `withdrawalId` | admin role; approval is atomic CAS on `status='pending'` | `requireAuth` + `requireAdminRole` (file-wide) |

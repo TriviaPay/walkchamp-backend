@@ -25,11 +25,11 @@ export interface BlockingMembership {
 /**
  * The shared "one blocking challenge at a time" primitive. A user is blocked from creating/joining
  * ANY challenge while they have a blocking membership in EITHER the classic race system OR the
- * Unlimited Challenge system. Both callers acquire the same advisory lock first (see
+ * Streak Challenge system. Both callers acquire the same advisory lock first (see
  * `acquireOneChallengeLock`) so concurrent joins can't place a user in two challenges.
  */
 
-/** Advisory transaction lock keyed per user — shared by races and unlimited challenges. */
+/** Advisory transaction lock keyed per user — shared by races and Streak Challenges. */
 export async function acquireOneChallengeLock(tx: DbTx, userId: string): Promise<void> {
   await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`regular_race_registration:${userId}`}, 0))`);
 }
@@ -65,7 +65,7 @@ export async function getRaceBlockingMembership(dbOrTx: DbOrTx, userId: string):
   return null;
 }
 
-/** Blocking membership in the Unlimited Challenge system (waiting/starting/active/settling, not left). */
+/** Blocking membership in the Streak Challenge system (waiting/starting/active/settling, not left). */
 export async function getUnlimitedBlockingMembership(
   dbOrTx: DbOrTx,
   userId: string,
@@ -73,10 +73,10 @@ export async function getUnlimitedBlockingMembership(
 ): Promise<BlockingMembership | null> {
   const excludeChallengeId = typeof opts === "string" ? opts : opts?.excludeChallengeId;
   const failOpen = typeof opts === "string" ? true : opts?.failOpen ?? true;
-  // Feature off ⇒ no unlimited challenges exist to block against. Returning early also guarantees
+  // Feature off ⇒ no Streak Challenges exist to block against. Returning early also guarantees
   // this helper is a no-op on the existing race create/join paths when the flag is disabled (and
   // before the migration has run), so it can NEVER change or break existing race functionality.
-  if (!config.features.unlimitedGoalEnabled) return null;
+  if (!config.features.streakChallengeEnabled) return null;
   try {
     const rows = await dbOrTx
       .select({ id: unlimitedChallengesTable.id, status: unlimitedChallengesTable.status })

@@ -23,10 +23,11 @@ import { triggerEvent } from "./pusher.js";
 import { emitUnlimitedRealtime } from "./unlimitedRealtime.js";
 import { sendNotification } from "../routes/notifications.js";
 import { config } from "./config.js";
+import { STREAK_CHALLENGE_KIND } from "./streakChallengeContract.js";
 import { logger } from "./logger.js";
 
 /**
- * Start an Unlimited Challenge at its scheduled time: compare-and-set waiting→starting, materialize
+ * Start a Streak Challenge at its scheduled time: compare-and-set waiting→starting, materialize
  * each participant's per-day windows in their LOCKED timezone, go starting→active, and schedule
  * settlement. Idempotent — a challenge not in `waiting`/`starting` (recovery) is a no-op; day rows
  * use a unique (challenge, participant, dayNumber) constraint so re-runs never duplicate.
@@ -98,11 +99,12 @@ export async function startUnlimitedChallenge(challengeId: string): Promise<void
     challengeId,
     "challenge_started",
     { challengeId },
-    { event: "race:started", payload: { raceId: challengeId, challengeType: "unlimited_goal" } },
+    { event: "race:started", payload: { raceId: challengeId, challengeType: "unlimited_goal", challengeKind: STREAK_CHALLENGE_KIND } },
   );
   void triggerEvent(`public-live-race-${challengeId}`, "race:starting", {
     raceId: challengeId,
     challengeType: "unlimited_goal",
+    challengeKind: STREAK_CHALLENGE_KIND,
   });
   // Only the participants whose OWN local day 1 has opened. Telling a Chicago user "your
   // challenge has started" at India's midnight is the notification form of the same bug — the
@@ -137,7 +139,7 @@ export async function notifyDueParticipantStarts(now: Date = new Date()): Promis
     .limit(500);
 
   for (const p of due) {
-    void sendNotification(p.userId, "race_started", "Your challenge has started", "Your Unlimited Challenge has started — hit your daily goal every day!", {
+    void sendNotification(p.userId, "race_started", "Your challenge has started", "Your Streak Challenge has started — hit your daily goal every day!", {
       challengeId: p.challengeId,
       dedupeKey: `unlimited_started:${p.challengeId}:${p.userId}`,
     }).catch(() => {});
@@ -152,7 +154,7 @@ export async function notifyDueParticipantStarts(now: Date = new Date()): Promis
  * Idempotent via status guards.
  */
 export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<void> {
-  const graceMs = config.unlimitedGoal.graceMs;
+  const graceMs = config.streakChallenge.graceMs;
 
   // Mark closed-but-in-grace days as pending_verification (snapshot current verified steps).
   const inGrace = await db
@@ -216,7 +218,7 @@ export async function finalizeUnlimitedDays(now: Date = new Date()): Promise<voi
         ));
       continue;
     }
-    if (config.unlimitedGoal.verificationMode === "manual") {
+    if (config.streakChallenge.verificationMode === "manual") {
       // A mobile-supplied `source: health_connect|healthkit` label is provenance, not attestation.
       // In production-funded challenges the automatic worker may snapshot that claim for ops, but
       // it must never turn the claim into a paid day. An authenticated admin resolves the day via

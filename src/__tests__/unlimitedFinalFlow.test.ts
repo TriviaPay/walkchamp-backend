@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { resolveUnlimitedFinalFlow } from "../lib/unlimitedFinalFlow.js";
+import {
+  resolveStreakChallengeFinalResult,
+  resolveUnlimitedFinalFlow,
+} from "../lib/unlimitedFinalFlow.js";
 
 const NOW = new Date("2026-09-01T16:00:00.000Z");
 
@@ -90,5 +93,117 @@ describe("resolveUnlimitedFinalFlow", () => {
       resultsStatus: "results_ready",
       resultsAnnouncedAt: "2026-09-01T16:00:00.000Z",
     })).toBeNull();
+  });
+});
+
+function resolveFinalResult(
+  overrides: Partial<Parameters<typeof resolveStreakChallengeFinalResult>[0]> = {},
+) {
+  return resolveStreakChallengeFinalResult({
+    isParticipant: true,
+    challengeStatus: "active",
+    resultsStatus: "waiting_for_participants",
+    resultsAnnouncedAt: null,
+    viewerEndAt: "2026-09-01T15:00:00.000Z",
+    viewerStatus: "active",
+    verificationPending: true,
+    allParticipantWindowsClosed: false,
+    participantsFinishedCount: 1,
+    latestParticipantEndAtUtc: "2026-09-01T18:00:00.000Z",
+    finalVerificationParticipantCount: 2,
+    finalVerificationSubmittedCount: 0,
+    finalVerificationCompletedCount: 0,
+    finalVerificationPendingCount: 2,
+    verificationWindowMs: 4 * 60 * 60_000,
+    now: NOW,
+    ...overrides,
+  });
+}
+
+describe("resolveStreakChallengeFinalResult", () => {
+  it("marks an early finisher while the race waits for participant-local day ends", () => {
+    expect(resolveFinalResult()).toMatchObject({
+      participantStatus: "FINAL_DAY_COMPLETED_WAITING",
+      raceStatus: "WAITING_FOR_PARTICIPANT_DAY_ENDS",
+      title: "Final Day Completed",
+      message: "Your final challenge day is complete. We’re waiting for the remaining participants to finish in their local time zones.",
+      verificationStartedAt: null,
+      settlementEligibleAt: null,
+    });
+  });
+
+  it("moves the whole race into final verification at the latest valid participant end", () => {
+    expect(resolveFinalResult({
+      resultsStatus: "steps_validation_in_progress",
+      allParticipantWindowsClosed: true,
+      participantsFinishedCount: 2,
+      latestParticipantEndAtUtc: "2026-09-01T15:00:00.000Z",
+    })).toMatchObject({
+      participantStatus: "FINAL_VERIFICATION",
+      raceStatus: "FINAL_VERIFICATION",
+      title: "Final Verification",
+      message: "Your challenge is complete. We’re verifying the final activity for all participants.",
+      verificationStartedAt: "2026-09-01T15:00:00.000Z",
+      preparingLeaderboardAt: "2026-09-01T17:00:00.000Z",
+      settlementEligibleAt: "2026-09-01T19:00:00.000Z",
+      verificationWindowSeconds: 14_400,
+    });
+  });
+
+  it("reports results-ready/preparing-leaderboard after two hours when verification is progressing", () => {
+    expect(resolveFinalResult({
+      resultsStatus: "steps_validation_in_progress",
+      allParticipantWindowsClosed: true,
+      participantsFinishedCount: 2,
+      latestParticipantEndAtUtc: "2026-09-01T13:30:00.000Z",
+      finalVerificationSubmittedCount: 1,
+      now: NOW,
+    })).toMatchObject({
+      participantStatus: "RESULTS_READY",
+      raceStatus: "PREPARING_LEADERBOARD",
+      title: "Results Ready",
+      message: "Final verification is almost complete. We’re preparing the leaderboard.",
+      verificationProgressing: true,
+      verificationPending: true,
+    });
+  });
+
+  it("does not claim preparation merely because two hours elapsed without a provider submission", () => {
+    expect(resolveFinalResult({
+      resultsStatus: "steps_validation_in_progress",
+      allParticipantWindowsClosed: true,
+      participantsFinishedCount: 2,
+      latestParticipantEndAtUtc: "2026-09-01T13:30:00.000Z",
+    })?.raceStatus).toBe("FINAL_VERIFICATION");
+  });
+
+  it("distinguishes committed settlement from announced results", () => {
+    expect(resolveFinalResult({
+      challengeStatus: "completed",
+      resultsStatus: "results_ready",
+      allParticipantWindowsClosed: true,
+    })).toMatchObject({ participantStatus: "RESULTS_READY", raceStatus: "SETTLED" });
+
+    expect(resolveFinalResult({
+      challengeStatus: "completed",
+      resultsStatus: "results_ready",
+      resultsAnnouncedAt: "2026-09-01T16:00:00.000Z",
+      allParticipantWindowsClosed: true,
+    })).toMatchObject({
+      participantStatus: "RESULTS_ANNOUNCED",
+      raceStatus: "RESULTS_ANNOUNCED",
+      title: "Streak Challenge Completed",
+      message: "Streak Challenge Completed. The final results are ready. Congratulations to all participants!",
+    });
+  });
+
+  it("does not assign a participant status to an authenticated spectator", () => {
+    expect(resolveFinalResult({
+      isParticipant: false,
+      resultsStatus: "steps_validation_in_progress",
+      allParticipantWindowsClosed: true,
+      participantsFinishedCount: 2,
+      latestParticipantEndAtUtc: "2026-09-01T15:00:00.000Z",
+    })).toMatchObject({ participantStatus: null, raceStatus: "FINAL_VERIFICATION" });
   });
 });

@@ -23,9 +23,11 @@ import { writeAuditLog } from "./auditLog.js";
 import { logger } from "./logger.js";
 import { insertOutboxEventTx, enqueueOutboxEvent } from "./outbox.js";
 import { outboxEventsTable } from "../../db/src/schema/index.js";
+import { STREAK_CHALLENGE_KIND } from "./streakChallengeContract.js";
+import { config } from "./config.js";
 
 /**
- * Settle an Unlimited Challenge: equal split of the prize pool among qualified finishers (everyone
+ * Settle a Streak Challenge: equal split of the prize pool among qualified finishers (everyone
  * who passed every required day and did not leave). Atomic, idempotent, retry-safe:
  *  - `active → settling` is a compare-and-set claim (only one worker proceeds).
  *  - payout rows are unique per (challenge, participant); wallet credits are idempotent
@@ -85,7 +87,24 @@ export async function settleUnlimitedChallenge(challengeId: string): Promise<voi
     return;
   }
 
-  // ── Gate 3 (§8, §22): every required day must exist and be terminal ──
+  // ── Gate 3: preserve the full backend-owned verification window ──────────
+  // Even when every participant submits quickly, final results are not settled before four hours
+  // (STREAK_CHALLENGE_GRACE_HOURS) from the ACTUAL last participant-local end. Conversely, this is
+  // never a force-settlement deadline: the provider and day gates above/below may hold indefinitely.
+  const lastParticipantEndAtUtc = closure.latestParticipantEndAtUtc;
+  const settlementEligibleAt = lastParticipantEndAtUtc
+    ? new Date(lastParticipantEndAtUtc.getTime() + config.streakChallenge.graceMs)
+    : null;
+  if (!settlementEligibleAt || Date.now() < settlementEligibleAt.getTime()) {
+    logger.info(
+      { challengeId, lastParticipantEndAtUtc, settlementEligibleAt },
+      "[Unlimited] settlement deferred — final verification window is still open",
+    );
+    await refreshUnlimitedResultsStatus(challengeId);
+    return;
+  }
+
+  // ── Gate 4 (§8, §22): every required day must exist and be terminal ──
   // Verification/reconciliation completeness on top of the clock check. Provisional sensor steps
   // never satisfy this — only the Health Connect / HealthKit authoritative value finalizes a day.
   const validation = await areAllRequiredDaysTerminal(challengeId);
@@ -280,7 +299,7 @@ export async function announceUnlimitedChallengeResults(challengeId: string): Pr
     },
     {
       event: "race:results_ready",
-      payload: { raceId: challengeId, challengeType: "unlimited_goal", winners },
+      payload: { raceId: challengeId, challengeType: "unlimited_goal", challengeKind: STREAK_CHALLENGE_KIND, winners },
     },
   );
   emitUnlimitedRealtime(
@@ -289,7 +308,7 @@ export async function announceUnlimitedChallengeResults(challengeId: string): Pr
     { challengeId, winners, settlementStatus: challenge.settlementStatus },
     {
       event: "race:completed",
-      payload: { raceId: challengeId, challengeType: "unlimited_goal", winners },
+      payload: { raceId: challengeId, challengeType: "unlimited_goal", challengeKind: STREAK_CHALLENGE_KIND, winners },
     },
   );
   for (const payout of payouts) {

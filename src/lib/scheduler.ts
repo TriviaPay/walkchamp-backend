@@ -267,7 +267,7 @@ function msUntilNextLocalHour(now: Date, timezone: string, targetHour: number): 
  * has already woken the database, so its cost rides along with work that was happening anyway.
  */
 export async function computeSchedulerNextDueAtMs(now = new Date()): Promise<number | null> {
-  const graceMs = config.unlimitedGoal.graceMs;
+  const graceMs = config.streakChallenge.graceMs;
 
   const rows = await db.execute(sql`
     select
@@ -342,7 +342,7 @@ export async function runSchedulerTick(opts?: { force?: boolean }): Promise<void
     // and rooms stuck mid-start are recovered. Idempotent — a safety net behind the durable jobs.
     await reconcileWaitingRooms(now);
 
-    // Unlimited Challenge reconciliation: start past-due challenges, finalize due participant-days,
+    // Streak Challenge reconciliation: start past-due challenges, finalize due participant-days,
     // and settle challenges past their settlement time. Safety net behind the durable jobs.
     await reconcileUnlimitedChallenges(now);
 

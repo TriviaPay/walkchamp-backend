@@ -66,7 +66,7 @@ describe("Streak Challenge timezone changes", () => {
 
   it("wires an authenticated confirmation endpoint and an auditable history response", () => {
     const route = readFileSync(new URL("../routes/unlimitedChallenge.ts", import.meta.url), "utf8");
-    expect(route).toContain('router.post("/unlimited-challenges/:id/timezone", requireAuth, requireActiveAccount');
+    expect(route).toContain('router.post("/streak-challenges/:id/timezone", requireAuth, requireActiveAccount');
     expect(route).toContain("changeUnlimitedParticipantTimezone({");
     expect(route).toContain("timezoneHistory: timezoneHistory.map");
     expect(route).toContain("timezoneChangeConfirmedAt");

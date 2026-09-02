@@ -555,7 +555,7 @@ async function addUnlimitedParticipants(client: pg.Client, args: Args) {
           -$6::int,
           w.currency,
           'completed',
-          'Dummy Unlimited Challenge entry: ' || $1,
+          'Dummy Streak Challenge entry: ' || $1,
           'dummy_seed',
           'dummy_unlimited_wallet_debit:' || $1 || ':' || d.user_id,
           $1::uuid,

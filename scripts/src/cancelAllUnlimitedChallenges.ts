@@ -1,5 +1,5 @@
 /**
- * One-shot: cancel every open Unlimited Challenge and refund entry contributions.
+ * One-shot: cancel every open Streak Challenge and refund entry contributions.
  *
  * Usage (from Backend/):
  *   pnpm exec tsx ./scripts/src/cancelAllUnlimitedChallenges.ts
@@ -29,7 +29,7 @@ function loadDotEnvFile(filePath: string) {
 
 async function main() {
   loadDotEnvFile(path.resolve(process.cwd(), ".env"));
-  process.env.FEATURE_UNLIMITED_GOAL ??= "true";
+  process.env.FEATURE_STREAK_CHALLENGE ??= process.env.FEATURE_UNLIMITED_GOAL ?? "true";
 
   const { cancelAllOpenUnlimitedChallenges } = await import(
     "../../src/lib/unlimitedChallengeService.js"

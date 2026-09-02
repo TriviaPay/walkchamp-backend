@@ -1,5 +1,5 @@
 /**
- * Shared Unlimited Challenge live daily-progress helpers.
+ * Shared Streak Challenge live daily-progress helpers.
  *
  * currentSteps  = active challenge-day total from step_daily_totals
  * totalChallengeSteps = finalized verifiedSteps + today's live steps

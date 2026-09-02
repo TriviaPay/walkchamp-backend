@@ -9,15 +9,15 @@ const walk = read("src/routes/walk.ts");
 /** The Unlimited chat block, isolated from the rest of the router. */
 const chatBlock = route.slice(
   route.indexOf("// Chat: comments + reactions"),
-  route.indexOf("// ── GET /unlimited-challenges/:id/leaderboard"),
+  route.indexOf("// ── GET /streak-challenges/:id/leaderboard"),
 );
 
 describe("Unlimited chat mirrors the race contract", () => {
   it("registers all four endpoints", () => {
-    expect(route).toContain('router.get("/unlimited-challenges/:id/comments"');
-    expect(route).toContain('router.post("/unlimited-challenges/:id/comments"');
-    expect(route).toContain('router.get("/unlimited-challenges/:id/reactions"');
-    expect(route).toContain('router.post("/unlimited-challenges/:id/reactions"');
+    expect(route).toContain('router.get("/streak-challenges/:id/comments"');
+    expect(route).toContain('router.post("/streak-challenges/:id/comments"');
+    expect(route).toContain('router.get("/streak-challenges/:id/reactions"');
+    expect(route).toContain('router.post("/streak-challenges/:id/reactions"');
   });
 
   it("returns the same comment fields the race endpoint returns", () => {
@@ -84,8 +84,8 @@ describe("chat membership is checked against unlimited participants", () => {
 
   it("does not gate the read endpoints, matching the race behaviour", () => {
     const getComments = chatBlock.slice(
-      chatBlock.indexOf('router.get("/unlimited-challenges/:id/comments"'),
-      chatBlock.indexOf('router.post("/unlimited-challenges/:id/comments"'),
+      chatBlock.indexOf('router.get("/streak-challenges/:id/comments"'),
+      chatBlock.indexOf('router.post("/streak-challenges/:id/comments"'),
     );
     expect(getComments).not.toContain("isUnlimitedChatParticipant");
   });

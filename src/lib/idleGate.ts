@@ -59,7 +59,7 @@ export async function setSchedulerNextDueAtMs(atMs: number | null): Promise<void
 
 /**
  * Force the next scheduler tick to run a full Postgres pass. Called by writers that create
- * time-sensitive work (a scheduled room, an unlimited challenge) so the gate cannot hold a
+ * time-sensitive work (a scheduled room, a Streak Challenge) so the gate cannot hold a
  * stale "nothing due until tomorrow" while new work is waiting.
  */
 export async function invalidateSchedulerGate(): Promise<void> {

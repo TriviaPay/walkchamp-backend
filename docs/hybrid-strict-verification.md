@@ -71,7 +71,7 @@ checks whether any held participant could reach a paid slot:
 
 Soundness: an ops approval is capped at `serverCap = live + tolerance`, so a held participant's
 final total can never exceed that ceiling — an already-paid winner can never be retroactively
-displaced. Equal-share Unlimited Challenges (separate module) hold the entire payout on any
+displaced. Equal-share Streak Challenges (separate module) hold the entire payout on any
 unresolved participant, since one share change affects everyone.
 
 ## Statuses exposed to the app

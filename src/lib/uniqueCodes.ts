@@ -41,7 +41,7 @@ export function allocateRoomCode(): Promise<string> {
   });
 }
 
-/** 6-char join code for a private Unlimited Challenge, unique across unlimited_challenges. */
+/** 6-char join code for a private Streak Challenge, unique across legacy unlimited_challenges storage. */
 export function allocateChallengeCode(): Promise<string> {
   return allocate("challenge code", generateRoomCode, async (code) => {
     const [row] = await db

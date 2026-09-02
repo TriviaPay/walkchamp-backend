@@ -23,6 +23,8 @@ import { profilesTable } from "../../db/src/schema/profiles.js";
 import { emitUnlimitedRealtime } from "./unlimitedRealtime.js";
 import { logger } from "./logger.js";
 import { sendNotification } from "../routes/notifications.js";
+import { STREAK_CHALLENGE_KIND } from "./streakChallengeContract.js";
+import { config } from "./config.js";
 import {
   isConfiguredParticipationExcludedUser,
   isReservedParticipationIdentity,
@@ -217,6 +219,8 @@ export interface FinalVerificationState {
   allCompleted: boolean;
   participantCount: number;
   pendingParticipantCount: number;
+  submittedParticipantCount: number;
+  completedParticipantCount: number;
 }
 
 /** Request one post-boundary provider reconciliation from every frozen participant. */
@@ -226,7 +230,30 @@ export async function requestFinalParticipantVerifications(
 ): Promise<FinalVerificationState> {
   const closure = await areAllParticipantWindowsClosed(challengeId, now);
   if (!closure.allClosed) {
-    return { allCompleted: false, participantCount: closure.registeredParticipantCount, pendingParticipantCount: closure.registeredParticipantCount };
+    return {
+      allCompleted: false,
+      participantCount: closure.registeredParticipantCount,
+      pendingParticipantCount: closure.registeredParticipantCount,
+      submittedParticipantCount: 0,
+      completedParticipantCount: 0,
+    };
+  }
+
+  // The four-hour verification clock is anchored to the ACTUAL latest valid participant end,
+  // not the host-zone placeholder created before the participant population was known. Keeping
+  // the stored scheduler timestamp in sync makes the minute reconciler attempt settlement at the
+  // correct instant; settleUnlimitedChallenge independently re-checks the same boundary.
+  if (closure.latestParticipantEndAtUtc) {
+    const settlementEligibleAt = new Date(
+      closure.latestParticipantEndAtUtc.getTime() + config.streakChallenge.graceMs,
+    );
+    await db
+      .update(unlimitedChallengesTable)
+      .set({ settlementNotBeforeUtc: settlementEligibleAt, updatedAt: now })
+      .where(and(
+        eq(unlimitedChallengesTable.id, challengeId),
+        sql`${unlimitedChallengesTable.settlementNotBeforeUtc} is distinct from ${settlementEligibleAt}`,
+      ));
   }
 
   const requested = await db
@@ -253,7 +280,7 @@ export async function requestFinalParticipantVerifications(
       requestedAt: now.toISOString(),
     }, {
       event: "race:final-verification-requested",
-      payload: { raceId: challengeId, challengeType: "unlimited_goal" },
+      payload: { raceId: challengeId, challengeType: "unlimited_goal", challengeKind: STREAK_CHALLENGE_KIND },
     });
     for (const participant of requested) {
       void sendNotification(
@@ -277,6 +304,12 @@ export async function areAllFinalParticipantVerificationsComplete(
       pending: sql<number>`count(*) filter (
         where ${unlimitedChallengeParticipantsTable.finalVerificationStatus} <> 'completed'
       )::int`,
+      submitted: sql<number>`count(*) filter (
+        where ${unlimitedChallengeParticipantsTable.finalVerificationStatus} = 'submitted'
+      )::int`,
+      completed: sql<number>`count(*) filter (
+        where ${unlimitedChallengeParticipantsTable.finalVerificationStatus} = 'completed'
+      )::int`,
     })
     .from(unlimitedChallengeParticipantsTable)
     .where(and(
@@ -285,10 +318,14 @@ export async function areAllFinalParticipantVerificationsComplete(
     ));
   const participantCount = row?.participants ?? 0;
   const pendingParticipantCount = row?.pending ?? participantCount;
+  const submittedParticipantCount = row?.submitted ?? 0;
+  const completedParticipantCount = row?.completed ?? 0;
   return {
     allCompleted: participantCount > 0 && pendingParticipantCount === 0,
     participantCount,
     pendingParticipantCount,
+    submittedParticipantCount,
+    completedParticipantCount,
   };
 }
 

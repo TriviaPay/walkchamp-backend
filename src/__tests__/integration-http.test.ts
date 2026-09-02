@@ -168,6 +168,22 @@ describe("HTTP integration smoke", () => {
     expect(response.status).toBe(401);
   });
 
+  it("serves canonical Streak Challenge routes and preserves deprecated aliases", async () => {
+    const canonical = await request("/api/streak-challenges/my-active");
+    expect(canonical.response.status).toBe(401);
+    expect(canonical.response.headers.get("deprecation")).toBeNull();
+
+    const legacy = await request("/api/unlimited-challenges/my-active");
+    expect(legacy.response.status).toBe(401);
+    expect(legacy.response.headers.get("deprecation")).toBe("true");
+    expect(legacy.response.headers.get("link")).toContain("/api/streak-challenges");
+
+    const legacyAdmin = await request("/api/admin/unlimited-challenges/cancel-all", { method: "POST" });
+    expect(legacyAdmin.response.status).toBe(401);
+    expect(legacyAdmin.response.headers.get("deprecation")).toBe("true");
+    expect(legacyAdmin.response.headers.get("link")).toContain("/api/admin/streak-challenges");
+  });
+
   it("does not expose admin stats to anonymous callers", async () => {
     const { response } = await request("/api/admin/stats");
     expect([401, 404]).toContain(response.status);

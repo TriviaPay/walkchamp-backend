@@ -20,14 +20,15 @@ const schema = readFileSync("db/src/schema/unlimitedChallenge.ts", "utf8");
 const missedDayStaysActiveMigration = readFileSync("db/migrations/0031_unlimited_missed_day_stays_active.sql", "utf8");
 
 describe("rollback flag", () => {
-  it("is env-driven (FEATURE_UNLIMITED_GOAL) and gates the router", () => {
-    expect(config).toContain("unlimitedGoalEnabled: parseBoolean(rawEnv.FEATURE_UNLIMITED_GOAL, true)");
-    expect(router).toContain("if (!config.features.unlimitedGoalEnabled)");
+  it("is env-driven (FEATURE_STREAK_CHALLENGE) and gates the canonical router", () => {
+    expect(config).toContain("rawEnv.FEATURE_STREAK_CHALLENGE ?? rawEnv.FEATURE_UNLIMITED_GOAL");
+    expect(config).toContain("streakChallengeEnabled: parseBoolean(");
+    expect(router).toContain("if (!config.features.streakChallengeEnabled)");
     expect(router).toContain('code: "FEATURE_DISABLED"');
   });
 
   it("worker start/settle handlers are NOT behind the flag (in-flight challenges still complete)", () => {
-    expect(worker).not.toMatch(/unlimitedGoalEnabled[\s\S]*unlimited\.start/);
+    expect(worker).not.toMatch(/streakChallengeEnabled[\s\S]*unlimited\.start/);
     expect(worker).toContain('case "unlimited.start"');
     expect(worker).toContain('case "unlimited.settle"');
   });
@@ -70,7 +71,7 @@ describe("one-blocking-challenge spans both systems", () => {
   it("the unlimited blocking check is flag-gated + fail-open so it CANNOT break existing race paths", () => {
     // When the feature is off it returns null before touching the new tables; a query error also
     // returns null (fail-open) rather than 500-ing the existing race create/join flow.
-    expect(membership).toContain("if (!config.features.unlimitedGoalEnabled) return null;");
+    expect(membership).toContain("if (!config.features.streakChallengeEnabled) return null;");
     expect(membership).toContain("Fail-open");
     expect(membership).toMatch(/catch \(err\)[\s\S]*return null;/);
   });
@@ -126,7 +127,7 @@ describe("settlement: equal split, idempotent, zero-winner policy", () => {
   it("zero winners applies the configured policy without auto-crediting the platform", () => {
     expect(settlement).toContain('action: "unlimited_challenge.zero_winner"');
     expect(settlement).toContain("no auto-credit");
-    expect(config).toContain('zeroWinnerPolicy: unlimitedGoalZeroWinnerPolicy');
+    expect(config).toContain('zeroWinnerPolicy: streakChallengeZeroWinnerPolicy');
   });
 
   it("refund_entry_contributions policy actually refunds entries idempotently (platform fee kept)", () => {
@@ -193,8 +194,8 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
     expect(router).toContain("participants: players");
     const liveProgress = readFileSync("src/lib/unlimitedLiveProgress.ts", "utf8");
     const detail = router.slice(
-      router.indexOf('router.get("/unlimited-challenges/:id"'),
-      router.indexOf("// ── POST /unlimited-challenges/:id/live-progress"),
+      router.indexOf('router.get("/streak-challenges/:id"'),
+      router.indexOf("// ── POST /streak-challenges/:id/live-progress"),
     );
     expect(detail).toContain("participantCount: players.length");
     expect(liveProgress).toContain("gt(unlimitedChallengeParticipantsTable.entryContributionCents, 0)");
@@ -205,12 +206,12 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
   it("my-active and detail expose the same challenge summary fields clients render from", () => {
     expect(router).toContain("async function loadChallengeParticipantCounts");
     const myActive = router.slice(
-      router.indexOf('router.get("/unlimited-challenges/my-active"'),
-      router.indexOf("// ── GET /unlimited-challenges (paginated public listing)"),
+      router.indexOf('router.get("/streak-challenges/my-active"'),
+      router.indexOf("// ── GET /streak-challenges (paginated public listing)"),
     );
     const detail = router.slice(
-      router.indexOf('router.get("/unlimited-challenges/:id"'),
-      router.indexOf("// ── POST /unlimited-challenges/:id/live-progress"),
+      router.indexOf('router.get("/streak-challenges/:id"'),
+      router.indexOf("// ── POST /streak-challenges/:id/live-progress"),
     );
     for (const field of ["startAtUtc", "registrationClosesAtUtc", "resultsReadyAt", "resultsAnnouncedAt", "createdAt"]) {
       expect(router).toContain(`${field} = isoOrNull(c.${field})`);
@@ -235,7 +236,7 @@ describe("capacity is explicitly unlimited (no fake max/full)", () => {
   it("viewer schedule embargoes an individual loss until global results are ready", () => {
     const viewerFn = router.slice(
       router.indexOf("async function buildViewerSchedule"),
-      router.indexOf("// ── POST /unlimited-challenges/host"),
+      router.indexOf("// ── POST /streak-challenges/host"),
     );
     expect(viewerFn).toContain("const viewerStreakBroken");
     expect(viewerFn).toContain("const viewerResultsStatus = challenge.resultsStatus");
@@ -284,8 +285,8 @@ describe("viewer membership on read paths (Next Race must not infer 'mine' from 
     expect(router).toContain("INNER JOIN unlimited_challenge_days d ON d.participant_id = p.id");
 
     const detail = router.slice(
-      router.indexOf('router.get("/unlimited-challenges/:id"'),
-      router.indexOf("// ── POST /unlimited-challenges/:id/live-progress"),
+      router.indexOf('router.get("/streak-challenges/:id"'),
+      router.indexOf("// ── POST /streak-challenges/:id/live-progress"),
     );
     expect(detail).toContain("loadChallengePlayers(challengeId, userId, challenge.hostUserId)");
     expect(detail).not.toContain("overlayChallengeListCards");

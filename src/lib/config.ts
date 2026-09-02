@@ -92,6 +92,13 @@ const envSchema = z
     CASH_FEATURES_ENABLED: z.enum(["true", "false"]).optional(),
     FEATURE_CASH_FEATURES: z.enum(["true", "false"]).optional(),
     FEATURE_COIN_ENTRY_CHALLENGES: z.enum(["true", "false"]).optional(),
+    FEATURE_STREAK_CHALLENGE: z.enum(["true", "false"]).optional(),
+    STREAK_CHALLENGE_GRACE_HOURS: z.string().optional(),
+    STREAK_CHALLENGE_VERIFICATION_MODE: z.enum(["manual", "client_source"]).optional(),
+    STREAK_CHALLENGE_ZERO_WINNER_POLICY: z
+      .enum(["refund_entry_contributions", "rollover_prize_pool", "manual_review"])
+      .optional(),
+    // Legacy rollout aliases. Canonical STREAK_CHALLENGE_* values win when both are present.
     FEATURE_UNLIMITED_GOAL: z.enum(["true", "false"]).optional(),
     UNLIMITED_GOAL_GRACE_HOURS: z.string().optional(),
     UNLIMITED_VERIFICATION_MODE: z.enum(["manual", "client_source"]).optional(),
@@ -212,10 +219,14 @@ const featureFlags = {
     parseBoolean(rawEnv.CASH_FEATURES_ENABLED)
     && parseBoolean(rawEnv.FEATURE_CASH_FEATURES),
   coinEntryChallengesEnabled: parseBoolean(rawEnv.FEATURE_COIN_ENTRY_CHALLENGES),
-  // Unlimited Challenge (unlimited_goal). On by default; primary rollback switch: setting
-  // FEATURE_UNLIMITED_GOAL=false blocks all create/join (routes 404); worker start/finalize/settle
+  // Streak Challenge (legacy machine discriminator: unlimited_goal). On by default; primary
+  // rollback switch FEATURE_STREAK_CHALLENGE=false blocks API access, while worker
+  // start/finalize/settle
   // paths are intentionally NOT gated so any in-flight challenge still completes safely.
-  unlimitedGoalEnabled: parseBoolean(rawEnv.FEATURE_UNLIMITED_GOAL, true),
+  streakChallengeEnabled: parseBoolean(
+    rawEnv.FEATURE_STREAK_CHALLENGE ?? rawEnv.FEATURE_UNLIMITED_GOAL,
+    true,
+  ),
   allowTestRoutes: parseBoolean(rawEnv.ALLOW_TEST_ROUTES),
   allowDemoSeeds: parseBoolean(rawEnv.ALLOW_DEMO_SEEDS),
   mockProvidersEnabled: parseBoolean(rawEnv.MOCK_PROVIDERS_ENABLED),
@@ -224,8 +235,10 @@ const featureFlags = {
 // A source label supplied by the mobile client is useful provenance, but it is not cryptographic
 // proof that Health Connect / HealthKit produced the number. Production funded challenges therefore
 // default to an ops-verification hold. Non-production keeps the legacy automatic mode for local QA.
-const unlimitedVerificationMode: "manual" | "client_source" =
-  rawEnv.UNLIMITED_VERIFICATION_MODE ?? (isProduction ? "manual" : "client_source");
+const streakChallengeVerificationMode: "manual" | "client_source" =
+  rawEnv.STREAK_CHALLENGE_VERIFICATION_MODE
+  ?? rawEnv.UNLIMITED_VERIFICATION_MODE
+  ?? (isProduction ? "manual" : "client_source");
 
 const realMoneyReadiness = {
   paymentsLiveMode: parseBoolean(rawEnv.PAYMENTS_LIVE_MODE, true),
@@ -372,8 +385,8 @@ if (isProduction) {
     if (!featureFlags.hybridReconciliationEnabled) {
       configErrors.push("ENABLE_HYBRID_RECONCILIATION=true is required when cash features are enabled in production (funded payouts must never settle on unverified live steps)");
     }
-    if (featureFlags.unlimitedGoalEnabled && unlimitedVerificationMode !== "manual") {
-      configErrors.push("UNLIMITED_VERIFICATION_MODE=manual is required when funded Unlimited challenges are enabled in production (client-declared health sources are not payout attestation)");
+    if (featureFlags.streakChallengeEnabled && streakChallengeVerificationMode !== "manual") {
+      configErrors.push("STREAK_CHALLENGE_VERIFICATION_MODE=manual is required when funded Streak Challenges are enabled in production (client-declared health sources are not payout attestation)");
     }
   }
 }
@@ -418,10 +431,17 @@ const parseIntWithFallback = (raw: unknown, fallback: number, min: number, max =
 const waitingRoomOpenWindowMinutes = parseIntWithFallback(rawEnv.ROOM_OPEN_WINDOW_MINUTES, 30, 1);
 const waitingRoomMinimumParticipants = parseIntWithFallback(rawEnv.MINIMUM_ROOM_PARTICIPANTS, 2, 2);
 
-// ── Unlimited Challenge tunables (backend-authoritative; never client-supplied) ──
-const unlimitedGoalGraceHours = parseIntWithFallback(rawEnv.UNLIMITED_GOAL_GRACE_HOURS, 4, 0);
-const unlimitedGoalZeroWinnerPolicy = (() => {
-  const raw = rawEnv.UNLIMITED_GOAL_ZERO_WINNER_POLICY?.trim();
+// ── Streak Challenge tunables (backend-authoritative; never client-supplied) ──
+const streakChallengeGraceHours = parseIntWithFallback(
+  rawEnv.STREAK_CHALLENGE_GRACE_HOURS ?? rawEnv.UNLIMITED_GOAL_GRACE_HOURS,
+  4,
+  0,
+);
+const streakChallengeZeroWinnerPolicy = (() => {
+  const raw = (
+    rawEnv.STREAK_CHALLENGE_ZERO_WINNER_POLICY
+    ?? rawEnv.UNLIMITED_GOAL_ZERO_WINNER_POLICY
+  )?.trim();
   return raw === "refund_entry_contributions" || raw === "rollover_prize_pool" || raw === "manual_review"
     ? raw
     : "manual_review";
@@ -487,7 +507,7 @@ export const config = {
     openWindowMs: waitingRoomOpenWindowMinutes * 60_000,
     minimumParticipants: waitingRoomMinimumParticipants,
   },
-  unlimitedGoal: {
+  streakChallenge: {
     platformFeeCents: 50,
     minEntryFeeCents: 1000,
     maxEntryFeeCents: 100_000,
@@ -496,10 +516,10 @@ export const config = {
     maxDailyGoalSteps: 20000,
     testingDailyGoalSteps: [100] as const,
     defaultDailyGoalSteps: 10000,
-    graceHours: unlimitedGoalGraceHours,
-    graceMs: unlimitedGoalGraceHours * 60 * 60_000,
-    verificationMode: unlimitedVerificationMode,
-    zeroWinnerPolicy: unlimitedGoalZeroWinnerPolicy,
+    graceHours: streakChallengeGraceHours,
+    graceMs: streakChallengeGraceHours * 60 * 60_000,
+    verificationMode: streakChallengeVerificationMode,
+    zeroWinnerPolicy: streakChallengeZeroWinnerPolicy,
   },
   hybridReconciliation: {
     absoluteToleranceSteps: hybridAbsoluteToleranceSteps,

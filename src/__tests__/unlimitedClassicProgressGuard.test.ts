@@ -17,13 +17,14 @@ const progressHandler = races.slice(
 
 describe("§1 classic progress short-circuits for Unlimited ids", () => {
   it("answers 200 skipped with the documented code and message", () => {
-    expect(progressHandler).toContain('code: "UNLIMITED_USES_WALK_STEPS"');
+    expect(progressHandler).toContain('code: "STREAK_CHALLENGE_USES_WALK_STEPS"');
+    expect(progressHandler).toContain('legacyCode: "UNLIMITED_USES_WALK_STEPS"');
     expect(progressHandler).toContain("skipped: true");
     expect(progressHandler).toContain(
-      "Unlimited challenges use /api/walk/steps and /api/unlimited-challenges/:id/live-progress.",
+      "Streak Challenges use /api/walk/steps and /api/streak-challenges/:id/live-progress.",
     );
     // 200, not 404 — a 404 is retryable to native/outbox layers and produced the retry storm.
-    const block = progressHandler.slice(progressHandler.indexOf("UNLIMITED_USES_WALK_STEPS") - 400);
+    const block = progressHandler.slice(progressHandler.indexOf("STREAK_CHALLENGE_USES_WALK_STEPS") - 400);
     expect(block).toContain("return res.json({");
   });
 
@@ -105,7 +106,7 @@ describe("§2 walk/steps reports what it credited", () => {
 describe("§3 my-active restores the Unlimited tray after process death", () => {
   const viewerFn = route.slice(
     route.indexOf("async function buildViewerSchedule"),
-    route.indexOf("// ── POST /unlimited-challenges/host"),
+    route.indexOf("// ── POST /streak-challenges/host"),
   );
 
   it("my-active carries the full viewer block", () => {
@@ -128,7 +129,7 @@ describe("§3 my-active restores the Unlimited tray after process death", () => 
   it("tells the client which endpoints to write through", () => {
     expect(viewerFn).toContain("unlimitedDailyMode: true");
     expect(viewerFn).toContain('verifiedStepsEndpoint: "/api/walk/steps"');
-    expect(viewerFn).toContain("provisionalStepsEndpoint: `/api/unlimited-challenges/${challenge.id}/live-progress`");
+    expect(viewerFn).toContain("provisionalStepsEndpoint: `/api/streak-challenges/${challenge.id}/live-progress`");
   });
 
   it("the day key is the PARTICIPANT's locked value, not the host's", () => {

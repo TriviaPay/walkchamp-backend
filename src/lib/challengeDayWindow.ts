@@ -1,5 +1,5 @@
 /**
- * Locked-timezone daily-window service for the Unlimited Challenge.
+ * Locked-timezone daily-window service for the Streak Challenge.
  *
  * THE SCHEDULE IS A CALENDAR DATE, NOT AN INSTANT. The host picks a date ("2026-08-09") and every
  * participant starts at 00:00 on that date in their OWN locked IANA timezone. Those are different
@@ -241,7 +241,7 @@ export function computeChallengeEndUtc(startAtUtc: Date, timezone: string, durat
   return windows[windows.length - 1].windowEndUtc;
 }
 
-// ── USD Unlimited Challenge schedule validation (public + private parity) ──────
+// ── USD Streak Challenge schedule validation (public + private parity) ─────────
 // A USD Unlimited Players challenge must start on a FUTURE calendar date at exactly local midnight
 // in the challenge timezone, run a supported whole-day duration, and end at local midnight
 // (start local date + duration). The end instant is backend-authoritative. Shared by the create
@@ -276,7 +276,7 @@ function civilOrdinal(year: number, month: number, day: number): number {
 }
 
 /**
- * Validate + normalize a USD Unlimited Challenge schedule.
+ * Validate + normalize a USD Streak Challenge schedule.
  *
  * Accepts EITHER the semantic form (`startLocalDate: "2026-08-09"`, preferred) or the legacy
  * instant form (`startAtIso`, which must land exactly on local midnight in `timezone` and is

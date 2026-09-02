@@ -48,7 +48,7 @@ describe("Unlimited provisional route is additive and separated", () => {
   const walk = readFileSync("src/routes/walk.ts", "utf8");
 
   it("exposes POST live-progress", () => {
-    expect(route).toContain('"/unlimited-challenges/:id/live-progress"');
+    expect(route).toContain('"/streak-challenges/:id/live-progress"');
     expect(route).toContain("applyUnlimitedProvisionalLive");
     expect(route).toContain("Never writes step_daily_totals");
   });

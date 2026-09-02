@@ -120,7 +120,7 @@ export async function submitUnlimitedFinalVerification(input: FinalVerificationS
     }
 
     const passed = input.verifiedSteps >= day.goalSteps;
-    const manual = config.unlimitedGoal.verificationMode === "manual";
+    const manual = config.streakChallenge.verificationMode === "manual";
     await tx
       .update(unlimitedChallengeDaysTable)
       .set({

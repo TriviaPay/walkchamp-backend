@@ -175,8 +175,8 @@ describe("APIs return viewer-personalized state", () => {
     expect(route).not.toContain("...(await buildViewerSchedule(r.challenge, userId))");
 
     const detail = route.slice(
-      route.indexOf('router.get("/unlimited-challenges/:id"'),
-      route.indexOf("// ── POST /unlimited-challenges/:id/live-progress"),
+      route.indexOf('router.get("/streak-challenges/:id"'),
+      route.indexOf("// ── POST /streak-challenges/:id/live-progress"),
     );
     expect(detail).toContain("// Canonical viewer-scoped contract");
     expect(detail).toContain("viewer,\n    ...viewer,");
@@ -189,7 +189,7 @@ describe("APIs return viewer-personalized state", () => {
     );
     const trimViewer = route.slice(
       route.indexOf("function trimViewerScheduleForList"),
-      route.indexOf("// ── POST /unlimited-challenges/host"),
+      route.indexOf("// ── POST /streak-challenges/host"),
     );
 
     expect(listOverlay).toContain("challenge.participationStatus !== null");
@@ -199,17 +199,18 @@ describe("APIs return viewer-personalized state", () => {
     for (const field of [
       "viewerStatus", "verificationPending", "viewerEndAt", "viewerTimezone",
       "viewerStartAt", "currentDayLocalDate", "completedDays", "finalFlowStatus", "finalFlow",
+      "finalResultStatus", "raceFinalStatus", "finalResult",
     ]) {
       expect(trimViewer).toContain(`${field}: viewer.${field}`);
     }
 
     const liveRoute = route.slice(
-      route.indexOf('router.get("/unlimited-challenges/live"'),
-      route.indexOf("// ── GET /unlimited-challenges/recently-finished"),
+      route.indexOf('router.get("/streak-challenges/live"'),
+      route.indexOf("// ── GET /streak-challenges/recently-finished"),
     );
     const listRoute = route.slice(
-      route.indexOf('router.get("/unlimited-challenges",'),
-      route.indexOf("// ── GET /unlimited-challenges/:id"),
+      route.indexOf('router.get("/streak-challenges",'),
+      route.indexOf("// ── GET /streak-challenges/:id"),
     );
     expect(liveRoute).toContain("overlayChallengeListCards(rows, userId)");
     expect(listRoute).toContain("overlayChallengeListCards(rows, userId)");
@@ -232,7 +233,7 @@ describe("APIs return viewer-personalized state", () => {
   });
 
   it("exposes the fields the Walk screen and the Android FGS need", () => {
-    const fn = route.slice(route.indexOf("async function buildViewerSchedule"), route.indexOf("// ── POST /unlimited-challenges/host"));
+    const fn = route.slice(route.indexOf("async function buildViewerSchedule"), route.indexOf("// ── POST /streak-challenges/host"));
     for (const field of [
       "startLocalDate", "durationDays", "viewerStatus", "viewerTimezone", "viewerStartAt", "viewerEndAt",
       "currentDayIndex", "currentDayLocalDate", "currentDayStartAt", "currentDayEndAt", "currentDayStatus",

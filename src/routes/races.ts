@@ -132,6 +132,7 @@ import { sendPushToUser } from "./push.js";
 import { computeCanStart, terminateWaitingRoom, enqueueWaitingRoomLifecycleJobs } from "../lib/waitingRoom.js";
 import { getUnlimitedBlockingMembership } from "../lib/challengeMembership.js";
 import { UNLIMITED_NON_ACTIVE_STATUSES } from "../lib/unlimitedChallengeStatuses.js";
+import { STREAK_CHALLENGE_KIND } from "../lib/streakChallengeContract.js";
 import { leaveUnlimitedChallenge } from "../lib/unlimitedChallengeService.js";
 import {
   currentProtectedPolicySnapshot,
@@ -2577,6 +2578,7 @@ function activeUnlimitedPayload(
     room_type: "unlimited",
     is_sponsored: false,
     challenge_type: "unlimited_goal",
+    challenge_kind: STREAK_CHALLENGE_KIND,
     entry_fee: row.entryFeeCents / 100,
     entry_fee_cents: row.entryFeeCents,
     target_steps: row.dailyGoalSteps,
@@ -3544,6 +3546,7 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
       id: r.id,
       title: r.title,
       entryType: "unlimited_goal",
+      challengeKind: STREAK_CHALLENGE_KIND,
       entryAmountCents: r.entryFeeCents,
       entryAmountDollars: r.entryFeeCents / 100,
       targetSteps: r.dailyGoalSteps,
@@ -3581,7 +3584,7 @@ router.get("/races/my-active", requireAuth, async (req, res) => {
 
 // ── GET /api/races/my-upcoming ────────────────────────────────────────────────
 // Unified "mine" feed for Next Race: scheduled fixed races the viewer is registered
-// for + unlimited challenges the viewer is an active participant in. Membership is by
+// plus Streak Challenges the viewer is an active participant in. Membership is by
 // participation only (never host id alone), so leaving removes the item.
 router.get("/races/my-upcoming", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
@@ -3656,6 +3659,7 @@ router.get("/races/my-upcoming", requireAuth, async (req, res) => {
       sortMs: r.startAtUtc?.getTime() ?? 0,
       item: {
         kind: "unlimited" as const,
+        challengeKind: STREAK_CHALLENGE_KIND,
         id: r.id,
         title: r.title,
         challengeType: "unlimited_goal",
@@ -3835,7 +3839,7 @@ router.post("/races/host", requireAuth, async (req, res) => {
     return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
   {
-    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    // One-blocking-challenge also spans Streak Challenges (no-op when the feature flag is off).
     const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
     if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
   }
@@ -5283,7 +5287,7 @@ router.post("/races", requireAuth, async (req, res) => {
     if (existingRegularRace) {
       return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
     }
-    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    // One-blocking-challenge also spans Streak Challenges (no-op when the feature flag is off).
     const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
     if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
   }
@@ -5381,7 +5385,7 @@ router.post("/races/quick-join-free", requireAuth, async (req, res) => {
     return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
   {
-    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    // One-blocking-challenge also spans Streak Challenges (no-op when the feature flag is off).
     const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
     if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
   }
@@ -5533,7 +5537,7 @@ router.post("/races/:id/join-paid", requireAuth, async (req, res) => {
     return res.status(409).json(regularRaceRegistrationConflictBody(existingRegularRace, userId));
   }
   {
-    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    // One-blocking-challenge also spans Streak Challenges (no-op when the feature flag is off).
     const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
     if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
   }
@@ -5729,7 +5733,7 @@ router.post("/races/:id/join", requireAuth, async (req, res) => {
     });
   }
   if (room.type !== "sponsored") {
-    // One-blocking-challenge also spans Unlimited Challenges (no-op when the feature flag is off).
+    // One-blocking-challenge also spans Streak Challenges (no-op when the feature flag is off).
     const unlimitedBlock = await getUnlimitedBlockingMembership(db, userId);
     if (unlimitedBlock) return res.status(409).json(oneChallengeAtATimeConflictBody(unlimitedBlock));
   }
@@ -7185,7 +7189,7 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
   if (!participantData) {
     // ── Unlimited Daily Goal challenges never use classic race progress ──────
     // Their progress lives in unlimited_challenge_days, written by POST /api/walk/steps
-    // (verified) and POST /api/unlimited-challenges/:id/live-progress (provisional). An Unlimited
+    // (verified) and POST /api/streak-challenges/:id/live-progress (provisional). A Streak Challenge
     // id has no race_rooms row and no race_participants row, so it used to fall out here as a 404
     // — which native/outbox layers treat as retryable, producing an endless retry storm.
     //
@@ -7198,11 +7202,12 @@ router.post("/races/:id/progress", requireAuth, async (req, res) => {
       .where(eq(unlimitedChallengesTable.id, raceId))
       .limit(1);
     if (unlimited) {
-      req.log.info({ raceId, userId }, "[StepSync] classic progress skipped — Unlimited challenge id");
+      req.log.info({ raceId, userId }, "[StepSync] classic progress skipped — Streak Challenge id");
       return res.json({
         skipped: true,
-        code: "UNLIMITED_USES_WALK_STEPS",
-        message: "Unlimited challenges use /api/walk/steps and /api/unlimited-challenges/:id/live-progress.",
+        code: "STREAK_CHALLENGE_USES_WALK_STEPS",
+        legacyCode: "UNLIMITED_USES_WALK_STEPS",
+        message: "Streak Challenges use /api/walk/steps and /api/streak-challenges/:id/live-progress.",
       });
     }
     return res.status(404).json({ error: "Participant not found" });

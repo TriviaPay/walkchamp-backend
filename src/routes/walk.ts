@@ -228,7 +228,7 @@ router.get("/walk/today", requireAuth, async (req, res) => {
 // central step-source contract. Verified health sources (health_connect/healthkit, plus their
 // legacy aliases ios_healthkit/android_health_connect) mark the session/day as verified.
 // Provisional sensor sources (android_step_counter/ios_pedometer) are IGNORED here — they must
-// use POST /api/unlimited-challenges/:id/live-progress (Unlimited) or classic race progress.
+// use POST /api/streak-challenges/:id/live-progress (Streak Challenge) or classic race progress.
 // Clearly-fake sources are safely ignored (200 no-op), never a hard error that would break sync.
 const submitStepsSchema = z.object({
   steps: z.number().int().min(1).max(200000),

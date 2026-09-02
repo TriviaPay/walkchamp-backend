@@ -146,7 +146,7 @@ export async function creditCashChallengePrizes(
 }
 
 /**
- * Idempotently credit entry-fee refunds back to wallets — used only by the Unlimited Challenge
+ * Idempotently credit entry-fee refunds back to wallets — used only by the Streak Challenge
  * zero-winner "refund_entry_contributions" policy (nobody completed, so entries are returned). The
  * fixed platform fee is NOT refunded. Keyed by `refund:{sourceId}:{userId}` so duplicate/retried
  * settlements never double-refund. Balance snapshots are written so the wallet-ledger reconciliation
@@ -155,7 +155,7 @@ export async function creditCashChallengePrizes(
 export async function creditEntryRefunds(
   tx: DbTx,
   input: {
-    sourceId: string; // the unlimited challenge id
+    sourceId: string; // the Streak Challenge id
     refunds: Array<{ userId: string; amountCents: number }>;
   },
 ) {

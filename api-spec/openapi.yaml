@@ -10,6 +10,8 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: streak-challenges
+    description: Multi-day Streak Challenge operations
 paths:
   /healthz:
     get:
@@ -24,8 +26,292 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+  /streak-challenges:
+    get:
+      operationId: listStreakChallenges
+      tags: [streak-challenges]
+      summary: List public Streak Challenges
+      parameters:
+        - in: query
+          name: status
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 50 }
+        - in: query
+          name: offset
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeCollection" }
+  /streak-challenges/host:
+    post:
+      operationId: hostStreakChallenge
+      tags: [streak-challenges]
+      summary: Host a Streak Challenge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: true }
+      responses:
+        "201": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/live:
+    get:
+      operationId: listLiveStreakChallenges
+      tags: [streak-challenges]
+      summary: List live Streak Challenges
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeCollection" }
+  /streak-challenges/recently-finished:
+    get:
+      operationId: listRecentlyFinishedStreakChallenges
+      tags: [streak-challenges]
+      summary: List recently finished Streak Challenges
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeCollection" }
+  /streak-challenges/my-active:
+    get:
+      operationId: getMyActiveStreakChallenge
+      tags: [streak-challenges]
+      summary: Get the viewer's active Streak Challenge
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/{id}:
+    get:
+      operationId: getStreakChallenge
+      tags: [streak-challenges]
+      summary: Get Streak Challenge detail and viewer state
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/{id}/join:
+    post:
+      operationId: joinStreakChallenge
+      tags: [streak-challenges]
+      summary: Join a Streak Challenge
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/{id}/timezone:
+    post:
+      operationId: changeStreakChallengeTimezone
+      tags: [streak-challenges]
+      summary: Confirm a participant timezone change
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/{id}/leave:
+    post:
+      operationId: leaveStreakChallenge
+      tags: [streak-challenges]
+      summary: Leave a Streak Challenge
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/{id}/live-progress:
+    post:
+      operationId: updateStreakChallengeLiveProgress
+      tags: [streak-challenges]
+      summary: Submit provisional live progress
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/{id}/daily-history:
+    get:
+      operationId: getStreakChallengeDailyHistory
+      tags: [streak-challenges]
+      summary: Get locked-window daily history
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/{id}/final-verification:
+    post:
+      operationId: submitStreakChallengeFinalVerification
+      tags: [streak-challenges]
+      summary: Submit the final provider verification
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/{id}/comments:
+    get:
+      operationId: listStreakChallengeComments
+      tags: [streak-challenges]
+      summary: List live comments
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+    post:
+      operationId: createStreakChallengeComment
+      tags: [streak-challenges]
+      summary: Post a live comment
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/{id}/reactions:
+    get:
+      operationId: listStreakChallengeReactions
+      tags: [streak-challenges]
+      summary: Get live reaction counts
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+    post:
+      operationId: createStreakChallengeReaction
+      tags: [streak-challenges]
+      summary: Post a live reaction
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /streak-challenges/{id}/leaderboard:
+    get:
+      operationId: getStreakChallengeLeaderboard
+      tags: [streak-challenges]
+      summary: Get the informational leaderboard
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /admin/streak-challenges/{challengeId}/days/{dayId}/verification-resolve:
+    post:
+      operationId: resolveStreakChallengeDayVerification
+      tags: [streak-challenges]
+      summary: Resolve a Streak Challenge day verification as an administrator
+      parameters:
+        - in: path
+          name: challengeId
+          required: true
+          schema: { type: string, format: uuid }
+        - in: path
+          name: dayId
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /admin/streak-challenges/cancel-all:
+    post:
+      operationId: cancelAllStreakChallenges
+      tags: [streak-challenges]
+      summary: Cancel all open Streak Challenges as an administrator
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
+  /admin/streak-challenges/{id}/cancel:
+    post:
+      operationId: cancelStreakChallenge
+      tags: [streak-challenges]
+      summary: Cancel one Streak Challenge as an administrator
+      parameters:
+        - $ref: "#/components/parameters/StreakChallengeId"
+      responses:
+        "200": { $ref: "#/components/responses/StreakChallengeDetail" }
 components:
+  parameters:
+    StreakChallengeId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    StreakChallengeDetail:
+      description: Streak Challenge response
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/StreakChallengeResponse"
+    StreakChallengeCollection:
+      description: Paginated Streak Challenge collection
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/StreakChallengeCollectionResponse"
   schemas:
+    StreakChallengeFinalResult:
+      type: object
+      description: Backend-owned final-result presentation state. All timestamps derive from persisted participant UTC windows.
+      properties:
+        participantStatus:
+          type: [string, "null"]
+          enum: [FINAL_DAY_COMPLETED_WAITING, FINAL_VERIFICATION, RESULTS_READY, RESULTS_ANNOUNCED, null]
+        raceStatus:
+          type: [string, "null"]
+          enum: [WAITING_FOR_PARTICIPANT_DAY_ENDS, FINAL_VERIFICATION, PREPARING_LEADERBOARD, SETTLED, RESULTS_ANNOUNCED, null]
+        title: { type: [string, "null"] }
+        message: { type: [string, "null"] }
+        lastParticipantEndAtUtc: { type: [string, "null"], format: date-time }
+        verificationStartedAt: { type: [string, "null"], format: date-time }
+        preparingLeaderboardAt: { type: [string, "null"], format: date-time }
+        settlementEligibleAt: { type: [string, "null"], format: date-time }
+        verificationElapsedSeconds: { type: [integer, "null"], minimum: 0 }
+        preparingLeaderboardAfterSeconds: { type: integer, minimum: 0, example: 7200 }
+        verificationWindowSeconds: { type: integer, minimum: 0, example: 14400 }
+        verificationProgressing: { type: boolean }
+        verificationPending: { type: boolean }
+      required:
+        - participantStatus
+        - raceStatus
+        - title
+        - message
+        - lastParticipantEndAtUtc
+        - verificationStartedAt
+        - preparingLeaderboardAt
+        - settlementEligibleAt
+        - verificationElapsedSeconds
+        - preparingLeaderboardAfterSeconds
+        - verificationWindowSeconds
+        - verificationProgressing
+        - verificationPending
+    StreakChallengeViewer:
+      type: object
+      properties:
+        finalResultStatus:
+          type: [string, "null"]
+          enum: [FINAL_DAY_COMPLETED_WAITING, FINAL_VERIFICATION, RESULTS_READY, RESULTS_ANNOUNCED, null]
+        raceFinalStatus:
+          type: [string, "null"]
+          enum: [WAITING_FOR_PARTICIPANT_DAY_ENDS, FINAL_VERIFICATION, PREPARING_LEADERBOARD, SETTLED, RESULTS_ANNOUNCED, null]
+        finalResult:
+          anyOf:
+            - $ref: "#/components/schemas/StreakChallengeFinalResult"
+            - type: "null"
+      additionalProperties: true
+    StreakChallengeResponse:
+      type: object
+      properties:
+        viewer:
+          $ref: "#/components/schemas/StreakChallengeViewer"
+        finalResultStatus:
+          type: [string, "null"]
+          enum: [FINAL_DAY_COMPLETED_WAITING, FINAL_VERIFICATION, RESULTS_READY, RESULTS_ANNOUNCED, null]
+        raceFinalStatus:
+          type: [string, "null"]
+          enum: [WAITING_FOR_PARTICIPANT_DAY_ENDS, FINAL_VERIFICATION, PREPARING_LEADERBOARD, SETTLED, RESULTS_ANNOUNCED, null]
+        finalResult:
+          anyOf:
+            - $ref: "#/components/schemas/StreakChallengeFinalResult"
+            - type: "null"
+      additionalProperties: true
+    StreakChallengeCollectionResponse:
+      type: object
+      properties:
+        challenges:
+          type: array
+          items:
+            type: object
+            properties:
+              viewer:
+                $ref: "#/components/schemas/StreakChallengeViewer"
+            additionalProperties: true
+      additionalProperties: true
     HealthStatus:
       type: object
       properties:
@@ -33,4 +319,3 @@ components:
           type: string
       required:
         - status
-

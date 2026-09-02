@@ -11,14 +11,14 @@ describe("remaining audit remediation", () => {
     const jobs = read("src/lib/unlimitedChallengeJobs.ts");
     const admin = read("src/routes/admin.ts");
 
-    expect(config).toContain('UNLIMITED_VERIFICATION_MODE: z.enum(["manual", "client_source"])');
+    expect(config).toContain('STREAK_CHALLENGE_VERIFICATION_MODE: z.enum(["manual", "client_source"])');
     expect(config).toContain('isProduction ? "manual" : "client_source"');
-    expect(config).toContain('UNLIMITED_VERIFICATION_MODE=manual is required');
-    expect(compose).toContain('UNLIMITED_VERIFICATION_MODE: ${UNLIMITED_VERIFICATION_MODE:-manual}');
-    expect(jobs).toContain('config.unlimitedGoal.verificationMode === "manual"');
+    expect(config).toContain('STREAK_CHALLENGE_VERIFICATION_MODE=manual is required');
+    expect(compose).toContain('STREAK_CHALLENGE_VERIFICATION_MODE: ${STREAK_CHALLENGE_VERIFICATION_MODE:-${UNLIMITED_VERIFICATION_MODE:-manual}}');
+    expect(jobs).toContain('config.streakChallenge.verificationMode === "manual"');
     expect(jobs).toContain('status: "pending_verification"');
     expect(jobs).toContain("resolveUnlimitedDayVerification");
-    expect(admin).toContain('/admin/unlimited-challenges/:challengeId/days/:dayId/verification-resolve');
+    expect(admin).toContain('/admin/streak-challenges/:challengeId/days/:dayId/verification-resolve');
     expect(admin).toContain("authoritativeSteps");
   });
 

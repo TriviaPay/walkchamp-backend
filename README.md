@@ -2,6 +2,8 @@
 
 Express API plus worker for step ingestion, race state, wallets, chat, groups, and media.
 
+Streak Challenge API and environment documentation: [`docs/streak-challenge-api.md`](docs/streak-challenge-api.md).
+
 ## Current production target
 
 - `OVH VPS-2`

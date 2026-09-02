@@ -34,7 +34,11 @@ import {
   resolveChallengeStartLocalDate,
   resolveLockableTimezone,
 } from "../lib/unlimitedParticipantSchedule.js";
-import { areAllParticipantWindowsClosed, toDayStatus } from "../lib/unlimitedResults.js";
+import {
+  areAllFinalParticipantVerificationsComplete,
+  areAllParticipantWindowsClosed,
+  toDayStatus,
+} from "../lib/unlimitedResults.js";
 import {
   applyUnlimitedProvisionalLive,
   displayedFromLanes,
@@ -52,7 +56,15 @@ import {
   changeUnlimitedParticipantTimezone,
   UnlimitedTimezoneChangeError,
 } from "../lib/unlimitedTimezoneChange.js";
-import { resolveUnlimitedFinalFlow } from "../lib/unlimitedFinalFlow.js";
+import {
+  resolveStreakChallengeFinalResult,
+  resolveUnlimitedFinalFlow,
+} from "../lib/unlimitedFinalFlow.js";
+import {
+  LEGACY_STREAK_CHALLENGE_TYPE,
+  STREAK_CHALLENGE_KIND,
+  rewriteLegacyPublicStreakChallengeUrl,
+} from "../lib/streakChallengeContract.js";
 
 const router: Router = Router();
 
@@ -94,12 +106,23 @@ function sqlValues(values: readonly string[]): SQL {
   return sql.join(values.map((v) => sql`${v}`), sql`, `);
 }
 
-// ── Env rollback gate: FEATURE_UNLIMITED_GOAL=false → all routes 404 ──────────
+// Legacy /unlimited-challenges URLs remain aliases while clients move to /streak-challenges.
+router.use((req, res, next): void => {
+  const rewritten = rewriteLegacyPublicStreakChallengeUrl(req.url);
+  if (rewritten !== req.url) {
+    res.setHeader("Deprecation", "true");
+    res.setHeader("Link", "</api/streak-challenges>; rel=\"successor-version\"");
+    req.url = rewritten;
+  }
+  next();
+});
+
+// ── Env rollback gate: FEATURE_STREAK_CHALLENGE=false → all routes 404 ───────
 // The worker start/finalize/settle paths are intentionally NOT gated, so any in-flight
 // challenge still completes after the flag is turned off.
-router.use("/unlimited-challenges", (_req: Request, res: Response, next: NextFunction): void => {
-  if (!config.features.unlimitedGoalEnabled) {
-    res.status(404).json({ error: "Unlimited Challenges are disabled for this build.", code: "FEATURE_DISABLED" });
+router.use("/streak-challenges", (_req: Request, res: Response, next: NextFunction): void => {
+  if (!config.features.streakChallengeEnabled) {
+    res.status(404).json({ error: "Streak Challenges are disabled for this build.", code: "FEATURE_DISABLED" });
     return;
   }
   next();
@@ -109,7 +132,7 @@ const createSchema = z.object({
   title: z.string().max(80).optional(),
   visibility: z.enum(["public", "private"]).default("public"),
   entryFeeCents: z.number().int(),
-  dailyGoalSteps: z.number().int().default(config.unlimitedGoal.defaultDailyGoalSteps),
+  dailyGoalSteps: z.number().int().default(config.streakChallenge.defaultDailyGoalSteps),
   durationDays: z.number().int(),
   // PREFERRED: the calendar date every participant starts on, in their own timezone.
   startLocalDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -155,8 +178,10 @@ function serializeChallenge(
 
   return {
     id: c.id,
-    challengeType: "unlimited_goal",
-    entryType: "unlimited_goal",
+    challengeKind: STREAK_CHALLENGE_KIND,
+    challengeType: LEGACY_STREAK_CHALLENGE_TYPE,
+    entryType: LEGACY_STREAK_CHALLENGE_TYPE,
+    apiBasePath: "/api/streak-challenges",
     hostUserId: c.hostUserId,
     title: c.title,
     visibility: c.visibility,
@@ -616,6 +641,15 @@ async function buildViewerSchedule(
   // §7 — counters behind "waiting for all registered participants to finish in their local
   // timezones". Derived from the frozen settlement population, never from a live row count.
   const closure = await areAllParticipantWindowsClosed(challenge.id);
+  const finalVerification = closure.allClosed
+    ? await areAllFinalParticipantVerificationsComplete(challenge.id)
+    : {
+        allCompleted: false,
+        participantCount: closure.registeredParticipantCount,
+        pendingParticipantCount: closure.registeredParticipantCount,
+        submittedParticipantCount: 0,
+        completedParticipantCount: 0,
+      };
   const viewerStreakBroken =
     state.failedDays > 0 ||
     participant?.eligibilityReasonCode === "daily_goal_missed";
@@ -628,6 +662,25 @@ async function buildViewerSchedule(
     viewerEndAt: state.viewerEndAt,
     viewerStatus: state.viewerStatus,
     verificationPending: state.verificationPending,
+  });
+  const finalResult = resolveStreakChallengeFinalResult({
+    isParticipant: participant != null,
+    challengeStatus: challenge.status,
+    resultsStatus: challenge.resultsStatus,
+    resultsAnnouncedAt: challenge.resultsAnnouncedAt,
+    resultsReadyAt: challenge.resultsReadyAt,
+    settledAt: challenge.settledAt,
+    viewerEndAt: state.viewerEndAt,
+    viewerStatus: state.viewerStatus,
+    verificationPending: state.verificationPending,
+    allParticipantWindowsClosed: closure.allClosed,
+    participantsFinishedCount: closure.participantsFinishedCount,
+    latestParticipantEndAtUtc: closure.latestParticipantEndAtUtc,
+    finalVerificationParticipantCount: finalVerification.participantCount,
+    finalVerificationSubmittedCount: finalVerification.submittedParticipantCount,
+    finalVerificationCompletedCount: finalVerification.completedParticipantCount,
+    finalVerificationPendingCount: finalVerification.pendingParticipantCount,
+    verificationWindowMs: config.streakChallenge.graceMs,
   });
 
   return {
@@ -657,6 +710,10 @@ async function buildViewerSchedule(
     viewerResultReasonCode: viewerResultsReady && viewerStreakBroken ? "daily_goal_missed" : null,
     finalFlowStatus: finalFlow?.status ?? null,
     finalFlow,
+    // Canonical Streak Challenge lifecycle. Legacy finalFlow remains during client migration.
+    finalResultStatus: finalResult?.participantStatus ?? null,
+    raceFinalStatus: finalResult?.raceStatus ?? null,
+    finalResult,
     viewerStatus: state.viewerStatus,
     viewerTimezone: state.viewerTimezone,
     viewerTimezoneLockedAt: isoOrNull(participant?.timezoneLockedAt),
@@ -696,7 +753,7 @@ async function buildViewerSchedule(
     // The tray must drive step sync through these, never through /api/races/:id/progress.
     unlimitedDailyMode: true,
     verifiedStepsEndpoint: "/api/walk/steps",
-    provisionalStepsEndpoint: `/api/unlimited-challenges/${challenge.id}/live-progress`,
+    provisionalStepsEndpoint: `/api/streak-challenges/${challenge.id}/live-progress`,
   };
 }
 
@@ -712,11 +769,14 @@ function trimViewerScheduleForList(viewer: Awaited<ReturnType<typeof buildViewer
     completedDays: viewer.completedDays,
     finalFlowStatus: viewer.finalFlowStatus,
     finalFlow: viewer.finalFlow,
+    finalResultStatus: viewer.finalResultStatus,
+    raceFinalStatus: viewer.raceFinalStatus,
+    finalResult: viewer.finalResult,
   };
 }
 
-// ── POST /unlimited-challenges/host ───────────────────────────────────────────
-router.post("/unlimited-challenges/host", requireAuth, async (req, res) => {
+// ── POST /streak-challenges/host ──────────────────────────────────────────────
+router.post("/streak-challenges/host", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const parsed = createSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid challenge parameters.", details: parsed.error.flatten() });
@@ -729,8 +789,8 @@ router.post("/unlimited-challenges/host", requireAuth, async (req, res) => {
   return res.status(201).json({ challenge: serializeChallenge(result.data), inviteCode: result.data.inviteCode ?? undefined });
 });
 
-// ── POST /unlimited-challenges/:id/join ───────────────────────────────────────
-router.post("/unlimited-challenges/:id/join", requireAuth, async (req, res) => {
+// ── POST /streak-challenges/:id/join ──────────────────────────────────────────
+router.post("/streak-challenges/:id/join", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const inviteCode = typeof req.body?.inviteCode === "string" ? req.body.inviteCode : undefined;
   const timezone = typeof req.body?.timezone === "string" ? req.body.timezone : undefined;
@@ -745,7 +805,7 @@ const timezoneChangeSchema = z.object({
 
 // Confirmation is server-authoritative: the active day stays byte-for-byte unchanged, the new
 // IANA zone is assigned only to not-yet-started day rows, and the account preference is retained.
-router.post("/unlimited-challenges/:id/timezone", requireAuth, requireActiveAccount, async (req, res) => {
+router.post("/streak-challenges/:id/timezone", requireAuth, requireActiveAccount, async (req, res) => {
   const parsed = timezoneChangeSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "Invalid timezone change.", details: parsed.error.issues });
   try {
@@ -763,8 +823,8 @@ router.post("/unlimited-challenges/:id/timezone", requireAuth, requireActiveAcco
   }
 });
 
-// ── POST /unlimited-challenges/:id/leave ──────────────────────────────────────
-router.post("/unlimited-challenges/:id/leave", requireAuth, async (req, res) => {
+// ── POST /streak-challenges/:id/leave ─────────────────────────────────────────
+router.post("/streak-challenges/:id/leave", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const result = await leaveUnlimitedChallenge(userId, String(req.params.id));
   if (!result.ok) return res.status(result.httpStatus).json(result.body);
@@ -787,9 +847,9 @@ router.post("/unlimited-challenges/:id/leave", requireAuth, async (req, res) => 
   });
 });
 
-// ── GET /unlimited-challenges/live (public running challenges for Live tab) ───
+// ── GET /streak-challenges/live (public running challenges for Live tab) ──────
 // Must be registered BEFORE /:id so "live" is not treated as an id.
-router.get("/unlimited-challenges/live", requireAuth, async (req, res) => {
+router.get("/streak-challenges/live", requireAuth, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
   const userId = (req as AuthenticatedRequest).descopeUserId;
@@ -810,8 +870,8 @@ router.get("/unlimited-challenges/live", requireAuth, async (req, res) => {
   return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
 });
 
-// ── GET /unlimited-challenges/recently-finished (Live tab Recently Finished) ───
-router.get("/unlimited-challenges/recently-finished", requireAuth, async (req, res) => {
+// ── GET /streak-challenges/recently-finished (Live tab Recently Finished) ─────
+router.get("/streak-challenges/recently-finished", requireAuth, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 50);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
   const userId = (req as AuthenticatedRequest).descopeUserId;
@@ -832,8 +892,8 @@ router.get("/unlimited-challenges/recently-finished", requireAuth, async (req, r
   return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
 });
 
-// ── GET /unlimited-challenges/my-active (membership-scoped open challenges) ───
-router.get("/unlimited-challenges/my-active", requireAuth, async (req, res) => {
+// ── GET /streak-challenges/my-active (membership-scoped open challenges) ──────
+router.get("/streak-challenges/my-active", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const rows = await db
     .select({
@@ -876,11 +936,11 @@ router.get("/unlimited-challenges/my-active", requireAuth, async (req, res) => {
   return res.json({ challenge: challenges[0] ?? null, challenges, count: challenges.length });
 });
 
-// ── GET /unlimited-challenges (paginated public listing) ──────────────────────
+// ── GET /streak-challenges (paginated public listing) ─────────────────────────
 // Default: public + waiting (Available / joinable).
 // ?status=active|live|in_progress → public starting/active/settling (Live browse).
 // ?status=waiting → explicit waiting (same as default).
-router.get("/unlimited-challenges", requireAuth, async (req, res) => {
+router.get("/streak-challenges", requireAuth, async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 50);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
   const userId = (req as AuthenticatedRequest).descopeUserId;
@@ -912,8 +972,8 @@ router.get("/unlimited-challenges", requireAuth, async (req, res) => {
   return res.json({ challenges, pagination: { limit, offset, count: rows.length } });
 });
 
-// ── GET /unlimited-challenges/:id (detail + membership + canJoin) ─────────────
-router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
+// ── GET /streak-challenges/:id (detail + membership + canJoin) ────────────────
+router.get("/streak-challenges/:id", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const challengeId = String(req.params.id);
   const [challenge] = await db.select().from(unlimitedChallengesTable).where(eq(unlimitedChallengesTable.id, challengeId)).limit(1);
@@ -968,7 +1028,7 @@ router.get("/unlimited-challenges/:id", requireAuth, async (req, res) => {
   });
 });
 
-// ── POST /unlimited-challenges/:id/live-progress (provisional sensor only) ─────
+// ── POST /streak-challenges/:id/live-progress (provisional sensor only) ───────
 // Redis live state only. Never writes step_daily_totals / qualification / prizes.
 const provisionalLiveSchema = z.object({
   challengeDayKey: z.string().min(1).max(32),
@@ -980,7 +1040,7 @@ const provisionalLiveSchema = z.object({
   sequence: z.number().int().min(0).max(1_000_000_000),
 });
 
-router.post("/unlimited-challenges/:id/live-progress", requireAuth, async (req, res) => {
+router.post("/streak-challenges/:id/live-progress", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const challengeId = String(req.params.id);
   const parsed = provisionalLiveSchema.safeParse(req.body);
@@ -1152,14 +1212,14 @@ router.post("/unlimited-challenges/:id/live-progress", requireAuth, async (req, 
   });
 });
 
-// ── GET /unlimited-challenges/:id/daily-history ───────────────────────────────
+// ── GET /streak-challenges/:id/daily-history ──────────────────────────────────
 // §12/§15 — the complete, historically queryable day-by-day record: exactly durationDays rows
 // (7/10/30/60/90), each carrying its frozen calendar date and assigned timezone so a
 // finished challenge can be rendered without re-deriving any timezone rules.
 //
 // ?userId= views another participant's history (the board is public within the challenge);
 // omitted, it returns the caller's own.
-router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, res) => {
+router.get("/streak-challenges/:id/daily-history", requireAuth, async (req, res) => {
   const viewerId = (req as AuthenticatedRequest).descopeUserId;
   const challengeId = String(req.params.id);
   const targetUserId = typeof req.query.userId === "string" && req.query.userId ? req.query.userId : viewerId;
@@ -1274,6 +1334,16 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     days: dayRows,
     now,
   });
+  const closure = await areAllParticipantWindowsClosed(challenge.id, now);
+  const finalVerification = closure.allClosed
+    ? await areAllFinalParticipantVerificationsComplete(challenge.id)
+    : {
+        allCompleted: false,
+        participantCount: closure.registeredParticipantCount,
+        pendingParticipantCount: closure.registeredParticipantCount,
+        submittedParticipantCount: 0,
+        completedParticipantCount: 0,
+      };
   const finalFlow = resolveUnlimitedFinalFlow({
     challengeStatus: challenge.status,
     resultsStatus: challenge.resultsStatus,
@@ -1281,6 +1351,26 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     viewerEndAt: viewerState.viewerEndAt,
     viewerStatus: viewerState.viewerStatus,
     verificationPending: viewerState.verificationPending,
+    now,
+  });
+  const finalResult = resolveStreakChallengeFinalResult({
+    isParticipant: true,
+    challengeStatus: challenge.status,
+    resultsStatus: challenge.resultsStatus,
+    resultsAnnouncedAt: challenge.resultsAnnouncedAt,
+    resultsReadyAt: challenge.resultsReadyAt,
+    settledAt: challenge.settledAt,
+    viewerEndAt: viewerState.viewerEndAt,
+    viewerStatus: viewerState.viewerStatus,
+    verificationPending: viewerState.verificationPending,
+    allParticipantWindowsClosed: closure.allClosed,
+    participantsFinishedCount: closure.participantsFinishedCount,
+    latestParticipantEndAtUtc: closure.latestParticipantEndAtUtc,
+    finalVerificationParticipantCount: finalVerification.participantCount,
+    finalVerificationSubmittedCount: finalVerification.submittedParticipantCount,
+    finalVerificationCompletedCount: finalVerification.completedParticipantCount,
+    finalVerificationPendingCount: finalVerification.pendingParticipantCount,
+    verificationWindowMs: config.streakChallenge.graceMs,
     now,
   });
 
@@ -1302,6 +1392,9 @@ router.get("/unlimited-challenges/:id/daily-history", requireAuth, async (req, r
     viewerResultReasonCode: viewerResultsReady && viewerStreakBroken ? "daily_goal_missed" : null,
     finalFlowStatus: finalFlow?.status ?? null,
     finalFlow,
+    finalResultStatus: finalResult?.participantStatus ?? null,
+    raceFinalStatus: finalResult?.raceStatus ?? null,
+    finalResult,
     // Do not publish final winner/loser eligibility through history before global settlement.
     prizePoolEligibilityStatus: viewerResultsReady ? participant.prizePoolEligibilityStatus : "pending",
     eligibilityReasonCode: viewerResultsReady ? participant.eligibilityReasonCode : null,
@@ -1339,7 +1432,7 @@ const finalVerificationSubmissionSchema = z.object({
 // after the latest participant deadline. A race cannot settle until every frozen participant has
 // completed this handshake (and manual production review, when configured).
 router.post(
-  "/unlimited-challenges/:id/final-verification",
+  "/streak-challenges/:id/final-verification",
   requireAuth,
   requireActiveAccount,
   async (req, res) => {
@@ -1396,8 +1489,8 @@ async function isUnlimitedChatParticipant(userId: string, challengeId: string): 
   return Boolean(row);
 }
 
-// ── GET /unlimited-challenges/:id/comments ────────────────────────────────────
-router.get("/unlimited-challenges/:id/comments", requireAuth, async (req, res) => {
+// ── GET /streak-challenges/:id/comments ───────────────────────────────────────
+router.get("/streak-challenges/:id/comments", requireAuth, async (req, res) => {
   const challengeId = String(req.params.id);
   const rows = await db
     .select({
@@ -1426,8 +1519,8 @@ router.get("/unlimited-challenges/:id/comments", requireAuth, async (req, res) =
   });
 });
 
-// ── POST /unlimited-challenges/:id/comments ───────────────────────────────────
-router.post("/unlimited-challenges/:id/comments", requireAuth, async (req, res) => {
+// ── POST /streak-challenges/:id/comments ──────────────────────────────────────
+router.post("/streak-challenges/:id/comments", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const challengeId = String(req.params.id);
   const { text, clientMessageId } = req.body as { text?: unknown; clientMessageId?: unknown };
@@ -1485,8 +1578,8 @@ router.post("/unlimited-challenges/:id/comments", requireAuth, async (req, res) 
   return res.json({ comment });
 });
 
-// ── GET /unlimited-challenges/:id/reactions ───────────────────────────────────
-router.get("/unlimited-challenges/:id/reactions", requireAuth, async (req, res) => {
+// ── GET /streak-challenges/:id/reactions ──────────────────────────────────────
+router.get("/streak-challenges/:id/reactions", requireAuth, async (req, res) => {
   const challengeId = String(req.params.id);
   const rows = await db
     .select({
@@ -1499,8 +1592,8 @@ router.get("/unlimited-challenges/:id/reactions", requireAuth, async (req, res) 
   return res.json({ reactions: rows });
 });
 
-// ── POST /unlimited-challenges/:id/reactions ──────────────────────────────────
-router.post("/unlimited-challenges/:id/reactions", requireAuth, async (req, res) => {
+// ── POST /streak-challenges/:id/reactions ─────────────────────────────────────
+router.post("/streak-challenges/:id/reactions", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const challengeId = String(req.params.id);
   const { emoji } = req.body as { emoji?: unknown };
@@ -1528,8 +1621,8 @@ router.post("/unlimited-challenges/:id/reactions", requireAuth, async (req, res)
   return res.json({ success: true, counts });
 });
 
-// ── GET /unlimited-challenges/:id/leaderboard (paginated, informational) ──────
-router.get("/unlimited-challenges/:id/leaderboard", requireAuth, async (req, res) => {
+// ── GET /streak-challenges/:id/leaderboard (paginated, informational) ─────────
+router.get("/streak-challenges/:id/leaderboard", requireAuth, async (req, res) => {
   const challengeId = String(req.params.id);
   // Live Board may paginate the full roster (100+/page). Cap keeps abuse bounded.
   const limit = Math.min(Math.max(Number(req.query.limit) || 25, 1), 500);

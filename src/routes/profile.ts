@@ -995,7 +995,7 @@ router.delete("/me/account", requireAuth, async (req, res) => {
 
     // Unlimited-challenge stake (audit 2026-08-17 H6): the stake lives in a separate table the
     // original guard never queried, so a user could delete mid-challenge and have the later payout
-    // credited to a locked-out wallet. Every unlimited challenge is funded (entry_fee_cents ≥ 1000).
+    // credited to a locked-out wallet. Every Streak Challenge is funded (entry_fee_cents ≥ 1000).
     const [activeUnlimited] = await tx
       .select({ id: unlimitedChallengeParticipantsTable.id })
       .from(unlimitedChallengeParticipantsTable)

@@ -1,7 +1,7 @@
 import { config } from "./config.js";
 
 /**
- * Pure, integer-cent money math for the Unlimited Challenge. No floating point.
+ * Pure, integer-cent money math for the Streak Challenge. No floating point.
  *
  * - Total charge = entry fee + fixed $0.50 platform fee. The platform fee never enters the pool.
  * - Prize pool = sum of paid participants' entry-fee contributions (computed elsewhere as rows are
@@ -21,7 +21,7 @@ export type EntryValidation = { ok: true } | { ok: false; error: string };
 
 /** Validate an entry fee against the configured $10–$1000 bounds. */
 export function validateEntryFeeCents(entryFeeCents: number): EntryValidation {
-  const { minEntryFeeCents, maxEntryFeeCents } = config.unlimitedGoal;
+  const { minEntryFeeCents, maxEntryFeeCents } = config.streakChallenge;
   if (!Number.isInteger(entryFeeCents)) return { ok: false, error: "Entry fee must be a whole number of cents." };
   if (entryFeeCents < minEntryFeeCents) return { ok: false, error: `Entry fee must be at least $${minEntryFeeCents / 100}.` };
   if (entryFeeCents > maxEntryFeeCents) return { ok: false, error: `Entry fee must be at most $${maxEntryFeeCents / 100}.` };
@@ -30,7 +30,7 @@ export function validateEntryFeeCents(entryFeeCents: number): EntryValidation {
 
 /** Validate a daily step goal against the configured production bounds plus explicit test options. */
 export function validateDailyGoalSteps(dailyGoalSteps: number): EntryValidation {
-  const { minDailyGoalSteps, maxDailyGoalSteps, testingDailyGoalSteps } = config.unlimitedGoal;
+  const { minDailyGoalSteps, maxDailyGoalSteps, testingDailyGoalSteps } = config.streakChallenge;
   if (!Number.isInteger(dailyGoalSteps)) return { ok: false, error: "Daily goal must be a whole number of steps." };
   if ((testingDailyGoalSteps as readonly number[]).includes(dailyGoalSteps)) return { ok: true };
   if (dailyGoalSteps < minDailyGoalSteps) return { ok: false, error: `Daily goal must be at least ${minDailyGoalSteps} steps.` };
@@ -39,7 +39,7 @@ export function validateDailyGoalSteps(dailyGoalSteps: number): EntryValidation 
 }
 
 export function isAllowedDuration(durationDays: number): boolean {
-  return (config.unlimitedGoal.allowedDurationDays as readonly number[]).includes(durationDays);
+  return (config.streakChallenge.allowedDurationDays as readonly number[]).includes(durationDays);
 }
 
 export interface EqualSplitAllocation {

@@ -1,11 +1,11 @@
 import { pgTable, text, integer, boolean, timestamp, date, index, uniqueIndex } from "drizzle-orm/pg-core";
 
 // ══════════════════════════════════════════════════════════════════════════════
-// Unlimited Challenge (`unlimited_goal`) — a multi-day, no-capacity, pooled
+// Streak Challenge (legacy machine discriminator: `unlimited_goal`) — a multi-day, no-capacity, pooled
 // real-money challenge where every participant must hit a daily step goal every
 // required day (evaluated in their LOCKED IANA timezone). All qualified finishers
 // split the prize pool equally. Fully additive + isolated: dedicated tables, gated
-// behind FEATURE_UNLIMITED_GOAL. All money is stored as integer USD cents.
+// behind FEATURE_STREAK_CHALLENGE. All money is stored as integer USD cents.
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ── Challenge ─────────────────────────────────────────────────────────────────

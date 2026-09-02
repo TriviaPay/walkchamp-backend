@@ -45,8 +45,20 @@ import {
   getProtectedRaceReview,
   resolveProtectedRaceAdmin,
 } from "../lib/protectedRaceAdjudication.js";
+import { rewriteLegacyAdminStreakChallengeUrl } from "../lib/streakChallengeContract.js";
 
 const router = Router();
+
+// Keep the old admin URLs working while ops tooling migrates to Streak Challenge naming.
+router.use((req, res, next): void => {
+  const rewritten = rewriteLegacyAdminStreakChallengeUrl(req.url);
+  if (rewritten !== req.url) {
+    res.setHeader("Deprecation", "true");
+    res.setHeader("Link", "</api/admin/streak-challenges>; rel=\"successor-version\"");
+    req.url = rewritten;
+  }
+  next();
+});
 
 router.use("/admin", requireAuth, requireAdminRole);
 
@@ -137,9 +149,9 @@ const unlimitedDayVerificationSchema = z.discriminatedUnion("decision", [
   }),
 ]);
 
-// Production-funded Unlimited days stay pending until this authenticated ops boundary supplies
+// Production-funded Streak Challenge days stay pending until this authenticated ops boundary supplies
 // the authoritative total. The regular mobile step endpoint can never call this path.
-router.post("/admin/unlimited-challenges/:challengeId/days/:dayId/verification-resolve", async (req, res) => {
+router.post("/admin/streak-challenges/:challengeId/days/:dayId/verification-resolve", async (req, res) => {
   const parsed = unlimitedDayVerificationSchema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: "Invalid verification decision", details: parsed.error.issues });
@@ -152,7 +164,7 @@ router.post("/admin/unlimited-challenges/:challengeId/days/:dayId/verification-r
     authoritativeSteps: parsed.data.decision === "approve" ? parsed.data.authoritativeSteps : undefined,
     verificationSource: parsed.data.decision === "approve" ? parsed.data.source : undefined,
   });
-  if (!result.found) return res.status(404).json({ error: "Unlimited challenge day not found" });
+  if (!result.found) return res.status(404).json({ error: "Streak Challenge day not found" });
   if (!result.resolved && result.status !== "passed" && result.status !== "failed") {
     return res.status(409).json({ error: "Day is not pending verification", status: result.status });
   }
@@ -982,9 +994,9 @@ router.post("/admin/withdrawals/:id/reject", requireCashFeaturesEnabled, async (
   return res.json({ ok: true });
 });
 
-// ── POST /api/admin/unlimited-challenges/cancel-all ───────────────────────────
-// Platform cancel every open Unlimited Challenge and refund entry contributions.
-router.post("/admin/unlimited-challenges/cancel-all", async (req, res) => {
+// ── POST /api/admin/streak-challenges/cancel-all ──────────────────────────────
+// Platform cancel every open Streak Challenge and refund entry contributions.
+router.post("/admin/streak-challenges/cancel-all", async (req, res) => {
   const adminUserId = (req as unknown as AuthenticatedRequest).descopeUserId;
   const reason =
     typeof req.body?.reason === "string" && req.body.reason.trim()
@@ -1012,7 +1024,7 @@ router.post("/admin/unlimited-challenges/cancel-all", async (req, res) => {
 
   logger.info(
     { cancelled: result.cancelled, skippedTerminal: result.skippedTerminal, reason },
-    "Admin: cancelled all open unlimited challenges",
+    "Admin: cancelled all open streak challenges",
   );
 
   return res.json({
@@ -1029,8 +1041,8 @@ router.post("/admin/unlimited-challenges/cancel-all", async (req, res) => {
   });
 });
 
-// ── POST /api/admin/unlimited-challenges/:id/cancel ───────────────────────────
-router.post("/admin/unlimited-challenges/:id/cancel", async (req, res) => {
+// ── POST /api/admin/streak-challenges/:id/cancel ──────────────────────────────
+router.post("/admin/streak-challenges/:id/cancel", async (req, res) => {
   const adminUserId = (req as unknown as AuthenticatedRequest).descopeUserId;
   const challengeId = String(req.params.id);
   const reason =

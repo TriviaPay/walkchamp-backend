@@ -119,8 +119,12 @@ x-app-env: &app-env
   PROTECTED_INTEGRITY_CHALLENGE_MINUTES: ${PROTECTED_INTEGRITY_CHALLENGE_MINUTES:-5}
   PROTECTED_HEARTBEAT_INTERVAL_SECONDS: ${PROTECTED_HEARTBEAT_INTERVAL_SECONDS:-60}
   # Client-provided Health Connect / HealthKit source labels are not payout attestation. Keep
-  # funded Unlimited days held until an authenticated ops verifier supplies the authoritative total.
-  UNLIMITED_VERIFICATION_MODE: ${UNLIMITED_VERIFICATION_MODE:-manual}
+  # funded Streak Challenge days held until an authenticated ops verifier supplies the authoritative total.
+  # Canonical variables fall back to the former Unlimited names for a zero-downtime rename.
+  FEATURE_STREAK_CHALLENGE: ${FEATURE_STREAK_CHALLENGE:-${FEATURE_UNLIMITED_GOAL:-true}}
+  STREAK_CHALLENGE_GRACE_HOURS: ${STREAK_CHALLENGE_GRACE_HOURS:-${UNLIMITED_GOAL_GRACE_HOURS:-4}}
+  STREAK_CHALLENGE_VERIFICATION_MODE: ${STREAK_CHALLENGE_VERIFICATION_MODE:-manual}
+  STREAK_CHALLENGE_ZERO_WINNER_POLICY: ${STREAK_CHALLENGE_ZERO_WINNER_POLICY:-${UNLIMITED_GOAL_ZERO_WINNER_POLICY:-manual_review}}
   SENTRY_DSN: ${SENTRY_DSN:-}
   SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
   ADMIN_API_KEY: ${ADMIN_API_KEY:?ADMIN_API_KEY is required}
