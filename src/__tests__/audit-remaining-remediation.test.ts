@@ -14,7 +14,7 @@ describe("remaining audit remediation", () => {
     expect(config).toContain('STREAK_CHALLENGE_VERIFICATION_MODE: z.enum(["manual", "client_source"])');
     expect(config).toContain('isProduction ? "manual" : "client_source"');
     expect(config).toContain('STREAK_CHALLENGE_VERIFICATION_MODE=manual is required');
-    expect(compose).toContain('STREAK_CHALLENGE_VERIFICATION_MODE: ${STREAK_CHALLENGE_VERIFICATION_MODE:-${UNLIMITED_VERIFICATION_MODE:-manual}}');
+    expect(compose).toContain('STREAK_CHALLENGE_VERIFICATION_MODE: ${STREAK_CHALLENGE_VERIFICATION_MODE:-manual}');
     expect(jobs).toContain('config.streakChallenge.verificationMode === "manual"');
     expect(jobs).toContain('status: "pending_verification"');
     expect(jobs).toContain("resolveUnlimitedDayVerification");
@@ -66,8 +66,8 @@ describe("remaining audit remediation", () => {
 
   it("keeps inactive race participants on the listen-only voice path", () => {
     const entitlements = read("src/routes/entitlements.ts");
-    expect(entitlements).toContain("const isActiveParticipant = !!participant");
-    expect(entitlements).toContain("} else if (!participant) {");
+    expect(entitlements).toContain('isActiveParticipant = !!participant && ["joined", "active"].includes(participant.status)');
+    expect(entitlements).toContain("} else if (!participant && !isStreakChallenge) {");
     expect(entitlements).toContain("inactive participant listen-only token issued");
   });
 });

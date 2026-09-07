@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import { AccessToken } from "livekit-server-sdk";
 import { db } from "../../db/src/index.js";
 import {
@@ -10,6 +10,8 @@ import {
   voiceSessionsTable,
   coinBalancesTable,
   coinTransactionsTable,
+  unlimitedChallengesTable,
+  unlimitedChallengeParticipantsTable,
 } from "../../db/src/schema/index.js";
 import { eq, and, inArray, desc, sql, gte, lte } from "drizzle-orm";
 import { requireAuth, type AuthenticatedRequest } from "../middleware/requireAuth.js";
@@ -634,11 +636,22 @@ router.get("/purchases/summary", requireAuth, async (req, res) => {
 // Validates race access and Mic Pass ownership, then issues a short-lived
 // LiveKit token scoped to room "race_<raceId>".
 // Token secret never leaves the backend.
-router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
+export const STREAK_VOICE_INACTIVE_PARTICIPANT_STATUSES = new Set([
+  "left",
+  "forfeited",
+  "withdrawn",
+  "removed",
+  "cancelled",
+  "canceled",
+  "disqualified",
+]);
+
+export function isActiveStreakVoiceParticipant(status: string | null | undefined): boolean {
+  return !!status && !STREAK_VOICE_INACTIVE_PARTICIPANT_STATUSES.has(status.toLowerCase());
+}
+
+async function issueRaceVoiceToken(req: Request, res: Response, raceId: string) {
   const userId = (req as AuthenticatedRequest).descopeUserId;
-  // Express route params are always plain strings, but TypeScript widens to
-  // string | string[] at type level — cast once here to satisfy Drizzle.
-  const raceId = req.params.raceId as string;
 
   const livekitUrl    = process.env.LIVEKIT_URL;
   const livekitApiKey = process.env.LIVEKIT_API_KEY;
@@ -653,34 +666,74 @@ router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
     });
   }
 
-  // 1. Verify race exists and is in progress.
+  // 1. Resolve either a classic race room or a Streak Challenge. The classic branch keeps its
+  // existing lifecycle, participant and spectator behavior byte-for-byte; only a missing classic
+  // row falls through to the dedicated Streak tables.
   const [race] = await db
     .select({ id: raceRoomsTable.id, status: raceRoomsTable.status })
     .from(raceRoomsTable)
     .where(eq(raceRoomsTable.id, raceId))
     .limit(1);
 
-  if (!race) {
-    return res.status(404).json({ success: false, code: "RACE_NOT_FOUND", message: "Race not found." });
-  }
-  if (race.status !== "in_progress") {
-    return res.status(403).json({ success: false, code: "RACE_NOT_LIVE", message: "Race is not currently live." });
-  }
+  let participant: { status: string } | undefined;
+  let isActiveParticipant = false;
+  let isStreakChallenge = false;
 
-  // 2. Check whether the user has a participant row. Only joined/active users may publish, but a
-  // participant who already finished or was disqualified while the room is still live may keep
-  // listening; they must not be forced through the spectator-session branch.
-  const [participant] = await db
-    .select({ status: raceParticipantsTable.status })
-    .from(raceParticipantsTable)
-    .where(
-      and(
-        eq(raceParticipantsTable.raceRoomId, raceId),
-        eq(raceParticipantsTable.userId, userId),
-      ),
-    )
-    .limit(1);
-  const isActiveParticipant = !!participant && ["joined", "active"].includes(participant.status);
+  if (race) {
+    if (race.status !== "in_progress") {
+      return res.status(403).json({ success: false, code: "RACE_NOT_LIVE", message: "Race is not currently live." });
+    }
+
+    // Only joined/active classic participants may publish. Finished/disqualified participants
+    // remain listen-only and classic non-participants retain the spectate-session path below.
+    [participant] = await db
+      .select({ status: raceParticipantsTable.status })
+      .from(raceParticipantsTable)
+      .where(
+        and(
+          eq(raceParticipantsTable.raceRoomId, raceId),
+          eq(raceParticipantsTable.userId, userId),
+        ),
+      )
+      .limit(1);
+    isActiveParticipant = !!participant && ["joined", "active"].includes(participant.status);
+  } else {
+    const [streakChallenge] = await db
+      .select({ id: unlimitedChallengesTable.id, status: unlimitedChallengesTable.status })
+      .from(unlimitedChallengesTable)
+      .where(eq(unlimitedChallengesTable.id, raceId))
+      .limit(1);
+
+    if (!streakChallenge) {
+      return res.status(404).json({ success: false, code: "RACE_NOT_FOUND", message: "Race not found." });
+    }
+    if (!["active", "starting", "settling"].includes(streakChallenge.status)) {
+      return res.status(403).json({ success: false, code: "RACE_NOT_LIVE", message: "Race is not currently live." });
+    }
+
+    isStreakChallenge = true;
+    [participant] = await db
+      .select({ status: unlimitedChallengeParticipantsTable.qualificationStatus })
+      .from(unlimitedChallengeParticipantsTable)
+      .where(
+        and(
+          eq(unlimitedChallengeParticipantsTable.challengeId, raceId),
+          eq(unlimitedChallengeParticipantsTable.userId, userId),
+        ),
+      )
+      .limit(1);
+
+    // Streak Challenges have no spectate-session model. A guessed challenge id must never grant
+    // access to its LiveKit room, even as a listen-only user.
+    if (!participant) {
+      return res.status(403).json({
+        success: false,
+        code: "VOICE_NOT_AUTHORIZED",
+        message: "Join the challenge before requesting voice access.",
+      });
+    }
+    isActiveParticipant = isActiveStreakVoiceParticipant(participant.status);
+  }
 
   // 3. Publishing rights — active participants with Mic Pass may speak.
   // Spectators can still join the room, but only as listen-only.
@@ -700,7 +753,7 @@ router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
 
     canPublishAudio = !!micPassRow;
     req.log.info({ userId, raceId, canPublishAudio }, "[MicPass] has_mic_pass: %s", canPublishAudio);
-  } else if (!participant) {
+  } else if (!participant && !isStreakChallenge) {
     // Listen-only is spectator-scoped (audit 2026-08-17 F-13): the same bar as the Pusher
     // race-channel auth — a non-participant must hold a spectate session for THIS race, not
     // merely be logged in with a guessed raceId.
@@ -768,6 +821,17 @@ router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
     can_publish_audio: canPublishAudio,
     expires_at: expiresAt.toISOString(),
   });
+}
+
+router.post("/races/:raceId/voice-token", requireAuth, async (req, res) => {
+  // Express route params are always strings at runtime; normalize the widened TS type once.
+  return issueRaceVoiceToken(req, res, String(req.params.raceId));
+});
+
+// Optional canonical Streak alias. It intentionally delegates to the exact same authorization,
+// grants and response serializer used by the existing mobile endpoint above.
+router.post("/streak-challenges/:id/voice-token", requireAuth, async (req, res) => {
+  return issueRaceVoiceToken(req, res, String(req.params.id));
 });
 
 // ── POST /api/voice/token  (legacy — deprecated, use /api/races/:id/voice-token) ─
