@@ -12,6 +12,7 @@ import {
   requestFinalParticipantVerifications,
 } from "./unlimitedResults.js";
 import { isRaceVerificationSource, normalizeSource } from "./stepSources.js";
+import { UNLIMITED_LEFT_STATUSES } from "./unlimitedChallengeStatuses.js";
 
 export class UnlimitedFinalVerificationError extends Error {
   constructor(public status: number, public code: string, message: string) {
@@ -71,6 +72,7 @@ export async function submitUnlimitedFinalVerification(input: FinalVerificationS
     const [participant] = await tx
       .select({
         id: unlimitedChallengeParticipantsTable.id,
+        qualificationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
         inPopulation: unlimitedChallengeParticipantsTable.inSettlementPopulation,
         finalStatus: unlimitedChallengeParticipantsTable.finalVerificationStatus,
       })
@@ -83,6 +85,9 @@ export async function submitUnlimitedFinalVerification(input: FinalVerificationS
       .for("update");
     if (!participant || !participant.inPopulation) {
       throw new UnlimitedFinalVerificationError(403, "not_settlement_participant", "This membership is not part of final settlement.");
+    }
+    if ((UNLIMITED_LEFT_STATUSES as readonly string[]).includes(participant.qualificationStatus)) {
+      throw new UnlimitedFinalVerificationError(403, "participant_forfeited", "A forfeited participant cannot submit prize verification.");
     }
     if (participant.finalStatus === "completed") {
       return { accepted: true as const, alreadyCompleted: true, status: "completed" };

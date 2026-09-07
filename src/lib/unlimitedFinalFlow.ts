@@ -3,19 +3,23 @@ export type UnlimitedFinalFlowStatus =
   | "final_results_pending"
   | "verifying_final_results"
   | "results_ready"
-  | "challenge_completed";
+  | "challenge_completed"
+  | "forfeited";
 
 export interface UnlimitedFinalFlow {
   status: UnlimitedFinalFlowStatus;
   title: string;
   message: string;
+  secondaryMessage?: string;
+  prizeEligible?: boolean;
 }
 
 export type StreakChallengeParticipantFinalStatus =
   | "FINAL_DAY_COMPLETED_WAITING"
   | "FINAL_VERIFICATION"
   | "RESULTS_READY"
-  | "RESULTS_ANNOUNCED";
+  | "RESULTS_ANNOUNCED"
+  | "FORFEITED";
 
 export type StreakChallengeRaceFinalStatus =
   | "WAITING_FOR_PARTICIPANT_DAY_ENDS"
@@ -29,6 +33,8 @@ export interface StreakChallengeFinalResult {
   raceStatus: StreakChallengeRaceFinalStatus | null;
   title: string | null;
   message: string | null;
+  secondaryMessage: string | null;
+  prizeEligible: boolean | null;
   lastParticipantEndAtUtc: string | null;
   verificationStartedAt: string | null;
   preparingLeaderboardAt: string | null;
@@ -46,6 +52,8 @@ interface ResolveUnlimitedFinalFlowInput {
   resultsAnnouncedAt: Date | string | null | undefined;
   viewerEndAt: Date | string | null | undefined;
   viewerStatus: string | null | undefined;
+  viewerQualificationStatus?: string | null | undefined;
+  viewerDisqualificationReason?: string | null | undefined;
   verificationPending: boolean;
   now?: Date;
 }
@@ -67,7 +75,16 @@ interface ResolveStreakChallengeFinalResultInput extends ResolveUnlimitedFinalFl
 const PREPARING_LEADERBOARD_AFTER_MS = 2 * 60 * 60_000;
 const DEFAULT_VERIFICATION_WINDOW_MS = 4 * 60 * 60_000;
 
+export const STREAK_FORFEITED_PARTICIPANT_CONTENT = {
+  title: "Challenge Forfeited",
+  message: "You have forfeited from this Streak Challenge and are no longer eligible for the prize pool.",
+  secondaryMessage: "You can still follow the challenge and view the final results.",
+} as const;
+
 const STREAK_FINAL_COPY = {
+  FORFEITED: {
+    ...STREAK_FORFEITED_PARTICIPANT_CONTENT,
+  },
   FINAL_DAY_COMPLETED_WAITING: {
     title: "Final Day Completed",
     message: "Your final challenge day is complete. We’re waiting for the remaining participants to finish in their local time zones.",
@@ -85,6 +102,19 @@ const STREAK_FINAL_COPY = {
     message: "Streak Challenge Completed. The final results are ready. Congratulations to all participants!",
   },
 } as const;
+
+/**
+ * Canonical recognition for both new forfeits and legacy post-start exits. Older rows used
+ * `left` plus `left_after_start`; treating those as ordinary pre-start departures would let the
+ * participant-facing status drift back into verification after deployment.
+ */
+export function isStreakChallengeParticipantForfeited(input: {
+  qualificationStatus: string | null | undefined;
+  disqualificationReason?: string | null | undefined;
+}): boolean {
+  return input.qualificationStatus === "forfeited"
+    || (input.qualificationStatus === "left" && input.disqualificationReason === "left_after_start");
+}
 
 const FINAL_FLOW_COPY: Record<UnlimitedFinalFlowStatus, UnlimitedFinalFlow> = {
   final_day_completed: {
@@ -111,6 +141,11 @@ const FINAL_FLOW_COPY: Record<UnlimitedFinalFlowStatus, UnlimitedFinalFlow> = {
     status: "challenge_completed",
     title: "Challenge Completed",
     message: "Here are the final results! Congrats to all!",
+  },
+  forfeited: {
+    status: "forfeited",
+    ...STREAK_FINAL_COPY.FORFEITED,
+    prizeEligible: false,
   },
 };
 
@@ -141,7 +176,11 @@ function toIso(timestamp: number | null): string | null {
 export function resolveStreakChallengeFinalResult(
   input: ResolveStreakChallengeFinalResultInput,
 ): StreakChallengeFinalResult | null {
-  if (input.challengeStatus === "cancelled_by_platform") return null;
+  const forfeited = input.isParticipant && isStreakChallengeParticipantForfeited({
+    qualificationStatus: input.viewerQualificationStatus,
+    disqualificationReason: input.viewerDisqualificationReason,
+  });
+  if (input.challengeStatus === "cancelled_by_platform" && !forfeited) return null;
 
   const now = input.now ?? new Date();
   const verificationWindowMs = Math.max(0, input.verificationWindowMs ?? DEFAULT_VERIFICATION_WINDOW_MS);
@@ -166,7 +205,6 @@ export function resolveStreakChallengeFinalResult(
   let participantStatus: StreakChallengeParticipantFinalStatus | null = null;
   let raceStatus: StreakChallengeRaceFinalStatus | null = null;
   let copy: { title: string; message: string } | null = null;
-
   if (input.resultsAnnouncedAt) {
     participantStatus = "RESULTS_ANNOUNCED";
     raceStatus = "RESULTS_ANNOUNCED";
@@ -196,8 +234,15 @@ export function resolveStreakChallengeFinalResult(
     participantStatus = "FINAL_DAY_COMPLETED_WAITING";
     raceStatus = "WAITING_FOR_PARTICIPANT_DAY_ENDS";
     copy = STREAK_FINAL_COPY.FINAL_DAY_COMPLETED_WAITING;
-  } else {
+  } else if (!forfeited) {
     return null;
+  }
+
+  // Participant forfeiture is permanent and wins over every personal lifecycle state. The
+  // independently resolved raceStatus above is intentionally left untouched.
+  if (forfeited) {
+    participantStatus = "FORFEITED";
+    copy = STREAK_FINAL_COPY.FORFEITED;
   }
 
   return {
@@ -205,6 +250,8 @@ export function resolveStreakChallengeFinalResult(
     raceStatus,
     title: copy?.title ?? null,
     message: copy?.message ?? null,
+    secondaryMessage: forfeited ? STREAK_FINAL_COPY.FORFEITED.secondaryMessage : null,
+    prizeEligible: forfeited ? false : null,
     lastParticipantEndAtUtc: toIso(lastEndMs),
     verificationStartedAt: toIso(verificationStartedAt),
     preparingLeaderboardAt: toIso(verificationStartedAt == null ? null : verificationStartedAt + preparingAfterMs),
@@ -226,6 +273,12 @@ export function resolveStreakChallengeFinalResult(
 export function resolveUnlimitedFinalFlow(
   input: ResolveUnlimitedFinalFlowInput,
 ): UnlimitedFinalFlow | null {
+  if (isStreakChallengeParticipantForfeited({
+    qualificationStatus: input.viewerQualificationStatus,
+    disqualificationReason: input.viewerDisqualificationReason,
+  })) {
+    return FINAL_FLOW_COPY.forfeited;
+  }
   if (input.challengeStatus === "cancelled_by_platform") return null;
 
   if (input.resultsAnnouncedAt) return FINAL_FLOW_COPY.challenge_completed;

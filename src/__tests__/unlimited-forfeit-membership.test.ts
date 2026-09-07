@@ -20,8 +20,9 @@ const cancelRoute = races.slice(
 );
 
 describe("Unlimited leave membership", () => {
-  it("records leave as a left participant with leftAt", () => {
-    expect(service).toContain('qualificationStatus: "left"');
+  it("records pre-start leave as left and post-start leave as forfeited with leftAt", () => {
+    expect(service).toContain('const participantStatus = preStart ? "left" as const : "forfeited" as const');
+    expect(service).toContain("qualificationStatus: participantStatus");
     expect(service).toContain("leftAt: now");
   });
 

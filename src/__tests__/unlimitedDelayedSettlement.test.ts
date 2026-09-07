@@ -431,7 +431,8 @@ describe("§12/§15 daily history API", () => {
     expect(history).toContain("passedDays: days.filter");
     expect(history).toContain("const failedDays = days.filter");
     expect(history).toContain("failedDays,");
-    expect(history).toContain('prizePoolEligibilityStatus: viewerResultsReady ? participant.prizePoolEligibilityStatus : "pending"');
+    expect(history).toContain('prizePoolEligibilityStatus: viewerForfeited');
+    expect(history).toContain('? "not_eligible"');
   });
   it("keeps an individual loss embargoed until global resultsStatus is ready", () => {
     expect(history).toContain("resultsStatus: challenge.resultsStatus");

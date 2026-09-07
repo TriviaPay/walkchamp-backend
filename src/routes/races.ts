@@ -134,6 +134,7 @@ import { getUnlimitedBlockingMembership } from "../lib/challengeMembership.js";
 import { UNLIMITED_NON_ACTIVE_STATUSES } from "../lib/unlimitedChallengeStatuses.js";
 import { STREAK_CHALLENGE_KIND } from "../lib/streakChallengeContract.js";
 import { leaveUnlimitedChallenge } from "../lib/unlimitedChallengeService.js";
+import { STREAK_FORFEITED_PARTICIPANT_CONTENT } from "../lib/unlimitedFinalFlow.js";
 import {
   currentProtectedPolicySnapshot,
   isProtectedPrizeCandidate,
@@ -4661,6 +4662,7 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
     if (unlimitedChallenge) {
       const result = await leaveUnlimitedChallenge(userId, raceId);
       if (!result.ok) return res.status(result.httpStatus).json(result.body);
+      const forfeited = result.data.participantStatus === "forfeited";
       return res.json({
         success: true,
         challengeId: result.data.challengeId,
@@ -4668,12 +4670,13 @@ router.post("/races/:id/leave", requireAuth, async (req, res) => {
         room_id: result.data.challengeId,
         raceContinues: true,
         challengeContinues: true,
-        participationStatus: "left",
-        participantStatus: "left",
-        participant_status: "left",
+        participationStatus: result.data.participantStatus,
+        participantStatus: forfeited ? "FORFEITED" : "left",
+        participant_status: result.data.participantStatus,
         currentUserRegistered: false,
         current_user_registered: false,
         prizeEligible: false,
+        ...(forfeited ? STREAK_FORFEITED_PARTICIPANT_CONTENT : {}),
         refundEligible: result.data.refundIssued,
         refundIssued: result.data.refundIssued,
         refundAmount: result.data.refundAmountCents / 100,

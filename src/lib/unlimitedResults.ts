@@ -11,7 +11,7 @@
  * nothing here credits a wallet.
  */
 
-import { and, eq, ne, inArray, sql } from "drizzle-orm";
+import { and, eq, ne, inArray, notInArray, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import {
   unlimitedChallengesTable,
@@ -25,6 +25,7 @@ import { logger } from "./logger.js";
 import { sendNotification } from "../routes/notifications.js";
 import { STREAK_CHALLENGE_KIND } from "./streakChallengeContract.js";
 import { config } from "./config.js";
+import { UNLIMITED_LEFT_STATUSES } from "./unlimitedChallengeStatuses.js";
 import {
   isConfiguredParticipationExcludedUser,
   isReservedParticipationIdentity,
@@ -156,12 +157,16 @@ export interface ValidationState {
 /**
  * §22 — is every required day of every settlement participant terminal?
  *
- * Days belonging to participants outside the settlement population (those who left) are ignored:
- * they cannot qualify, so an unverified day of theirs must not hold everyone else's result.
+ * Days belonging to participants outside the settlement population or participants who forfeited
+ * after start are ignored here: they cannot qualify, so their unverified days must not hold every
+ * eligible participant's result. They remain in areAllParticipantWindowsClosed for timing.
  */
 export async function areAllRequiredDaysTerminal(challengeId: string): Promise<ValidationState> {
   const [challenge] = await db
-    .select({ durationDays: unlimitedChallengesTable.durationDays })
+    .select({
+      durationDays: unlimitedChallengesTable.durationDays,
+      settlementPopulationSize: unlimitedChallengesTable.settlementPopulationSize,
+    })
     .from(unlimitedChallengesTable)
     .where(eq(unlimitedChallengesTable.id, challengeId))
     .limit(1);
@@ -194,6 +199,9 @@ export async function areAllRequiredDaysTerminal(challengeId: string): Promise<V
     .where(and(
       eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
       eq(unlimitedChallengeParticipantsTable.inSettlementPopulation, true),
+      // Forfeits remain in the frozen timing population above, but they no longer owe prize
+      // verification or terminal day evidence because they can never receive a payout.
+      notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_LEFT_STATUSES]),
     ))
     .groupBy(unlimitedChallengeParticipantsTable.id);
 
@@ -205,7 +213,7 @@ export async function areAllRequiredDaysTerminal(challengeId: string): Promise<V
   );
   return {
     allDaysTerminal:
-      rows.length > 0
+      (rows.length > 0 || (challenge.settlementPopulationSize ?? 0) > 0)
       && incomplete.length === 0
       && rows.every((r) => r.terminal === challenge.durationDays),
     pendingDayCount,
@@ -266,6 +274,7 @@ export async function requestFinalParticipantVerifications(
     .where(and(
       eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
       eq(unlimitedChallengeParticipantsTable.inSettlementPopulation, true),
+      notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_LEFT_STATUSES]),
       eq(unlimitedChallengeParticipantsTable.finalVerificationStatus, "pending"),
     ))
     .returning({
@@ -315,13 +324,16 @@ export async function areAllFinalParticipantVerificationsComplete(
     .where(and(
       eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
       eq(unlimitedChallengeParticipantsTable.inSettlementPopulation, true),
+      notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_LEFT_STATUSES]),
     ));
   const participantCount = row?.participants ?? 0;
   const pendingParticipantCount = row?.pending ?? participantCount;
   const submittedParticipantCount = row?.submitted ?? 0;
   const completedParticipantCount = row?.completed ?? 0;
   return {
-    allCompleted: participantCount > 0 && pendingParticipantCount === 0,
+    // A challenge whose entire frozen population forfeited has nobody left to verify. The frozen
+    // window boundary still gates settlement, so zero here is a completed verification set.
+    allCompleted: pendingParticipantCount === 0,
     participantCount,
     pendingParticipantCount,
     submittedParticipantCount,
@@ -572,7 +584,7 @@ export async function evaluateParticipantEligibility(
     const pendingDays = agg?.pending ?? 0;
 
     // Terminal membership states decide on their own.
-    if (p.qualificationStatus === "left" || !p.inPopulation) {
+    if ((UNLIMITED_LEFT_STATUSES as readonly string[]).includes(p.qualificationStatus) || !p.inPopulation) {
       return { ...p, status: "not_eligible" as const, reasonCode: "left_challenge" as const, passedDays, failedDays, pendingDays };
     }
     if (p.qualificationStatus === "disqualified") {

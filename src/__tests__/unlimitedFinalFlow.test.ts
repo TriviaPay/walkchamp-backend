@@ -20,6 +20,19 @@ function resolve(overrides: Partial<Parameters<typeof resolveUnlimitedFinalFlow>
 }
 
 describe("resolveUnlimitedFinalFlow", () => {
+  it("keeps a forfeited participant out of every legacy verification/result state", () => {
+    expect(resolve({
+      resultsStatus: "steps_validation_in_progress",
+      viewerQualificationStatus: "forfeited",
+    })).toEqual({
+      status: "forfeited",
+      title: "Challenge Forfeited",
+      message: "You have forfeited from this Streak Challenge and are no longer eligible for the prize pool.",
+      secondaryMessage: "You can still follow the challenge and view the final results.",
+      prizeEligible: false,
+    });
+  });
+
   it("returns no final flow before this viewer's persisted UTC end", () => {
     expect(resolve({
       viewerEndAt: "2026-09-01T17:00:00.000Z",
@@ -121,6 +134,44 @@ function resolveFinalResult(
 }
 
 describe("resolveStreakChallengeFinalResult", () => {
+  it("keeps race final verification separate from permanent participant forfeiture", () => {
+    expect(resolveFinalResult({
+      resultsStatus: "steps_validation_in_progress",
+      allParticipantWindowsClosed: true,
+      participantsFinishedCount: 2,
+      latestParticipantEndAtUtc: "2026-09-01T15:00:00.000Z",
+      viewerQualificationStatus: "forfeited",
+    })).toMatchObject({
+      participantStatus: "FORFEITED",
+      raceStatus: "FINAL_VERIFICATION",
+      prizeEligible: false,
+      title: "Challenge Forfeited",
+      message: "You have forfeited from this Streak Challenge and are no longer eligible for the prize pool.",
+      secondaryMessage: "You can still follow the challenge and view the final results.",
+    });
+  });
+
+  it("does not overwrite forfeiture when race results are settled or announced", () => {
+    expect(resolveFinalResult({
+      challengeStatus: "completed",
+      resultsStatus: "results_ready",
+      resultsAnnouncedAt: "2026-09-01T16:00:00.000Z",
+      allParticipantWindowsClosed: true,
+      viewerQualificationStatus: "forfeited",
+    })).toMatchObject({
+      participantStatus: "FORFEITED",
+      raceStatus: "RESULTS_ANNOUNCED",
+      prizeEligible: false,
+    });
+  });
+
+  it("recognizes legacy post-start left rows as forfeited", () => {
+    expect(resolveFinalResult({
+      viewerQualificationStatus: "left",
+      viewerDisqualificationReason: "left_after_start",
+    })).toMatchObject({ participantStatus: "FORFEITED", prizeEligible: false });
+  });
+
   it("marks an early finisher while the race waits for participant-local day ends", () => {
     expect(resolveFinalResult()).toMatchObject({
       participantStatus: "FINAL_DAY_COMPLETED_WAITING",

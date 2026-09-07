@@ -28,6 +28,22 @@ function key(challengeId: string, userId: string, challengeDayKey: string): stri
   return `ul:prov:${challengeId}:${userId}:${challengeDayKey}`;
 }
 
+/** Remove a forfeited participant's display-only live lanes without touching verified history. */
+export async function clearUnlimitedProvisionalLive(
+  challengeId: string,
+  userId: string,
+  challengeDayKeys: string[],
+): Promise<void> {
+  const keys = [...new Set(challengeDayKeys)].map((dayKey) => key(challengeId, userId, dayKey));
+  if (keys.length === 0) return;
+  try {
+    await ensureRedisLiveConnected();
+    await getRedisLive().del(...keys);
+  } catch (err) {
+    logger.warn({ err, challengeId, userId }, "[UnlimitedProvisional] forfeit invalidation failed");
+  }
+}
+
 export async function getUnlimitedProvisionalLive(
   challengeId: string,
   userId: string,

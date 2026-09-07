@@ -17,7 +17,12 @@ import {
   unlimitedChallengeParticipantsTable,
   unlimitedChallengesTable,
 } from "../../db/src/schema/unlimitedChallenge.js";
-import { UNLIMITED_NON_ACTIVE_STATUSES } from "./unlimitedChallengeStatuses.js";
+import {
+  UNLIMITED_NON_ACTIVE_STATUSES,
+  UNLIMITED_ROSTER_EXCLUDED_STATUSES,
+  toStreakChallengeParticipantStatus,
+} from "./unlimitedChallengeStatuses.js";
+import { STREAK_FORFEITED_PARTICIPANT_CONTENT } from "./unlimitedFinalFlow.js";
 
 export type UnlimitedActiveDayProgress = {
   participantId: string;
@@ -54,6 +59,11 @@ export type UnlimitedPlayerLiveProgress = {
   avatarUrl: string | null;
   avatarVersion: number;
   qualificationStatus: string;
+  participantStatus: string;
+  prizeEligible: boolean | null;
+  title?: string;
+  message?: string;
+  secondaryMessage?: string;
   /** pending | eligible | not_eligible — explicit prize-pool eligibility (§10). */
   prizePoolEligibilityStatus: string;
   /**
@@ -242,6 +252,7 @@ export async function findActiveUnlimitedDaysForUser(
       and(
         eq(unlimitedChallengeDaysTable.userId, userId),
         eq(unlimitedChallengesTable.status, "active"),
+        notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
         inArray(unlimitedChallengeDaysTable.status, [
           "pending",
           "in_progress",
@@ -299,7 +310,7 @@ export async function loadChallengePlayers(
       and(
         eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
         gt(unlimitedChallengeParticipantsTable.entryContributionCents, 0),
-        notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
+        notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_ROSTER_EXCLUDED_STATUSES]),
       ),
     )
     .orderBy(
@@ -345,6 +356,13 @@ export async function loadChallengePlayers(
       avatarUrl: p.avatarUrl ?? null,
       avatarVersion: p.updatedAt?.getTime() ?? 0,
       qualificationStatus: p.qualificationStatus,
+      participantStatus: toStreakChallengeParticipantStatus(p.qualificationStatus),
+      prizeEligible: p.qualificationStatus === "forfeited"
+        ? false
+        : p.prizePoolEligibilityStatus === "pending"
+          ? null
+          : p.prizePoolEligibilityStatus === "eligible",
+      ...(p.qualificationStatus === "forfeited" ? STREAK_FORFEITED_PARTICIPANT_CONTENT : {}),
       prizePoolEligibilityStatus: p.prizePoolEligibilityStatus,
       eligibilityReason: publicEligibilityReason(p.eligibilityReasonCode),
       status: p.qualificationStatus,

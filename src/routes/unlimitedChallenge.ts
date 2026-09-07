@@ -21,7 +21,11 @@ import {
   leaveUnlimitedChallenge,
   UNLIMITED_OPEN_STATUSES,
 } from "../lib/unlimitedChallengeService.js";
-import { UNLIMITED_NON_ACTIVE_STATUSES } from "../lib/unlimitedChallengeStatuses.js";
+import {
+  UNLIMITED_NON_ACTIVE_STATUSES,
+  UNLIMITED_ROSTER_EXCLUDED_STATUSES,
+  toStreakChallengeParticipantStatus,
+} from "../lib/unlimitedChallengeStatuses.js";
 import {
   loadActiveDayProgressByChallenge,
   loadChallengePlayers,
@@ -57,6 +61,8 @@ import {
   UnlimitedTimezoneChangeError,
 } from "../lib/unlimitedTimezoneChange.js";
 import {
+  isStreakChallengeParticipantForfeited,
+  STREAK_FORFEITED_PARTICIPANT_CONTENT,
   resolveStreakChallengeFinalResult,
   resolveUnlimitedFinalFlow,
 } from "../lib/unlimitedFinalFlow.js";
@@ -81,6 +87,11 @@ type ChallengeCardPlayer = {
   isHost: boolean;
   status: string;
   qualificationStatus: string;
+  participantStatus: string;
+  prizeEligible: boolean | null;
+  title?: string;
+  message?: string;
+  secondaryMessage?: string;
 };
 
 type RawChallengeCardPlayerRow = {
@@ -231,6 +242,7 @@ async function overlayMembership(
         .select({
           challengeId: unlimitedChallengeParticipantsTable.challengeId,
           status: unlimitedChallengeParticipantsTable.qualificationStatus,
+          disqualificationReason: unlimitedChallengeParticipantsTable.disqualificationReason,
         })
         .from(unlimitedChallengeParticipantsTable)
         .where(
@@ -243,9 +255,14 @@ async function overlayMembership(
           ),
         )
     : [];
-  const statusByChallenge = new Map(memberships.map((m) => [m.challengeId, m.status]));
+  const membershipByChallenge = new Map(memberships.map((m) => [m.challengeId, m]));
   return rows.map((c) => {
-    const status = statusByChallenge.get(c.id) ?? null;
+    const membership = membershipByChallenge.get(c.id);
+    const status = membership?.status ?? null;
+    const forfeited = isStreakChallengeParticipantForfeited({
+      qualificationStatus: status,
+      disqualificationReason: membership?.disqualificationReason,
+    });
     const currentUserRegistered =
       status != null
       && !UNLIMITED_NON_ACTIVE_STATUSES.includes(
@@ -254,6 +271,9 @@ async function overlayMembership(
     return {
       ...serializeChallenge(c),
       participationStatus: status,
+      participantStatus: forfeited ? "FORFEITED" : status ? toStreakChallengeParticipantStatus(status) : null,
+      prizeEligible: forfeited ? false : null,
+      ...(forfeited ? STREAK_FORFEITED_PARTICIPANT_CONTENT : {}),
       currentUserRegistered,
       current_user_registered: currentUserRegistered,
     };
@@ -287,7 +307,7 @@ async function loadActiveChallengeCardPlayers(
   if (challengeIds.length === 0) return new Map();
 
   const idList = sqlValues(challengeIds);
-  const nonActiveList = sqlValues([...UNLIMITED_NON_ACTIVE_STATUSES]);
+  const rosterExcludedList = sqlValues([...UNLIMITED_ROSTER_EXCLUDED_STATUSES]);
   const result = await db.execute(sql`
     WITH current_days AS (
       SELECT
@@ -326,7 +346,7 @@ async function loadActiveChallengeCardPlayers(
       LEFT JOIN profiles pr ON pr.id = p.user_id
       WHERE p.challenge_id IN (${idList})
         AND p.entry_contribution_cents > 0
-        AND p.qualification_status NOT IN (${nonActiveList})
+        AND p.qualification_status NOT IN (${rosterExcludedList})
     )
     SELECT
       challenge_id,
@@ -377,8 +397,11 @@ async function loadActiveChallengeCardPlayers(
       isHost: row.is_host,
       // Live challenge cards must not expose an internal disqualification as an announced loss.
       // Final qualification is returned only by the completed/results_ready loader below.
-      status: "active",
-      qualificationStatus: "active",
+      status: row.qualification_status === "forfeited" ? "forfeited" : "active",
+      qualificationStatus: row.qualification_status === "forfeited" ? "forfeited" : "active",
+      participantStatus: row.qualification_status === "forfeited" ? "FORFEITED" : "ACTIVE",
+      prizeEligible: row.qualification_status === "forfeited" ? false : null,
+      ...(row.qualification_status === "forfeited" ? STREAK_FORFEITED_PARTICIPANT_CONTENT : {}),
     };
     const list = out.get(row.challenge_id) ?? [];
     list.push(player);
@@ -474,6 +497,9 @@ async function loadCompletedChallengeCardPlayers(
       isHost: row.is_host,
       status: row.qualification_status,
       qualificationStatus: row.qualification_status,
+      participantStatus: toStreakChallengeParticipantStatus(row.qualification_status),
+      prizeEligible: row.qualification_status !== "forfeited" && row.qualification_status === "qualified",
+      ...(row.qualification_status === "forfeited" ? STREAK_FORFEITED_PARTICIPANT_CONTENT : {}),
     });
     out.set(row.challenge_id, list);
   }
@@ -580,6 +606,7 @@ async function buildViewerSchedule(
       participantStartAtUtc: unlimitedChallengeParticipantsTable.participantStartAtUtc,
       participantEndAtUtc: unlimitedChallengeParticipantsTable.participantEndAtUtc,
       qualificationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
+      disqualificationReason: unlimitedChallengeParticipantsTable.disqualificationReason,
       prizePoolEligibilityStatus: unlimitedChallengeParticipantsTable.prizePoolEligibilityStatus,
       eligibilityReasonCode: unlimitedChallengeParticipantsTable.eligibilityReasonCode,
       inSettlementPopulation: unlimitedChallengeParticipantsTable.inSettlementPopulation,
@@ -655,12 +682,18 @@ async function buildViewerSchedule(
     participant?.eligibilityReasonCode === "daily_goal_missed";
   const viewerResultsReady = challenge.resultsStatus === "results_ready";
   const viewerResultsStatus = challenge.resultsStatus;
+  const viewerForfeited = isStreakChallengeParticipantForfeited({
+    qualificationStatus: participant?.qualificationStatus,
+    disqualificationReason: participant?.disqualificationReason,
+  });
   const finalFlow = resolveUnlimitedFinalFlow({
     challengeStatus: challenge.status,
     resultsStatus: challenge.resultsStatus,
     resultsAnnouncedAt: challenge.resultsAnnouncedAt,
     viewerEndAt: state.viewerEndAt,
     viewerStatus: state.viewerStatus,
+    viewerQualificationStatus: participant?.qualificationStatus,
+    viewerDisqualificationReason: participant?.disqualificationReason,
     verificationPending: state.verificationPending,
   });
   const finalResult = resolveStreakChallengeFinalResult({
@@ -672,6 +705,8 @@ async function buildViewerSchedule(
     settledAt: challenge.settledAt,
     viewerEndAt: state.viewerEndAt,
     viewerStatus: state.viewerStatus,
+    viewerQualificationStatus: participant?.qualificationStatus,
+    viewerDisqualificationReason: participant?.disqualificationReason,
     verificationPending: state.verificationPending,
     allParticipantWindowsClosed: closure.allClosed,
     participantsFinishedCount: closure.participantsFinishedCount,
@@ -692,11 +727,22 @@ async function buildViewerSchedule(
     participantsPendingCount: closure.participantsPendingCount,
     latestParticipantEndAtUtc: isoOrNull(closure.latestParticipantEndAtUtc),
     // §10 — the viewer's own eligibility, explicit rather than inferred from day rows.
-    prizePoolEligibilityStatus: viewerResultsReady ? (participant?.prizePoolEligibilityStatus ?? null) : "pending",
-    eligibilityReasonCode: viewerResultsReady ? (participant?.eligibilityReasonCode ?? null) : null,
+    prizePoolEligibilityStatus: viewerForfeited
+      ? "not_eligible"
+      : viewerResultsReady ? (participant?.prizePoolEligibilityStatus ?? null) : "pending",
+    eligibilityReasonCode: viewerForfeited
+      ? "left_challenge"
+      : viewerResultsReady ? (participant?.eligibilityReasonCode ?? null) : null,
+    participantStatus: finalResult?.participantStatus ?? null,
+    raceStatus: finalResult?.raceStatus ?? null,
+    prizeEligible: viewerForfeited ? false : null,
+    title: finalResult?.title ?? null,
+    message: finalResult?.message ?? null,
+    secondaryMessage: finalResult?.secondaryMessage ?? null,
     inSettlementPopulation: participant?.inSettlementPopulation ?? null,
     finalVerificationStatus: participant?.finalVerificationStatus ?? null,
-    finalVerificationRequired: participant?.inSettlementPopulation === true
+    finalVerificationRequired: !viewerForfeited
+      && participant?.inSettlementPopulation === true
       && participant?.finalVerificationStatus === "requested",
     finalVerificationRequestedAt: isoOrNull(participant?.finalVerificationRequestedAt),
     finalVerificationSubmittedAt: isoOrNull(participant?.finalVerificationSubmittedAt),
@@ -715,6 +761,7 @@ async function buildViewerSchedule(
     raceFinalStatus: finalResult?.raceStatus ?? null,
     finalResult,
     viewerStatus: state.viewerStatus,
+    qualificationStatus: participant?.qualificationStatus ?? null,
     viewerTimezone: state.viewerTimezone,
     viewerTimezoneLockedAt: isoOrNull(participant?.timezoneLockedAt),
     accountTimezone,
@@ -828,17 +875,20 @@ router.post("/streak-challenges/:id/leave", requireAuth, async (req, res) => {
   const userId = (req as AuthenticatedRequest).descopeUserId;
   const result = await leaveUnlimitedChallenge(userId, String(req.params.id));
   if (!result.ok) return res.status(result.httpStatus).json(result.body);
+  const forfeited = result.data.participantStatus === "forfeited";
   // Leaving never cancels the challenge; the original host/creator is preserved for display.
   return res.json({
     success: true,
     challengeId: result.data.challengeId,
     raceContinues: true,
     challengeContinues: true,
-    participationStatus: "left",
-    participantStatus: "left",
+    participationStatus: result.data.participantStatus,
+    participantStatus: forfeited ? "FORFEITED" : "left",
+    participant_status: result.data.participantStatus,
     currentUserRegistered: false,
     current_user_registered: false,
     prizeEligible: false,
+    ...(forfeited ? STREAK_FORFEITED_PARTICIPANT_CONTENT : {}),
     refundEligible: result.data.refundIssued,
     refundIssued: result.data.refundIssued,
     refundAmount: result.data.refundAmountCents,
@@ -1239,6 +1289,7 @@ router.get("/streak-challenges/:id/daily-history", requireAuth, async (req, res)
       participantStartAtUtc: unlimitedChallengeParticipantsTable.participantStartAtUtc,
       participantEndAtUtc: unlimitedChallengeParticipantsTable.participantEndAtUtc,
       qualificationStatus: unlimitedChallengeParticipantsTable.qualificationStatus,
+      disqualificationReason: unlimitedChallengeParticipantsTable.disqualificationReason,
       prizePoolEligibilityStatus: unlimitedChallengeParticipantsTable.prizePoolEligibilityStatus,
       eligibilityReasonCode: unlimitedChallengeParticipantsTable.eligibilityReasonCode,
       inSettlementPopulation: unlimitedChallengeParticipantsTable.inSettlementPopulation,
@@ -1324,6 +1375,10 @@ router.get("/streak-challenges/:id/daily-history", requireAuth, async (req, res)
     participant.eligibilityReasonCode === "daily_goal_missed";
   const viewerResultsReady = challenge.resultsStatus === "results_ready";
   const viewerResultsStatus = challenge.resultsStatus;
+  const viewerForfeited = isStreakChallengeParticipantForfeited({
+    qualificationStatus: participant.qualificationStatus,
+    disqualificationReason: participant.disqualificationReason,
+  });
   const activeDay = dayRows.find((d) => d.windowStartUtc.getTime() <= now.getTime() && now.getTime() < d.windowEndUtc.getTime());
   const nextDay = dayRows.find((d) => d.windowStartUtc.getTime() > now.getTime());
   const latestStartedDay = [...dayRows].reverse().find((d) => d.windowStartUtc.getTime() <= now.getTime());
@@ -1350,6 +1405,8 @@ router.get("/streak-challenges/:id/daily-history", requireAuth, async (req, res)
     resultsAnnouncedAt: challenge.resultsAnnouncedAt,
     viewerEndAt: viewerState.viewerEndAt,
     viewerStatus: viewerState.viewerStatus,
+    viewerQualificationStatus: participant.qualificationStatus,
+    viewerDisqualificationReason: participant.disqualificationReason,
     verificationPending: viewerState.verificationPending,
     now,
   });
@@ -1362,6 +1419,8 @@ router.get("/streak-challenges/:id/daily-history", requireAuth, async (req, res)
     settledAt: challenge.settledAt,
     viewerEndAt: viewerState.viewerEndAt,
     viewerStatus: viewerState.viewerStatus,
+    viewerQualificationStatus: participant.qualificationStatus,
+    viewerDisqualificationReason: participant.disqualificationReason,
     verificationPending: viewerState.verificationPending,
     allParticipantWindowsClosed: closure.allClosed,
     participantsFinishedCount: closure.participantsFinishedCount,
@@ -1395,12 +1454,23 @@ router.get("/streak-challenges/:id/daily-history", requireAuth, async (req, res)
     finalResultStatus: finalResult?.participantStatus ?? null,
     raceFinalStatus: finalResult?.raceStatus ?? null,
     finalResult,
+    participantStatus: finalResult?.participantStatus ?? null,
+    raceStatus: finalResult?.raceStatus ?? null,
+    prizeEligible: viewerForfeited ? false : null,
+    title: finalResult?.title ?? null,
+    message: finalResult?.message ?? null,
+    secondaryMessage: finalResult?.secondaryMessage ?? null,
     // Do not publish final winner/loser eligibility through history before global settlement.
-    prizePoolEligibilityStatus: viewerResultsReady ? participant.prizePoolEligibilityStatus : "pending",
-    eligibilityReasonCode: viewerResultsReady ? participant.eligibilityReasonCode : null,
+    prizePoolEligibilityStatus: viewerForfeited
+      ? "not_eligible"
+      : viewerResultsReady ? participant.prizePoolEligibilityStatus : "pending",
+    eligibilityReasonCode: viewerForfeited
+      ? "left_challenge"
+      : viewerResultsReady ? participant.eligibilityReasonCode : null,
     inSettlementPopulation: participant.inSettlementPopulation,
     finalVerificationStatus: participant.finalVerificationStatus,
-    finalVerificationRequired: participant.inSettlementPopulation
+    finalVerificationRequired: !viewerForfeited
+      && participant.inSettlementPopulation
       && participant.finalVerificationStatus === "requested",
     finalVerificationRequestedAt: participant.finalVerificationRequestedAt,
     finalVerificationSubmittedAt: participant.finalVerificationSubmittedAt,
@@ -1655,7 +1725,7 @@ router.get("/streak-challenges/:id/leaderboard", requireAuth, async (req, res) =
     .where(
       and(
         eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
-        notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_NON_ACTIVE_STATUSES]),
+        notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_ROSTER_EXCLUDED_STATUSES]),
       ),
     )
     .groupBy(
@@ -1664,6 +1734,8 @@ router.get("/streak-challenges/:id/leaderboard", requireAuth, async (req, res) =
       profilesTable.username,
       profilesTable.fullName,
       unlimitedChallengeParticipantsTable.qualificationStatus,
+      unlimitedChallengeParticipantsTable.prizePoolEligibilityStatus,
+      unlimitedChallengeParticipantsTable.eligibilityReasonCode,
     )
     .orderBy(
       sql`(${unlimitedChallengeParticipantsTable.qualificationStatus} = 'disqualified')`,
@@ -1695,9 +1767,22 @@ router.get("/streak-challenges/:id/leaderboard", requireAuth, async (req, res) =
         fullName: r.fullName ?? null,
         displayName,
         // Live progress remains visible, but final winner/loser fields are embargoed race-wide.
-        qualificationStatus: resultsReady ? r.qualificationStatus : "active",
-        prizePoolEligibilityStatus: resultsReady ? r.prizePoolEligibilityStatus : "pending",
-        eligibilityReason: resultsReady ? publicEligibilityReason(r.eligibilityReasonCode) : null,
+        qualificationStatus: r.qualificationStatus === "forfeited"
+          ? "forfeited"
+          : resultsReady ? r.qualificationStatus : "active",
+        participantStatus: r.qualificationStatus === "forfeited"
+          ? "FORFEITED"
+          : toStreakChallengeParticipantStatus(resultsReady ? r.qualificationStatus : "active"),
+        prizeEligible: r.qualificationStatus === "forfeited"
+          ? false
+          : resultsReady ? r.prizePoolEligibilityStatus === "eligible" : null,
+        prizePoolEligibilityStatus: r.qualificationStatus === "forfeited"
+          ? "not_eligible"
+          : resultsReady ? r.prizePoolEligibilityStatus : "pending",
+        eligibilityReason: r.qualificationStatus === "forfeited"
+          ? "left_challenge"
+          : resultsReady ? publicEligibilityReason(r.eligibilityReasonCode) : null,
+        ...(r.qualificationStatus === "forfeited" ? STREAK_FORFEITED_PARTICIPANT_CONTENT : {}),
         completedDays: r.completedDays,
         totalChallengeSteps: r.totalSteps + verifiedToday,
         currentSteps,

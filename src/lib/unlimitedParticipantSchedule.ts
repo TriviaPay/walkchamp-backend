@@ -205,7 +205,7 @@ export function resolveLockableTimezone(raw: string | null | undefined): string 
 
 // ── Viewer-personalized status ────────────────────────────────────────────────
 
-export type ViewerStatus = "scheduled" | "active" | "completed" | "failed" | "left" | "not_joined";
+export type ViewerStatus = "scheduled" | "active" | "completed" | "failed" | "left" | "forfeited" | "not_joined";
 
 export interface ViewerScheduleState {
   viewerStatus: ViewerStatus;
@@ -305,7 +305,8 @@ export function deriveViewerState(input: {
   };
 
   // Terminal membership states win over the clock.
-  if (p.qualificationStatus === "left") return { ...base, viewerStatus: "left" };
+  if (p.qualificationStatus === "forfeited") return { ...base, viewerStatus: "forfeited" };
+  if (["left", "withdrawn", "quit"].includes(p.qualificationStatus)) return { ...base, viewerStatus: "left" };
   if (p.qualificationStatus === "disqualified") return { ...base, viewerStatus: "failed" };
   if (p.qualificationStatus === "qualified") return { ...base, viewerStatus: "completed" };
 

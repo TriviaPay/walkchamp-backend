@@ -98,7 +98,7 @@ export const unlimitedChallengeParticipantsTable = pgTable(
     participantEndAtUtc: timestamp("participant_end_at_utc", { withTimezone: true }),
     joinedAt: timestamp("joined_at", { withTimezone: true }).notNull().defaultNow(),
     leftAt: timestamp("left_at", { withTimezone: true }),
-    // active | goal_completed_today | pending_verification | disqualified | left | qualified
+    // active | goal_completed_today | pending_verification | disqualified | left | forfeited | qualified
     qualificationStatus: text("qualification_status").notNull().default("active"),
     disqualifiedAt: timestamp("disqualified_at", { withTimezone: true }),
     disqualificationReason: text("disqualification_reason"),

@@ -1,10 +1,11 @@
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import { db } from "../../db/src/index.js";
 import { profilesTable } from "../../db/src/schema/profiles.js";
 import { walletsTable } from "../../db/src/schema/index.js";
 import { userPreferencesTable } from "../../db/src/schema/userPreferences.js";
 import {
   unlimitedChallengesTable,
+  unlimitedChallengeDaysTable,
   unlimitedChallengeParticipantsTable,
   type UnlimitedChallenge,
 } from "../../db/src/schema/unlimitedChallenge.js";
@@ -36,6 +37,9 @@ import { config } from "./config.js";
 import { STREAK_CHALLENGE_KIND } from "./streakChallengeContract.js";
 import { logger } from "./logger.js";
 import { invalidateSchedulerGate } from "./idleGate.js";
+import { auditLogsTable } from "../../db/src/schema/index.js";
+import { clearUnlimitedProvisionalLive } from "./unlimitedProvisionalLive.js";
+import { STREAK_FORFEITED_PARTICIPANT_CONTENT } from "./unlimitedFinalFlow.js";
 
 /** Non-terminal challenge statuses that still block membership / appear as "open". */
 export const UNLIMITED_OPEN_STATUSES = ["waiting", "starting", "active", "settling"] as const;
@@ -401,7 +405,13 @@ export async function joinUnlimitedChallenge(userId: string, challengeId: string
  * per policy, pool + count decremented); at/after start → no refund, contribution stays in the pool.
  * Idempotent: a repeated leave is a no-op and the refund idempotency key prevents a double refund.
  */
-export async function leaveUnlimitedChallenge(userId: string, challengeId: string): Promise<ServiceResult<{ challengeId: string; participantStatus: string; refundIssued: boolean; refundAmountCents: number }>> {
+export async function leaveUnlimitedChallenge(userId: string, challengeId: string): Promise<ServiceResult<{
+  challengeId: string;
+  participantStatus: "left" | "forfeited";
+  refundIssued: boolean;
+  refundAmountCents: number;
+  changed: boolean;
+}>> {
   const result = await db.transaction(async (tx) => {
     const [challenge] = await tx.select().from(unlimitedChallengesTable).where(eq(unlimitedChallengesTable.id, challengeId)).limit(1).for("update");
     if (!challenge) return { ok: false as const, httpStatus: 404, body: { error: "Challenge not found." } };
@@ -417,24 +427,48 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
     // meant a retry on a forfeited row fell through and re-ran the leave path — rewriting
     // qualificationStatus and, pre-start, attempting a second refund.
     if ((UNLIMITED_LEFT_STATUSES as readonly string[]).includes(participant.qualificationStatus)) {
-      return { ok: true as const, refundIssued: false, refundAmountCents: 0 }; // idempotent
+      const legacyForfeit = participant.qualificationStatus === "left"
+        && participant.disqualificationReason === "left_after_start";
+      return {
+        ok: true as const,
+        refundIssued: false,
+        refundAmountCents: 0,
+        participantStatus: legacyForfeit || participant.qualificationStatus === "forfeited"
+          ? "forfeited" as const
+          : "left" as const,
+        changed: false,
+      };
     }
 
     // Pre-start iff still waiting AND server time is before the authoritative start instant.
     const preStart = challenge.status === "waiting" && Date.now() < challenge.startAtUtc.getTime();
     const now = new Date();
 
+    const participantStatus = preStart ? "left" as const : "forfeited" as const;
     await tx
       .update(unlimitedChallengeParticipantsTable)
       .set({
-        qualificationStatus: "left",
+        qualificationStatus: participantStatus,
         leftAt: now,
         // Leaving at/after start also removes prize eligibility (disqualified for payout).
         disqualifiedAt: preStart ? null : now,
         disqualificationReason: preStart ? null : "left_after_start",
+        prizePoolEligibilityStatus: "not_eligible",
+        eligibilityReasonCode: "left_challenge",
+        eligibilityFinalizedAt: now,
         updatedAt: now,
       })
       .where(eq(unlimitedChallengeParticipantsTable.id, participant.id));
+
+    await tx.insert(auditLogsTable).values({
+      actorUserId: userId,
+      actorType: "user",
+      action: preStart ? "unlimited_challenge.leave" : "unlimited_challenge.forfeit",
+      entityType: "unlimited_challenge_participant",
+      entityId: participant.id,
+      reason: preStart ? "left_before_start" : "left_after_start",
+      metadata: { challengeId, participantStatus, refund: preStart ? "pending" : "none" },
+    });
 
     if (!preStart) {
       // Post-start: contribution stays in the pool (no refund); pool/count unchanged.
@@ -443,6 +477,8 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
         refundIssued: false,
         refundAmountCents: 0,
         participantCount: challenge.paidParticipantCount,
+        participantStatus,
+        changed: true,
       };
     }
 
@@ -470,6 +506,8 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
       refundIssued: true,
       refundAmountCents: participant.entryContributionCents,
       participantCount: nextCount,
+      participantStatus,
+      changed: true,
     };
   });
 
@@ -478,11 +516,17 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
     "participantCount" in result && typeof result.participantCount === "number"
       ? result.participantCount
       : undefined;
+  const participantStatus = result.participantStatus;
+  const participantStatusPublic = participantStatus === "forfeited" ? "FORFEITED" : "left";
   const leavePayload = {
     challengeId,
     userId,
     room_id: challengeId,
     raceId: challengeId,
+    participationStatus: participantStatus,
+    participantStatus: participantStatusPublic,
+    prizeEligible: false,
+    ...(participantStatus === "forfeited" ? STREAK_FORFEITED_PARTICIPANT_CONTENT : {}),
     ...(leaveCount != null
       ? {
           current_players: leaveCount,
@@ -491,33 +535,61 @@ export async function leaveUnlimitedChallenge(userId: string, challengeId: strin
         }
       : {}),
   };
-  emitUnlimitedRealtime(
-    challengeId,
-    "participant_left",
-    leavePayload,
-    {
-      event: "race:player-left",
-      payload: leavePayload,
-    },
-  );
-  void triggerEvent(`public-live-race-${challengeId}`, "room:participant_left", leavePayload);
-  void triggerEvent("public-rooms-available", "room:participant_left", leavePayload);
-  if (leaveCount != null) {
-    void triggerEvent("public-rooms-available", "room:registration_cancelled", {
-      room_id: challengeId,
-      raceId: challengeId,
-      registered_count: leaveCount,
-      current_players: leaveCount,
-    });
+  if (result.changed) {
+    if (participantStatus === "forfeited") {
+      const dayKeys = await db
+        .select({ localDate: unlimitedChallengeDaysTable.localDate })
+        .from(unlimitedChallengeDaysTable)
+        .where(and(
+          eq(unlimitedChallengeDaysTable.challengeId, challengeId),
+          eq(unlimitedChallengeDaysTable.userId, userId),
+        ));
+      await clearUnlimitedProvisionalLive(challengeId, userId, dayKeys.map((row) => row.localDate));
+    }
+    emitUnlimitedRealtime(
+      challengeId,
+      participantStatus === "forfeited" ? "participant_forfeited" : "participant_left",
+      leavePayload,
+      {
+        event: participantStatus === "forfeited" ? "race:participant-forfeited" : "race:player-left",
+        payload: leavePayload,
+      },
+    );
+    void triggerEvent(`public-live-race-${challengeId}`, "room:participant_left", leavePayload);
+    void triggerEvent("public-rooms-available", "room:participant_left", leavePayload);
+    if (leaveCount != null) {
+      void triggerEvent("public-rooms-available", "room:registration_cancelled", {
+        room_id: challengeId,
+        raceId: challengeId,
+        registered_count: leaveCount,
+        current_players: leaveCount,
+      });
+    }
   }
-  const msg = result.refundIssued
-    ? "You left the challenge. Your entry fee has been refunded."
-    : "You left the challenge. Entry fees are non-refundable after it starts.";
-  void sendNotification(userId, "race_cancelled", "You left the challenge", msg, {
-    challengeId,
-    dedupeKey: `unlimited_left:${challengeId}:${userId}`,
-  }).catch(() => {});
-  return { ok: true, data: { challengeId, participantStatus: "left", refundIssued: result.refundIssued, refundAmountCents: result.refundAmountCents } };
+  const notificationTitle = participantStatus === "forfeited"
+    ? STREAK_FORFEITED_PARTICIPANT_CONTENT.title
+    : "You left the challenge";
+  const msg = participantStatus === "forfeited"
+    ? STREAK_FORFEITED_PARTICIPANT_CONTENT.message
+    : result.refundIssued
+      ? "You left the challenge. Your entry fee has been refunded."
+      : "You left the challenge. Entry fees are non-refundable after it starts.";
+  if (result.changed) {
+    void sendNotification(userId, "race_cancelled", notificationTitle, msg, {
+      challengeId,
+      dedupeKey: `unlimited_${participantStatus}:${challengeId}:${userId}`,
+    }).catch(() => {});
+  }
+  return {
+    ok: true,
+    data: {
+      challengeId,
+      participantStatus,
+      refundIssued: result.refundIssued,
+      refundAmountCents: result.refundAmountCents,
+      changed: result.changed,
+    },
+  };
 }
 
 /**
@@ -613,7 +685,7 @@ export async function cancelUnlimitedChallengeByPlatform(
       .where(
         and(
           eq(unlimitedChallengeParticipantsTable.challengeId, challengeId),
-          ne(unlimitedChallengeParticipantsTable.qualificationStatus, "left"),
+          notInArray(unlimitedChallengeParticipantsTable.qualificationStatus, [...UNLIMITED_LEFT_STATUSES]),
         ),
       );
 
